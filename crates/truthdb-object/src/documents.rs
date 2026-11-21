@@ -267,6 +267,17 @@ impl ObjTxn<'_, '_> {
         self.delete_document(&tree, &config_prefix(bucket, kind, id))
     }
 
+    /// Bucket configuration `kind`, if set (read in the transaction).
+    pub(crate) fn bucket_config_in(
+        &mut self,
+        bucket: &str,
+        kind: u8,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let tree = self.trees.bucket_config();
+        read(self.ctx, &tree, &config_prefix(bucket, kind, id))
+    }
+
     /// Whether bucket configuration `kind` is set.
     pub(crate) fn has_bucket_config(
         &mut self,

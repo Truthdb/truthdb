@@ -10,11 +10,18 @@
 //! replication time and metrics, and existing-object replication.
 //!
 //! The `Role` is kept as given: there are no IAM roles, so replication acts
-//! as the source bucket's owner.
+//! as the one who put the configuration (its account, and its user): it
+//! replicates a version only if they may `s3:GetObjectVersionForReplication`
+//! it and `s3:ReplicateObject` in the destination. The object engine keeps
+//! the configuration and queues what it replicates (see
+//! `truthdb_object::ReplicationConfig`); `replication_run` writes the
+//! replicas.
 
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
-use truthdb_object::{BUCKET_REPLICATION, StorageClass, Versioning};
+use truthdb_object::{
+    ReplicationConfig, ReplicationDestination as Destination, ReplicationRule, Versioning,
+};
 
 use crate::error::{S3Error, escape};
 use crate::object_lock::{malformed, read_checked_body};
@@ -27,31 +34,6 @@ const MAX_BODY: usize = 2 * 1024 * 1024;
 const MAX_RULES: usize = 1000;
 const MAX_ID: usize = 255;
 const BUCKET_ARN: &str = "arn:aws:s3:::";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicationConfig {
-    pub role: String,
-    pub rules: Vec<ReplicationRule>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicationRule {
-    /// Empty when the rule has none.
-    pub id: String,
-    pub priority: u32,
-    pub enabled: bool,
-    /// The keys it applies to: those under this prefix (none: every key).
-    pub prefix: Option<String>,
-    pub destination: Destination,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Destination {
-    pub bucket: String,
-    pub account: Option<String>,
-    /// The replicas' class (none: the source version's).
-    pub storage_class: Option<StorageClass>,
-}
 
 fn invalid(message: impl Into<String>) -> S3Error {
     S3Error::new(400, "InvalidArgument", message)
@@ -236,11 +218,16 @@ pub fn parse(body: &[u8]) -> Result<ReplicationConfig, S3Error> {
     {
         return Err(not_yet("Replication to more than one destination"));
     }
-    Ok(ReplicationConfig { role, rules })
+    // Who puts it is the request's (see `bucket_replication`).
+    Ok(ReplicationConfig {
+        role,
+        rules,
+        account: String::new(),
+        user: None,
+    })
 }
 
-/// The configuration as GetBucketReplication answers it (as it is also
-/// stored).
+/// The configuration as GetBucketReplication answers it.
 pub fn render(config: &ReplicationConfig) -> String {
     let mut out = format!(
         "<ReplicationConfiguration xmlns=\"{XMLNS}\"><Role>{}</Role>",
@@ -293,12 +280,13 @@ pub(crate) fn blocks_object_lock(
     bucket: &str,
     owner: &str,
 ) -> Result<bool, truthdb_core::storage::StorageError> {
-    let Some(document) = file.bucket_config(bucket, BUCKET_REPLICATION, "")? else {
-        return Ok(false);
-    };
-    // A stored configuration is one this module rendered.
-    let Ok(config) = parse(&document) else {
+    // One an earlier build stored as XML, not yet stored anew: it may name
+    // any destination.
+    if file.replication_xml(bucket)?.is_some() {
         return Ok(true);
+    }
+    let Some(config) = file.replication(bucket)? else {
+        return Ok(false);
     };
     for rule in &config.rules {
         match file.bucket(&rule.destination.bucket)? {
@@ -380,24 +368,31 @@ pub async fn bucket_replication(
             let found = crate::scope::object(state, move |file| {
                 Ok(match file.bucket(&name)? {
                     None => Err(()),
-                    Some(_) => Ok(file.bucket_config(&name, BUCKET_REPLICATION, "")?),
+                    Some(_) => Ok(file.replication(&name)?),
                 })
             })
             .await?
             .map_err(|()| no_bucket())?;
-            let document = found.ok_or_else(not_found)?;
+            let config = found.ok_or_else(not_found)?;
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/xml")
                 .body(full(format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-                    String::from_utf8_lossy(&document)
+                    render(&config)
                 )))
                 .expect("a valid response"))
         }
         Method::PUT => {
+            // Replicas are written as the one who puts it.
+            let principal = auth
+                .principal
+                .clone()
+                .ok_or_else(|| S3Error::access_denied("Access Denied"))?;
             let body = read_checked_body(request, auth, MAX_BODY).await?;
-            let config = parse(&body)?;
+            let mut config = parse(&body)?;
+            config.account = principal.account;
+            config.user = principal.user;
             // The buckets are checked and the configuration set in one
             // transaction: versioning cannot be suspended in between.
             crate::scope::object(state, move |file| {
@@ -415,9 +410,7 @@ pub async fn bucket_replication(
                 {
                     return Ok(Err(Some(refused)));
                 }
-                file.transaction(|tx| {
-                    tx.put_bucket_config(&name, BUCKET_REPLICATION, "", render(&config).as_bytes())
-                })?;
+                file.transaction(|tx| tx.put_replication(&name, &config))?;
                 Ok(Ok(()))
             })
             .await?
@@ -432,7 +425,7 @@ pub async fn bucket_replication(
                 if file.bucket(&name)?.is_none() {
                     return Ok(Err(()));
                 }
-                file.transaction(|tx| tx.delete_bucket_config(&name, BUCKET_REPLICATION, ""))?;
+                file.transaction(|tx| tx.delete_replication(&name))?;
                 Ok(Ok(()))
             })
             .await?
@@ -449,6 +442,7 @@ pub async fn bucket_replication(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use truthdb_object::StorageClass;
 
     fn config(rules: &str) -> Result<ReplicationConfig, S3Error> {
         parse(

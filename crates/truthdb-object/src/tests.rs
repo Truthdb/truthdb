@@ -6807,3 +6807,262 @@ fn state_of(
         })
         .collect()
 }
+
+#[test]
+fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_number() {
+    use crate::{
+        Expiration, Filter, ObjectLock, ReplicationConfig, ReplicationDestination, ReplicationRule,
+        ReplicationStatus, ReplicationWork, StorageClass, VersionSel, Versioning, When,
+    };
+    let path = temp_path("replication");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["src", "dst"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+            }
+            let rule = |id: &str, priority, prefix: &str, class| ReplicationRule {
+                id: id.to_string(),
+                priority,
+                enabled: true,
+                prefix: Some(prefix.to_string()),
+                destination: ReplicationDestination {
+                    bucket: "dst".to_string(),
+                    account: None,
+                    storage_class: class,
+                },
+            };
+            let mut off = rule("off", 9, "", None);
+            off.enabled = false;
+            let config = ReplicationConfig {
+                role: "role".to_string(),
+                account: DEFAULT_ACCOUNT.to_string(),
+                user: Some("deployer".to_string()),
+                rules: vec![
+                    rule("logs", 1, "logs/", None),
+                    rule("cold", 2, "logs/cold/", Some(StorageClass::StandardIa)),
+                    off,
+                ],
+            };
+            // Kept as given.
+            tx.put_replication("src", &config)?;
+            assert_eq!(ReplicationConfig::decode(&config.encode()).unwrap(), config);
+            Ok(())
+        })
+        .unwrap();
+    let status = |bucket: &str, key: &str, version: u64| {
+        ObjFile::new(&mut storage.lock())
+            .replication_status(bucket, key, version)
+            .unwrap()
+    };
+    let queue = || {
+        ObjFile::new(&mut storage.lock())
+            .replication_queue(100)
+            .unwrap()
+    };
+    // Written: PENDING and queued at once, under the rule of highest
+    // priority; a key no enabled rule names is neither.
+    let hot = put_at(&storage, "src", "logs/a", 10, StorageClass::Standard, T0);
+    let cold = put_at(
+        &storage,
+        "src",
+        "logs/cold/b",
+        10,
+        StorageClass::Standard,
+        T0,
+    );
+    let other = put_at(&storage, "src", "other", 10, StorageClass::Standard, T0);
+    assert_eq!(
+        status("src", "logs/a", hot),
+        Some(ReplicationStatus::Pending)
+    );
+    assert_eq!(status("src", "other", other), None);
+    // An archived version is not replicated (until restored and copied).
+    let frozen = put_at(
+        &storage,
+        "src",
+        "logs/frozen",
+        10,
+        StorageClass::Glacier,
+        T0,
+    );
+    assert_eq!(status("src", "logs/frozen", frozen), None);
+    let queued = queue();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|q| (q.work, q.key.as_str(), q.version, q.storage_class))
+            .collect::<Vec<_>>(),
+        [
+            (ReplicationWork::Create, "logs/a", hot, None),
+            (
+                ReplicationWork::Create,
+                "logs/cold/b",
+                cold,
+                Some(StorageClass::StandardIa)
+            ),
+        ]
+    );
+
+    // Lifecycle leaves a PENDING version alone.
+    put_rules(
+        &storage,
+        "src",
+        vec![crate::Rule {
+            expiration: Some(Expiration::At(When::Days(1))),
+            ..lifecycle_rule("e", Filter::All)
+        }],
+    );
+    let budget = crate::StepBudget {
+        rows: 1000,
+        actions: 1000,
+    };
+    lifecycle_passes(&storage, T0 + 3 * DAY, budget);
+    let latest = |bucket: &str, key: &str| {
+        ObjFile::new(&mut storage.lock())
+            .object_version(bucket, key, VersionSel::Latest)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(
+        !latest("src", "logs/a").delete_marker,
+        "pending: not expired"
+    );
+    assert!(
+        latest("src", "other").delete_marker,
+        "not replicated: expired"
+    );
+
+    // A version written in the destination meanwhile is newer than the
+    // replica, which keeps its source's number and time.
+    let local = put_at(
+        &storage,
+        "dst",
+        "logs/a",
+        20,
+        StorageClass::Standard,
+        T0 + DAY,
+    );
+    assert!(local > hot);
+    let source = latest("src", "logs/a");
+    let held = ObjectLock {
+        retention: None,
+        legal_hold: Some(true),
+    };
+    let insert = |queued: &crate::QueuedReplication, source: &crate::ObjectInfo| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                let written = tx.insert_replica(
+                    "dst",
+                    &queued.key,
+                    source,
+                    &source.attrs,
+                    queued.storage_class.unwrap_or(source.storage_class),
+                    &held,
+                    T0 + DAY,
+                    0,
+                )?;
+                tx.finish_replication(queued, Some(ReplicationStatus::Completed))?;
+                Ok(written)
+            })
+            .unwrap()
+            .unwrap()
+    };
+    assert!(insert(&queued[0], &source));
+    assert!(!insert(&queued[0], &source), "once");
+    let replica = ObjFile::new(&mut storage.lock())
+        .object_version("dst", "logs/a", VersionSel::Seq(hot))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            replica.mtime_ms,
+            replica.size,
+            replica.body,
+            replica.attrs.clone()
+        ),
+        (
+            source.mtime_ms,
+            source.size,
+            source.body,
+            source.attrs.clone()
+        )
+    );
+    assert_eq!(
+        latest("dst", "logs/a").version,
+        local,
+        "the local one is newest"
+    );
+    assert_eq!(
+        status("dst", "logs/a", hot),
+        Some(ReplicationStatus::Replica)
+    );
+    assert_eq!(
+        status("src", "logs/a", hot),
+        Some(ReplicationStatus::Completed)
+    );
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .object_lock("dst", "logs/a", hot)
+            .unwrap(),
+        held
+    );
+    let cold_source = latest("src", "logs/cold/b");
+    assert!(insert(&queued[1], &cold_source));
+    assert_eq!(
+        latest("dst", "logs/cold/b").storage_class,
+        StorageClass::StandardIa
+    );
+    assert!(queue().is_empty());
+    // Replicated, it is expired by lifecycle.
+    lifecycle_passes(&storage, T0 + 4 * DAY, budget);
+    assert!(latest("src", "logs/a").delete_marker);
+
+    // A tag change of a replicated version is queued for its replica; one of
+    // the replica is not.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.set_tags(
+                "src",
+                "logs/a",
+                VersionSel::Seq(hot),
+                vec![("t".into(), "1".into())],
+                T0,
+            )?
+            .unwrap();
+            tx.set_tags(
+                "dst",
+                "logs/a",
+                VersionSel::Seq(hot),
+                vec![("u".into(), "2".into())],
+                T0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let queued = queue();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|q| (q.work, q.bucket.as_str(), q.version))
+            .collect::<Vec<_>>(),
+        [(ReplicationWork::Metadata, "src", hot)]
+    );
+
+    // The source version removed, its status goes; the replica keeps the
+    // shared body.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.delete_object("src", "logs/a", Some(VersionSel::Seq(hot)), false, T0, 0)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(status("src", "logs/a", hot), None);
+    ObjFile::new(&mut storage.lock())
+        .collect_garbage(u64::MAX, 0, 1000)
+        .unwrap();
+    assert_eq!(read(&storage, replica.body, 0, 10).unwrap(), bytes(3, 10));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

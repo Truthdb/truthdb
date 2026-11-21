@@ -683,6 +683,7 @@ fn object_headers(
     encrypted_at_rest: bool,
     restore: Option<RestoreState>,
     expiration: Option<&str>,
+    replication: Option<truthdb_object::ReplicationStatus>,
 ) -> hyper::http::response::Builder {
     let attrs = &info.attrs;
     // An object with a customer-provided key says so, not AES256.
@@ -692,6 +693,9 @@ fn object_headers(
     );
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         builder = builder.header("x-amz-version-id", version);
+    }
+    if let Some(status) = replication {
+        builder = builder.header("x-amz-replication-status", status.as_str());
     }
     let mut builder = builder
         .header("etag", info.etag())
@@ -947,50 +951,65 @@ pub(crate) async fn read_object(
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-    let (found, versioning, lock, restore, expiration, span) = object(state, move |file| {
-        let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
-        // The current version's expiration, by the bucket's lifecycle rules.
-        let expiration = match &found {
-            Ok(info) if which == VersionSel::Latest && !info.delete_marker => {
-                crate::lifecycle::expiration_header(
-                    file.lifecycle(&lookup_bucket)?.as_ref(),
-                    &lookup_key,
-                    info.size,
-                    &info.attrs.tags,
-                    info.mtime_ms,
-                )
+    let (found, versioning, lock, restore, expiration, replication, span) =
+        object(state, move |file| {
+            let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
+            // The current version's expiration, by the bucket's lifecycle rules.
+            let expiration = match &found {
+                Ok(info) if which == VersionSel::Latest && !info.delete_marker => {
+                    crate::lifecycle::expiration_header(
+                        file.lifecycle(&lookup_bucket)?.as_ref(),
+                        &lookup_key,
+                        info.size,
+                        &info.attrs.tags,
+                        info.mtime_ms,
+                    )
+                }
+                _ => None,
+            };
+            // Everything that can fail comes before the lease: a failure after
+            // it would leave the lease held with no one to release it.
+            let versioning = versioning_of(file, &lookup_bucket)?;
+            let (lock, restore) = match &found {
+                Ok(info) => (
+                    file.object_lock(&lookup_bucket, &lookup_key, info.version)?,
+                    file.restore(&lookup_bucket, &lookup_key, info.version)?
+                        .and_then(|restore| restore.state(now_ms())),
+                ),
+                Err(_) => (truthdb_object::ObjectLock::default(), None),
+            };
+            let replication = match &found {
+                Ok(info) if !info.delete_marker => {
+                    file.replication_status(&lookup_bucket, &lookup_key, info.version)?
+                }
+                _ => None,
+            };
+            // The part asked for, as plaintext bytes.
+            let span = match (&found, part) {
+                (Ok(info), Some(number)) if !info.delete_marker => part_span(file, info, number)?,
+                _ => Ok(None),
+            };
+            // An archived version not restored is not read, nor a part that is
+            // not there: no lease.
+            if let Ok(info) = &found
+                && !head_only
+                && !info.delete_marker
+                && !truthdb_object::unreadable(info.storage_class, restore)
+                && span.is_ok()
+            {
+                file.take_lease(info.body)?;
             }
-            _ => None,
-        };
-        // Everything that can fail comes before the lease: a failure after
-        // it would leave the lease held with no one to release it.
-        let versioning = versioning_of(file, &lookup_bucket)?;
-        let (lock, restore) = match &found {
-            Ok(info) => (
-                file.object_lock(&lookup_bucket, &lookup_key, info.version)?,
-                file.restore(&lookup_bucket, &lookup_key, info.version)?
-                    .and_then(|restore| restore.state(now_ms())),
-            ),
-            Err(_) => (truthdb_object::ObjectLock::default(), None),
-        };
-        // The part asked for, as plaintext bytes.
-        let span = match (&found, part) {
-            (Ok(info), Some(number)) if !info.delete_marker => part_span(file, info, number)?,
-            _ => Ok(None),
-        };
-        // An archived version not restored is not read, nor a part that is
-        // not there: no lease.
-        if let Ok(info) = &found
-            && !head_only
-            && !info.delete_marker
-            && !truthdb_object::unreadable(info.storage_class, restore)
-            && span.is_ok()
-        {
-            file.take_lease(info.body)?;
-        }
-        Ok((found, versioning, lock, restore, expiration, span))
-    })
-    .await?;
+            Ok((
+                found,
+                versioning,
+                lock,
+                restore,
+                expiration,
+                replication,
+                span,
+            ))
+        })
+        .await?;
     let mut info = found.map_err(|err| object_error(err, &bucket, &key))?;
     for (header, value) in overrides {
         let attrs = &mut info.attrs;
@@ -1072,6 +1091,7 @@ pub(crate) async fn read_object(
             state.storage.is_encrypted(),
             restore,
             expiration.as_deref(),
+            replication,
         )
         .body(full(Bytes::new()))
         .expect("a valid response"));
@@ -1113,6 +1133,7 @@ pub(crate) async fn read_object(
             state.storage.is_encrypted(),
             restore,
             expiration.as_deref(),
+            replication,
         ),
         &lock,
         lock_visible.retention,
