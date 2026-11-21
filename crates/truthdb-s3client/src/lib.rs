@@ -61,14 +61,19 @@ impl std::error::Error for Error {}
 
 impl Error {
     /// Whether the same request would fail again: a refusal that lasts (not
-    /// a timeout, throttling, a clock skew or a server error), or a request
-    /// that cannot be made. Anything else may succeed when tried again.
+    /// a timeout, throttling, a clock skew or a server error, but what the
+    /// service does not implement), or a request that cannot be made.
+    /// Anything else may succeed when tried again.
     pub fn permanent(&self) -> bool {
         match self {
             Error::Invalid(_) => true,
-            Error::Service { status, code, .. } => {
-                *status < 500 && !matches!(*status, 408 | 429) && code != "RequestTimeTooSkewed"
-            }
+            Error::Service { status, code, .. } => match *status {
+                501 | 505 => true,
+                408 | 429 => false,
+                status if status >= 500 => false,
+                // S3's idle-socket timeout is a 400.
+                _ => !matches!(code.as_str(), "RequestTimeTooSkewed" | "RequestTimeout"),
+            },
             Error::Transport(_) => false,
         }
     }

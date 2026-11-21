@@ -69,7 +69,7 @@ struct RemoteJob {
 /// Writes replicas until `shutdown` turns true.
 pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
     let mut stored_anew = false;
-    let mut waits = Waits::new();
+    let mut runner = Runner::default();
     loop {
         if *shutdown.borrow() {
             return;
@@ -82,7 +82,7 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
         }
         let more = stored_anew
             && !state.storage.is_standby()
-            && step(&state, &mut waits)
+            && step(&state, &mut runner)
                 .await
                 .inspect_err(|err| eprintln!("replication: {err}"))
                 .unwrap_or(false);
@@ -134,60 +134,149 @@ fn store_anew(file: &mut ObjFile<'_>) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// What the runner keeps between steps: the remote buckets being waited
+/// for, where the next step looks in the queue, and how often each queued
+/// replication for another service failed for a while.
+#[derive(Default)]
+struct Runner {
+    waits: Waits,
+    after: Option<u64>,
+    tries: HashMap<u64, u32>,
+}
+
+/// How often a replication for another service may fail for a while
+/// before it is FAILED.
+const MAX_TRIES: u32 = 10;
+
+impl Runner {
+    /// Notes how sending queued replication `number` to remote bucket
+    /// `name` went, and returns how it is to be finished: a failure that
+    /// may clear makes the bucket wait (doubling), and is FAILED once it
+    /// happened [`MAX_TRIES`] times. A send skipped (no reason given, the
+    /// bucket being waited for) counts for nothing.
+    fn record(
+        &mut self,
+        name: &str,
+        number: u64,
+        outcome: Result<(), (bool, String)>,
+    ) -> Result<(), (bool, String)> {
+        match outcome {
+            Ok(()) | Err((true, _)) => {
+                self.waits.remove(name);
+                self.tries.remove(&number);
+                outcome
+            }
+            Err((false, why)) if !why.is_empty() => {
+                let wait = self
+                    .waits
+                    .get(name)
+                    .map_or(IDLE, |(_, wait)| (*wait * 2).clamp(IDLE, MAX_WAIT));
+                self.waits
+                    .insert(name.to_string(), (Instant::now() + wait, wait));
+                let tries = self.tries.entry(number).or_default();
+                *tries += 1;
+                if *tries >= MAX_TRIES {
+                    self.tries.remove(&number);
+                    return Err((true, format!("{why} (tried {MAX_TRIES} times)")));
+                }
+                Err((false, why))
+            }
+            skipped => skipped,
+        }
+    }
+}
+
+/// The size of the parts a replica of `size` bytes is sent in: [`PART`],
+/// or larger, as S3 takes at most 10,000 parts.
+fn part_size(size: u64) -> usize {
+    PART.max(size.div_ceil(10_000) as usize)
+}
+
 /// Makes the next queued replications; returns whether more may be queued.
 /// Those in this server are made in one lock hold; those for another
 /// service are prepared there (their bodies leased), sent without the lock,
-/// and finished in a hold each.
-async fn step(state: &S3State, waits: &mut Waits) -> Result<bool, String> {
+/// and finished in a hold each. A step goes on in the queue where the last
+/// one stopped, and from its start once it reaches the end, so the work for
+/// a remote bucket being waited for holds no other back.
+async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
     let now = Instant::now();
-    let waiting: HashSet<String> = waits
+    let waiting: HashSet<String> = runner
+        .waits
         .iter()
         .filter(|(_, (until, _))| *until > now)
         .map(|(name, _)| name.clone())
         .collect();
-    let (jobs, full) = object(state, move |file| {
+    let after = runner.after;
+    let (jobs, made, next) = object(state, move |file| {
         if !file.versions_keyed()? {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), 0, after));
         }
         let mut jobs = Vec::new();
-        let mut made = 0;
-        for queued in file.replication_queue(SCAN)? {
-            if made == BATCH {
-                break;
-            }
-            if waiting.contains(&queued.destination) {
-                continue;
-            }
-            made += 1;
-            if let Some(job) = replicate(file, &queued, now_ms())? {
-                jobs.push(job);
+        match prepare(file, after, &waiting, &mut jobs) {
+            Ok((made, next)) => Ok((jobs, made, next)),
+            Err(err) => {
+                // Nothing prepared is sent: its leases go.
+                for job in &jobs {
+                    file.release_lease(job.body);
+                }
+                Err(err)
             }
         }
-        Ok((jobs, made == BATCH))
     })
     .await?;
+    runner.after = next;
+    let mut failed = None;
     for job in jobs {
         let name = job.remote.name.clone();
+        let number = job.queued.number;
         // A remote bucket that just failed is not tried again in this step.
-        let outcome = match waits.get(&name) {
+        let outcome = match runner.waits.get(&name) {
             Some((until, _)) if *until > Instant::now() => Err((false, String::new())),
             _ => send(state, &job).await,
         };
-        match &outcome {
-            Ok(()) | Err((true, _)) => {
-                waits.remove(&name);
-            }
-            Err((false, why)) if !why.is_empty() => {
-                let wait = waits
-                    .get(&name)
-                    .map_or(IDLE, |(_, wait)| (*wait * 2).clamp(IDLE, MAX_WAIT));
-                waits.insert(name, (Instant::now() + wait, wait));
-            }
-            Err(_) => {}
+        let outcome = runner.record(&name, number, outcome);
+        // Every job is finished (its lease released), whatever one did.
+        if let Err(err) = object(state, move |file| finish_remote(file, &job, outcome)).await {
+            failed.get_or_insert(err);
         }
-        object(state, move |file| finish_remote(file, &job, outcome)).await?;
     }
-    Ok(full)
+    match failed {
+        Some(err) => Err(err),
+        None => Ok(made == BATCH),
+    }
+}
+
+/// Prepares the queued replications after `after`, making those in this
+/// server, up to [`BATCH`], those for a remote bucket in `waiting` passed
+/// over; returns how many were made or prepared, and where the next step
+/// goes on (none: from the start).
+fn prepare(
+    file: &mut ObjFile<'_>,
+    after: Option<u64>,
+    waiting: &HashSet<String>,
+    jobs: &mut Vec<RemoteJob>,
+) -> Result<(usize, Option<u64>), StorageError> {
+    let queue = file.replication_queue(after, SCAN)?;
+    let mut next = if queue.len() < SCAN {
+        None
+    } else {
+        queue.last().map(|queued| queued.number)
+    };
+    let mut made = 0;
+    for queued in &queue {
+        if made == BATCH {
+            next = Some(queued.number - 1);
+            break;
+        }
+        if waiting.contains(&queued.destination) {
+            continue;
+        }
+        made += 1;
+        if let Some(job) = replicate(file, queued, now_ms())? {
+            jobs.push(job);
+        }
+    }
+    Ok((made, next))
 }
 
 /// Sends `job`'s replica: in one PUT, or in parts past [`PART`]. An error
@@ -210,6 +299,11 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), (bool, String)> {
     let reader = tokio::spawn(async move {
         crate::objects::stream_plaintext(&engine, &layout, None, 0, size, &tx).await
     });
+    // However the send ends, the reader ends with it (before the body's
+    // lease is released).
+    let _reader_ends = StopOnDrop(reader.abort_handle());
+    // S3 takes at most 10,000 parts: a larger object takes larger parts.
+    let part_size = part_size(size);
     let (bucket, key) = (&remote.name, &job.queued.key);
     let headers: Vec<(&str, String)> = job
         .headers
@@ -241,8 +335,8 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), (bool, String)> {
                     read += chunk.len() as u64;
                     buffer.extend_from_slice(chunk);
                 }
-                while buffer.len() >= PART || (chunk.is_none() && !buffer.is_empty()) {
-                    let take = buffer.len().min(PART);
+                while buffer.len() >= part_size || (chunk.is_none() && !buffer.is_empty()) {
+                    let take = buffer.len().min(part_size);
                     let part: Bytes = buffer.split_to(take).freeze();
                     let number = parts.len() as u32 + 1;
                     let etag = client
@@ -268,6 +362,15 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), (bool, String)> {
             let _ = client.abort_multipart_upload(bucket, key, &upload).await;
         }
         parted
+    }
+}
+
+/// Stops a task when dropped.
+struct StopOnDrop(tokio::task::AbortHandle);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -344,10 +447,13 @@ fn remote_headers(
         headers.push((format!("x-amz-meta-{name}"), value.clone()));
     }
     if !attrs.tags.is_empty() {
-        let encode = |text: &str| {
-            percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC)
-                .to_string()
-        };
+        // RFC 3986's unreserved characters are left as they are.
+        const ESCAPED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'_')
+            .remove(b'.')
+            .remove(b'~');
+        let encode = |text: &str| percent_encoding::utf8_percent_encode(text, ESCAPED).to_string();
         let tagging: Vec<String> = attrs
             .tags
             .iter()
@@ -359,7 +465,11 @@ fn remote_headers(
         "x-amz-storage-class".to_string(),
         class.as_str().to_string(),
     ));
-    if let Some(retention) = lock.retention {
+    // An expired retention is not sent (S3 refuses a date past).
+    if let Some(retention) = lock
+        .retention
+        .filter(|retention| retention.effective_until(now) > now)
+    {
         headers.push((
             "x-amz-object-lock-mode".to_string(),
             match retention.mode {
@@ -472,8 +582,11 @@ fn remote_job(
             .transaction(|tx| tx.finish_replication(queued, None))
             .map(|()| None);
     }
+    let owner = file.bucket(&queued.bucket)?.map(|bucket| bucket.owner);
     let authz = creator_authz(file, config, queued)?;
-    let refusal = if !may_read(&authz, queued) {
+    let refusal = if owner.as_deref() != Some(remote.account.as_str()) {
+        Some("the remote bucket is recorded for another account")
+    } else if !may_read(&authz, queued) {
         Some(MAY_NOT_READ)
     } else if source.attrs.customer_key.is_some() {
         Some("an object under a customer-provided key is not sent to another service")
@@ -700,7 +813,7 @@ mod tests {
         let step = || {
             let mut lock = storage.lock();
             let mut file = ObjFile::new(&mut lock);
-            for queued in file.replication_queue(100).unwrap() {
+            for queued in file.replication_queue(None, 100).unwrap() {
                 replicate(&mut file, &queued, now_ms()).unwrap();
             }
         };
@@ -811,7 +924,7 @@ mod tests {
         assert_eq!(status("dst", "c", orphan), None);
         assert!(
             ObjFile::new(&mut storage.lock())
-                .replication_queue(10)
+                .replication_queue(None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -886,6 +999,7 @@ mod tests {
                 tx.set_versioning("src", Versioning::Enabled)?.unwrap();
                 tx.create_remote_bucket(&RemoteBucket {
                     name: "far".into(),
+                    account: me.into(),
                     endpoint: "http://127.0.0.1:1".into(),
                     region: "us-east-1".into(),
                     access_key: "k".into(),
@@ -934,7 +1048,11 @@ mod tests {
         let next = || {
             let mut lock = storage.lock();
             let mut file = ObjFile::new(&mut lock);
-            let queued = file.replication_queue(1).unwrap().pop().expect("queued");
+            let queued = file
+                .replication_queue(None, 1)
+                .unwrap()
+                .pop()
+                .expect("queued");
             replicate(&mut file, &queued, now_ms()).unwrap()
         };
         // A plain version: prepared with its headers, its body leased, then
@@ -973,7 +1091,7 @@ mod tests {
         assert!(next().is_none());
         assert!(
             ObjFile::new(&mut storage.lock())
-                .replication_queue(10)
+                .replication_queue(None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1003,11 +1121,241 @@ mod tests {
         assert_eq!(status("later", later), Some(ReplicationStatus::Pending));
         assert_eq!(
             ObjFile::new(&mut storage.lock())
-                .replication_queue(10)
+                .replication_queue(None, 10)
                 .unwrap()
                 .len(),
             1
         );
+        // A remote bucket recorded for another account: FAILED.
+        {
+            let mut lock = storage.lock();
+            let mut file = ObjFile::new(&mut lock);
+            file.release_lease(job.body);
+            file.transaction(|tx| {
+                tx.finish_replication(&job.queued, None)?;
+                tx.drop_remote_bucket("far")?;
+                tx.create_remote_bucket(&RemoteBucket {
+                    name: "far".into(),
+                    account: "222222222222".into(),
+                    endpoint: "http://127.0.0.1:1".into(),
+                    region: "us-east-1".into(),
+                    access_key: "k".into(),
+                    secret: "s".into(),
+                    ca_pem: None,
+                    created_ms: 1,
+                })
+            })
+            .unwrap();
+        }
+        let theirs = put("theirs", ObjectAttrs::default());
+        assert!(next().is_none());
+        assert_eq!(status("theirs", theirs), Some(ReplicationStatus::Failed));
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_send_failing_for_a_while_waits_then_fails_and_parts_fit_s3s_count() {
+        let mut runner = Runner::default();
+        let failing = || Err((false, "connection refused".to_string()));
+        for _ in 1..MAX_TRIES {
+            assert_eq!(runner.record("far", 7, failing()), failing());
+        }
+        assert!(runner.waits["far"].0 > Instant::now(), "the bucket waits");
+        assert!(matches!(runner.record("far", 7, failing()), Err((true, _))));
+        assert!(!runner.tries.contains_key(&7));
+        // A skipped send counts for nothing; a sent one ends the wait.
+        assert_eq!(
+            runner.record("far", 8, Err((false, String::new()))),
+            Err((false, String::new()))
+        );
+        assert!(!runner.tries.contains_key(&8));
+        assert_eq!(runner.record("far", 8, Ok(())), Ok(()));
+        assert!(!runner.waits.contains_key("far"));
+        // Parts: at least 8 MiB, at most 10,000 of them.
+        assert_eq!(part_size(1), PART);
+        assert_eq!(part_size(10_000 * PART as u64), PART);
+        let huge = 5u64 << 40;
+        assert!(huge.div_ceil(part_size(huge) as u64) <= 10_000);
+        assert!(part_size(huge) > PART);
+    }
+
+    #[test]
+    fn an_expired_retention_is_not_sent() {
+        use truthdb_object::{Retention, RetentionMode, StorageClass};
+        let info = ObjectInfo {
+            version: 1,
+            null_version: false,
+            delete_marker: false,
+            body: 1,
+            size: 0,
+            md5: [0; 16],
+            parts: 0,
+            mtime_ms: 0,
+            storage_class: StorageClass::Standard,
+            attrs: truthdb_object::ObjectAttrs::default(),
+        };
+        let lock = |until_ms| ObjectLock {
+            retention: Some(Retention {
+                mode: RetentionMode::Governance,
+                until_ms,
+                event: None,
+            }),
+            legal_hold: None,
+        };
+        let has = |headers: &[(String, String)]| {
+            headers
+                .iter()
+                .any(|(name, _)| name == "x-amz-object-lock-retain-until-date")
+        };
+        assert!(has(&remote_headers(
+            &info,
+            StorageClass::Standard,
+            &lock(2_000),
+            1_000
+        )));
+        assert!(!has(&remote_headers(
+            &info,
+            StorageClass::Standard,
+            &lock(500),
+            1_000
+        )));
+    }
+
+    #[test]
+    fn a_step_goes_past_the_work_for_a_bucket_being_waited_for() {
+        use truthdb_object::{
+            BodyWriter, ObjectAttrs, ReplicationDestination, ReplicationRule, StorageClass,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-s3-replication-scan-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let storage = create(&path);
+        let me = "111111111111";
+        let rule = |prefix: &str, bucket: &str| ReplicationRule {
+            id: prefix.into(),
+            priority: 1,
+            enabled: true,
+            prefix: Some(prefix.into()),
+            destination: ReplicationDestination {
+                bucket: bucket.into(),
+                account: None,
+                storage_class: None,
+            },
+        };
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_account(me, "me", 1)?.unwrap();
+                for bucket in ["src", "near"] {
+                    tx.create_bucket(bucket, me, 1)?.unwrap();
+                    tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+                }
+                tx.create_remote_bucket(&RemoteBucket {
+                    name: "far".into(),
+                    account: me.into(),
+                    endpoint: "http://127.0.0.1:1".into(),
+                    region: "us-east-1".into(),
+                    access_key: "k".into(),
+                    secret: "s".into(),
+                    ca_pem: None,
+                    created_ms: 1,
+                })?;
+                // A version first replicated far and nowhere else: each
+                // configuration in turn.
+                tx.put_replication(
+                    "src",
+                    &ReplicationConfig {
+                        role: "role".into(),
+                        rules: vec![rule("f/", "far")],
+                        account: me.into(),
+                        user: None,
+                    },
+                )
+            })
+            .unwrap();
+        let mut writer = BodyWriter::begin(&storage, 1).unwrap();
+        writer.write(&storage, b"x", 1).unwrap();
+        let sealed = writer.finish(&storage, 1).unwrap();
+        let body = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_object(
+                    "src",
+                    "f/0",
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    StorageClass::Standard,
+                    1,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                for i in 1..SCAN + 10 {
+                    tx.copy_object(
+                        "src",
+                        &format!("f/{i}"),
+                        &body,
+                        &ObjectAttrs::default(),
+                        StorageClass::Standard,
+                        1,
+                        0,
+                    )?
+                    .unwrap();
+                }
+                tx.put_replication(
+                    "src",
+                    &ReplicationConfig {
+                        role: "role".into(),
+                        rules: vec![rule("f/", "far"), rule("n/", "near")],
+                        account: me.into(),
+                        user: None,
+                    },
+                )
+            })
+            .unwrap();
+        // Behind more than a scan of work for "far", being waited for.
+        let local = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.copy_object(
+                    "src",
+                    "n/1",
+                    &body,
+                    &ObjectAttrs::default(),
+                    StorageClass::Standard,
+                    1,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap()
+            .version;
+        let waiting: HashSet<String> = ["far".to_string()].into();
+        let mut after = None;
+        let mut steps = 0;
+        loop {
+            let mut lock = storage.lock();
+            let mut file = ObjFile::new(&mut lock);
+            let mut jobs = Vec::new();
+            let (_, next) = prepare(&mut file, after, &waiting, &mut jobs).unwrap();
+            assert!(jobs.is_empty());
+            steps += 1;
+            after = next;
+            if after.is_none() || steps > 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .replication_status("src", "n/1", local)
+                .unwrap(),
+            Some(ReplicationStatus::Completed),
+            "the local replica is made though far's work comes first"
+        );
+        assert_eq!(steps, 2);
         drop(storage);
         std::fs::remove_file(&path).ok();
     }

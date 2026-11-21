@@ -1118,6 +1118,11 @@ async fn create_bucket(
     let name = bucket.clone();
     let now = now_ms();
     match object(state, move |file| {
+        // A name recorded as a bucket of another S3 service (`s3 create
+        // remote bucket`) is that bucket's: one here would be taken for it.
+        if file.remote_bucket(&name)?.is_some() {
+            return Ok(Err(BucketError::AlreadyExists));
+        }
         // A new bucket blocks public access, until its owner says otherwise.
         file.transaction(|tx| {
             let created = tx.create_bucket(&name, &owner, now)?;

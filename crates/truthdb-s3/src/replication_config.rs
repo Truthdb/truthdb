@@ -316,10 +316,15 @@ fn refused_destination(
     }
     let Some(info) = file.bucket(&destination.bucket)? else {
         // A bucket on another S3 service, recorded with `s3 create remote
-        // bucket`: what it is there is that service's to check, as it
-        // takes each replica.
-        if file.remote_bucket(&destination.bucket)?.is_some() {
-            return Ok(None);
+        // bucket` for the source's owner: what it is there is that
+        // service's to check, as it takes each replica. One recorded for
+        // another account is refused as another account's bucket is.
+        if let Some(remote) = file.remote_bucket(&destination.bucket)? {
+            return Ok(if remote.account != owner {
+                Some(not_yet("Replication to another account's bucket"))
+            } else {
+                None
+            });
         }
         return Ok(Some(S3Error::invalid_request(
             "Destination bucket must exist",

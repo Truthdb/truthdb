@@ -435,6 +435,9 @@ mod tests {
         assert!(!service(408, "RequestTimeout").permanent());
         assert!(!service(429, "SlowDown").permanent());
         assert!(!service(503, "SlowDown").permanent());
+        assert!(!service(400, "RequestTimeout").permanent());
+        assert!(service(501, "NotImplemented").permanent());
+        assert!(service(505, "HTTP505").permanent());
         assert!(!S3Error::Transport("reset".into()).permanent());
     }
 }

@@ -13626,43 +13626,46 @@ fn replicas_are_sent_to_a_bucket_of_another_server_and_wait_while_it_is_down() {
     for name in ["far", "missing"] {
         let made = native(
             source.native_port,
-            &format!("s3 create remote bucket {name} {endpoint} us-east-1 {far_key} {far_secret}"),
+            &format!(
+                "s3 create remote bucket {name} {account} {endpoint} us-east-1 {far_key} {far_secret}"
+            ),
         );
         assert_eq!(made["remote_bucket"], name, "{made}");
     }
     for bad in [
-        format!("s3 create remote bucket far {endpoint} us-east-1 k s"),
-        format!("s3 create remote bucket src {endpoint} us-east-1 k s"),
-        format!("s3 create remote bucket Bad_Name {endpoint} us-east-1 k s"),
-        "s3 create remote bucket other nonsense us-east-1 k s".to_string(),
-        format!("s3 create remote bucket other {endpoint} us-east-1 k s /no/such/ca.pem"),
+        format!("s3 create remote bucket far {account} {endpoint} us-east-1 k s"),
+        format!("s3 create remote bucket src {account} {endpoint} us-east-1 k s"),
+        format!("s3 create remote bucket Bad_Name {account} {endpoint} us-east-1 k s"),
+        format!("s3 create remote bucket other {account} nonsense us-east-1 k s"),
+        format!("s3 create remote bucket other 999999999999 {endpoint} us-east-1 k s"),
+        format!("s3 create remote bucket other {account} {endpoint} us-east-1 k s /no/such/ca.pem"),
     ] {
         let reply = native_text(source.native_port, &bad);
         assert!(!reply.contains("\"remote_bucket\""), "{bad}: {reply}");
     }
     let listed = sql_rows(
         source.native_port,
-        "SELECT bucket, endpoint, region, access_key, ca FROM sys.dm_s3_remote_buckets ORDER BY bucket",
+        "SELECT bucket, account_id, endpoint, region, access_key, ca \
+         FROM sys.dm_s3_remote_buckets ORDER BY bucket",
     );
-    assert_eq!(
-        listed,
-        [
-            [
-                "far",
-                endpoint.as_str(),
-                "us-east-1",
-                far_key.as_str(),
-                "SYSTEM"
-            ],
-            [
-                "missing",
-                endpoint.as_str(),
-                "us-east-1",
-                far_key.as_str(),
-                "SYSTEM"
-            ],
+    let row = |name: &str| {
+        vec![
+            name.to_string(),
+            account.clone(),
+            endpoint.clone(),
+            "us-east-1".to_string(),
+            far_key.clone(),
+            "SYSTEM".to_string(),
         ]
+    };
+    assert_eq!(listed, [row("far"), row("missing")]);
+    // One recorded for another account of this server.
+    let (other_account, _, _) = account_with_key(&source, "elsewhere");
+    let made = native(
+        source.native_port,
+        &format!("s3 create remote bucket theirs {other_account} {endpoint} us-east-1 k s"),
     );
+    assert_eq!(made["remote_bucket"], "theirs", "{made}");
     let all = sql_rows(source.native_port, "SELECT * FROM sys.dm_s3_remote_buckets");
     assert!(
         !format!("{all:?}").contains(&far_secret),
@@ -13709,6 +13712,21 @@ if phase == "buckets":
         c.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     print("ok")
 elif phase == "replicas":
+    # A remote bucket's name cannot be taken by a bucket of this server.
+    try:
+        s3.create_bucket(Bucket="far")
+        raise SystemExit("a bucket took a remote bucket's name")
+    except s3.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == "BucketAlreadyExists", error.response
+    # A remote bucket recorded for another account is refused as its bucket.
+    try:
+        s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE, "Rules": [{
+            "ID": "x", "Priority": 1, "Status": "Enabled", "Filter": {},
+            "DeleteMarkerReplication": {"Status": "Disabled"},
+            "Destination": {"Bucket": "arn:aws:s3:::theirs"}}]})
+        raise SystemExit("replicated to another account's remote bucket")
+    except s3.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == "NotImplemented", error.response
     rule = lambda prefix, destination, priority: {"ID": prefix, "Priority": priority, "Status": "Enabled",
         "Filter": {"Prefix": prefix}, "DeleteMarkerReplication": {"Status": "Disabled"},
         "Destination": {"Bucket": f"arn:aws:s3:::{destination}", "StorageClass": "STANDARD_IA"}}

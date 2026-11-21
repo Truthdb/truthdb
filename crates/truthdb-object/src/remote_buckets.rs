@@ -1,6 +1,7 @@
 //! Buckets on another S3 service that replication may send to (`s3 create
-//! remote bucket`): each by its name, with the endpoint, region and keys to
-//! reach it. A replication destination names a bucket of this server first,
+//! remote bucket`): each by its name, with the account of this server it is
+//! recorded for (only that account's buckets replicate to it, with its
+//! keys), and the endpoint, region and keys to reach it. A replication destination names a bucket of this server first,
 //! then one of these (bucket names are global in S3: one name, one place).
 //! The secret lives in the database, which whole-database encryption covers.
 
@@ -17,6 +18,8 @@ const FORMAT: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteBucket {
     pub name: String,
+    /// The account of this server whose buckets may replicate to it.
+    pub account: String,
     /// `http(s)://host[:port]`.
     pub endpoint: String,
     pub region: String,
@@ -31,6 +34,7 @@ impl RemoteBucket {
     fn encode(&self) -> Vec<u8> {
         let mut out = Writer::default();
         out.u8(FORMAT);
+        out.str(&self.account);
         out.str(&self.endpoint);
         out.str(&self.region);
         out.str(&self.access_key);
@@ -52,6 +56,7 @@ impl RemoteBucket {
         if input.u8()? != FORMAT {
             return Err(input.corrupt());
         }
+        let account = input.str()?;
         let endpoint = input.str()?;
         let region = input.str()?;
         let access_key = input.str()?;
@@ -71,6 +76,7 @@ impl RemoteBucket {
         }
         Ok(RemoteBucket {
             name: name.to_string(),
+            account,
             endpoint,
             region,
             access_key,
@@ -140,6 +146,7 @@ mod tests {
         for ca_pem in [None, Some(b"-----BEGIN CERTIFICATE-----".to_vec())] {
             let remote = RemoteBucket {
                 name: "far".into(),
+                account: "111111111111".into(),
                 endpoint: "https://s3.example:9000".into(),
                 region: "eu-west-1".into(),
                 access_key: "AKIA".into(),

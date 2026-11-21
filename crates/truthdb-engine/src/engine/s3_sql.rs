@@ -617,6 +617,7 @@ fn open_remote_buckets(
     Ok(ExternalRowset {
         columns: vec![
             nvarchar("bucket", 63),
+            nvarchar("account_id", 12),
             nvarchar_max("endpoint"),
             nvarchar("region", 64),
             nvarchar("access_key", 128),
@@ -650,6 +651,7 @@ impl ExternalStream for RemoteBucketStream {
             .map(|remote| {
                 vec![
                     text(&remote.name),
+                    text(&remote.account),
                     text(&remote.endpoint),
                     text(&remote.region),
                     text(&remote.access_key),

@@ -6858,7 +6858,7 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
     };
     let queue = || {
         ObjFile::new(&mut storage.lock())
-            .replication_queue(100)
+            .replication_queue(None, 100)
             .unwrap()
     };
     // Written: PENDING and queued at once, under the rule of highest
