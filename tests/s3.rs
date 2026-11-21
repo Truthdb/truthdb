@@ -13360,6 +13360,162 @@ print("ok")
 "#;
 
 #[test]
+fn inventory_reports_list_a_buckets_objects_once_a_day_across_a_crash() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let mut server = start_server();
+    let (_, key, secret) = account_with_key(&server, "inventoried");
+    let script = server.dir.join("inventory_reports.py");
+    std::fs::write(&script, INVENTORY_REPORTS_SCRIPT).expect("script");
+    let run = |phase: &str, port: u16| {
+        let output = Command::new(&python)
+            .arg(&script)
+            .args([phase, &port.to_string(), &key, &secret])
+            .output()
+            .expect("run python");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+            "{phase}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run("reports", server.s3_port);
+    // A configuration put just before a crash: its run, cut short or not,
+    // is made once; the reports made before are not made again the same day.
+    run("arm", server.s3_port);
+    crash_and_restart(&mut server);
+    run("after", server.s3_port);
+}
+
+const INVENTORY_REPORTS_SCRIPT: &str = r#"
+import csv, gzip, hashlib, io, json, sys, time
+import boto3, botocore.config
+phase, port, key, secret = sys.argv[1:5]
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+def read(bucket, key):
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+def manifests(bucket, prefix):
+    listed = s3.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])
+    return [o["Key"] for o in listed if o["Key"].endswith("/manifest.json")]
+def lists(bucket, prefix):
+    # A run's list is named by when it started: one a run.
+    return s3.list_objects_v2(Bucket=bucket, Prefix=prefix + "data/").get("KeyCount", 0)
+def wait_manifest(bucket, prefix):
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        found = manifests(bucket, prefix)
+        if found:
+            return found
+        time.sleep(0.2)
+    raise SystemExit(f"no manifest under {bucket}/{prefix}")
+def report(bucket, prefix):
+    [manifest_key] = wait_manifest(bucket, prefix)
+    raw = read(bucket, manifest_key)
+    manifest = json.loads(raw)
+    checksum = read(bucket, manifest_key[:-len("json")] + "checksum").decode()
+    assert checksum == hashlib.md5(raw).hexdigest(), checksum
+    [listed] = manifest["files"]
+    data = read(bucket, listed["key"])
+    assert listed["size"] == len(data) and listed["MD5checksum"] == hashlib.md5(data).hexdigest(), listed
+    assert listed["key"].startswith(prefix) and "/data/" in listed["key"] and listed["key"].endswith(".csv.gz")
+    stamp = manifest_key.split("/")[-2]
+    hive = prefix + "hive/dt=" + stamp[:10] + "-" + stamp[11:13] + "-" + stamp[14:16] + "/symlink.txt"
+    assert read(bucket, hive).decode() == f"s3://{bucket}/{listed['key']}\n"
+    rows = list(csv.reader(io.StringIO(gzip.decompress(data).decode())))
+    return manifest, sorted(rows), manifest_key
+
+if phase == "reports":
+    s3.create_bucket(Bucket="source")
+    # Written before versioning: a null version.
+    s3.put_object(Bucket="source", Key="early", Body=b"early")
+    s3.put_bucket_versioning(Bucket="source", VersioningConfiguration={"Status": "Enabled"})
+    s3.create_bucket(Bucket="lists")
+    s3.create_bucket(Bucket="kept", ObjectLockEnabledForBucket=True)
+    s3.put_object_lock_configuration(Bucket="kept", ObjectLockConfiguration={"ObjectLockEnabled": "Enabled",
+        "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 1}}})
+    first = s3.put_object(Bucket="source", Key="docs/x", Body=b"one")["VersionId"]
+    second = s3.put_object(Bucket="source", Key="docs/x", Body=b"second")["VersionId"]
+    spaced = s3.put_object(Bucket="source", Key="docs/a b.txt", Body=b"spaced")["VersionId"]
+    s3.put_object(Bucket="source", Key="other/y", Body=b"y")
+    gone = s3.put_object(Bucket="source", Key="docs/gone", Body=b"g")["VersionId"]
+    marker = s3.delete_object(Bucket="source", Key="docs/gone")["VersionId"]
+    def configuration(id, bucket, **extra):
+        config = {"Id": id, "IsEnabled": True, "IncludedObjectVersions": "Current",
+            "Schedule": {"Frequency": "Daily"},
+            "Destination": {"S3BucketDestination": {"Bucket": f"arn:aws:s3:::{bucket}", "Format": "CSV"}}}
+        config.update(extra)
+        return config
+    current = configuration("current", "lists", Filter={"Prefix": "docs/"},
+        OptionalFields=["ObjectOwner", "Size", "ETag", "StorageClass", "IsMultipartUploaded"])
+    current["Destination"]["S3BucketDestination"]["Prefix"] = "inv/"
+    s3.put_bucket_inventory_configuration(Bucket="source", Id="current", InventoryConfiguration=current)
+    s3.put_bucket_inventory_configuration(Bucket="source", Id="all", InventoryConfiguration=configuration(
+        "all", "kept", IncludedObjectVersions="All", OptionalFields=["Size", "ObjectLockLegalHoldStatus"]))
+    # More than a page (1,000) of each listing.
+    s3.create_bucket(Bucket="big")
+    s3.put_bucket_versioning(Bucket="big", VersioningConfiguration={"Status": "Enabled"})
+    for n in range(1001):
+        s3.put_object(Bucket="big", Key=f"many/{n:04}", Body=b"m")
+    for id, versions in [("many", "Current"), ("manyall", "All")]:
+        s3.put_bucket_inventory_configuration(Bucket="big", Id=id, InventoryConfiguration=configuration(
+            id, "lists", Filter={"Prefix": "many/"}, IncludedObjectVersions=versions))
+    off = configuration("off", "lists")
+    off["IsEnabled"] = False
+    s3.put_bucket_inventory_configuration(Bucket="source", Id="off", InventoryConfiguration=off)
+
+    manifest, rows, _ = report("lists", "inv/source/current/")
+    assert manifest["sourceBucket"] == "source" and manifest["destinationBucket"] == "arn:aws:s3:::lists", manifest
+    assert manifest["version"] == "2016-11-30" and manifest["fileFormat"] == "CSV", manifest
+    assert manifest["fileSchema"] == "Bucket, Key, Size, ETag, StorageClass, IsMultipartUploaded, ObjectOwner", manifest
+    etag = lambda body: hashlib.md5(body).hexdigest()
+    owner = s3.list_buckets()["Owner"]["ID"]
+    assert rows == [
+        ["source", "docs/a%20b.txt", "6", etag(b"spaced"), "STANDARD", "False", owner],
+        ["source", "docs/x", "6", etag(b"second"), "STANDARD", "False", owner],
+    ], rows
+
+    manifest, rows, manifest_key = report("kept", "source/all/")
+    assert manifest["fileSchema"] == "Bucket, Key, VersionId, IsLatest, IsDeleteMarker, Size, ObjectLockLegalHoldStatus"
+    assert rows == sorted([
+        ["source", "docs/a%20b.txt", spaced, "True", "False", "6", "OFF"],
+        ["source", "docs/gone", marker, "True", "True", "", "OFF"],
+        ["source", "docs/gone", gone, "False", "False", "1", "OFF"],
+        ["source", "docs/x", second, "True", "False", "6", "OFF"],
+        ["source", "docs/x", first, "False", "False", "3", "OFF"],
+        ["source", "early", "", "True", "False", "5", "OFF"],
+        ["source", "other/y", rows[-1][2], "True", "False", "1", "OFF"],
+    ]), rows
+    for id in ["many", "manyall"]:
+        _, rows, _ = report("lists", f"big/{id}/")
+        assert [row[1] for row in rows] == [f"many/{n:04}" for n in range(1001)], (id, len(rows))
+    # The destination's default retention applies to the report's files.
+    assert s3.head_object(Bucket="kept", Key=manifest_key)["ObjectLockMode"] == "GOVERNANCE"
+    # A disabled configuration makes none; a daily one, one a day.
+    time.sleep(3)
+    assert manifests("lists", "source/off/") == [] and lists("lists", "source/off/") == 0
+    assert lists("lists", "inv/source/current/") == 1 and lists("kept", "source/all/") == 1
+elif phase == "arm":
+    s3.put_bucket_inventory_configuration(Bucket="source", Id="late", InventoryConfiguration={"Id": "late",
+        "IsEnabled": True, "IncludedObjectVersions": "Current", "Schedule": {"Frequency": "Weekly"},
+        "Destination": {"S3BucketDestination": {"Bucket": "arn:aws:s3:::lists", "Format": "CSV"}}})
+else:
+    _, rows, _ = report("lists", "source/late/")
+    assert [row[1] for row in rows] == ["docs/a%20b.txt", "docs/x", "early", "other/y"], rows
+    time.sleep(3)
+    assert lists("lists", "source/late/") == 1
+    assert lists("lists", "inv/source/current/") == 1 and lists("kept", "source/all/") == 1
+    # A deleted configuration is no longer tracked.
+    s3.delete_bucket_inventory_configuration(Bucket="source", Id="current")
+print("ok")
+"#;
+
+#[test]
 fn trail_event_selectors_choose_management_and_data_events() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

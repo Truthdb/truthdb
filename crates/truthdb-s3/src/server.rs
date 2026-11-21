@@ -119,9 +119,13 @@ pub async fn serve(
     tls: Option<tokio_rustls::TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Batch Operations jobs run beside the listener, and the metric
-    // history's flushes.
+    // Batch Operations jobs and inventory reports run beside the listener,
+    // and the metric history's flushes.
     tokio::spawn(crate::batch_run::run(Arc::clone(&state), shutdown.clone()));
+    tokio::spawn(crate::inventory_run::run(
+        Arc::clone(&state),
+        shutdown.clone(),
+    ));
     // Their last flushes are waited for: what was counted and logged is
     // written before the engine closes.
     let flusher = tokio::spawn(crate::metric_history::run(

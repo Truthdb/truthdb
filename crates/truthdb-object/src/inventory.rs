@@ -1,9 +1,15 @@
 //! A bucket's S3 Inventory configurations (kept as bucket configurations
 //! of kind `BUCKET_INVENTORY`, by id): what an inventory report lists and
 //! where it goes. Kept as JSON here, where the object jobs read them; the
-//! S3 layer takes and renders them as XML.
+//! S3 layer takes and renders them as XML. Each configuration's report
+//! runs are tracked by when the last one started.
 
 use serde_json::{Value, json};
+use truthdb_core::relstore::ctx::OpMode;
+use truthdb_core::storage::StorageError;
+
+use crate::codec::corrupt;
+use crate::{INVENTORY_STATE_TREE, ObjFile, ObjTxn};
 
 /// The format an inventory list is written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +98,101 @@ impl InventoryConfig {
                 _ => return None,
             },
         })
+    }
+}
+
+/// A configuration's run state key: its bucket, 0, its id (bucket names
+/// hold no byte below `-`, so a bucket's keys lie between `bucket\0` and
+/// `bucket\1`).
+fn state_key(bucket: &str, id: &str) -> Vec<u8> {
+    [bucket.as_bytes(), &[0], id.as_bytes()].concat()
+}
+
+impl ObjTxn<'_, '_> {
+    /// Tracks configuration `id`'s runs from now on, none run yet; one
+    /// already tracked (a configuration replaced) keeps its last run.
+    pub fn track_inventory(&mut self, bucket: &str, id: &str) -> Result<(), StorageError> {
+        let tree = self.trees.inventory_state();
+        let key = state_key(bucket, id);
+        if tree.get(self.ctx, &key)?.is_none() {
+            tree.insert_unique(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                &key,
+                &0u64.to_be_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Stops tracking configuration `id` (deleted).
+    pub fn forget_inventory(&mut self, bucket: &str, id: &str) -> Result<(), StorageError> {
+        self.trees.inventory_state().delete(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &state_key(bucket, id),
+        )?;
+        Ok(())
+    }
+
+    /// Stops tracking every configuration of a bucket being deleted.
+    pub(crate) fn forget_inventories(&mut self, bucket: &str) -> Result<(), StorageError> {
+        let tree = self.trees.inventory_state();
+        let lower = [bucket.as_bytes(), &[0]].concat();
+        let upper = [bucket.as_bytes(), &[1]].concat();
+        for (key, _) in tree.scan_range(self.ctx, Some(&lower), Some(&upper))? {
+            tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
+        }
+        Ok(())
+    }
+
+    /// Records that a run of configuration `id` started at `started_ms`
+    /// ended; false (nothing recorded) when it is no longer tracked.
+    pub fn inventory_ran(
+        &mut self,
+        bucket: &str,
+        id: &str,
+        started_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let tree = self.trees.inventory_state();
+        let key = state_key(bucket, id);
+        if tree.get(self.ctx, &key)?.is_none() {
+            return Ok(false);
+        }
+        let mode = &mut OpMode::Txn(self.txn);
+        tree.delete(self.ctx, mode, &key)?;
+        tree.insert_unique(self.ctx, mode, &key, &started_ms.to_be_bytes())?;
+        Ok(true)
+    }
+}
+
+impl ObjFile<'_> {
+    /// Every tracked configuration: its bucket, its id, and when its last
+    /// run started (0: none has).
+    pub fn inventory_runs(&mut self) -> Result<Vec<(String, String, u64)>, StorageError> {
+        let Some(states) = self.existing_tree(INVENTORY_STATE_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let mut runs = Vec::new();
+        for (key, row) in states.scan(&mut self.core.page_ctx(0))? {
+            let split = key
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or_else(|| corrupt("inventory state"))?;
+            let text = |bytes: &[u8]| {
+                String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("inventory state"))
+            };
+            let last: [u8; 8] = row
+                .as_slice()
+                .try_into()
+                .map_err(|_| corrupt("inventory state"))?;
+            runs.push((
+                text(&key[..split])?,
+                text(&key[split + 1..])?,
+                u64::from_be_bytes(last),
+            ));
+        }
+        Ok(runs)
     }
 }
 

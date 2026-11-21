@@ -16,6 +16,7 @@ pub mod delete;
 pub mod error;
 pub mod iam_api;
 pub mod inventory_config;
+pub mod inventory_run;
 pub mod lifecycle;
 pub mod listing;
 pub mod logging_config;

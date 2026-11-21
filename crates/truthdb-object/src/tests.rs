@@ -6417,3 +6417,63 @@ fn a_metric_write_reaches_every_resolution_or_none_across_a_crash() {
         crash_at += 1;
     }
 }
+
+#[test]
+fn inventory_runs_are_tracked_until_their_configuration_or_bucket_goes() {
+    let path = temp_path("inventory-runs");
+    let storage = create(&path);
+    let mut lock = storage.lock();
+    let mut file = ObjFile::new(&mut lock);
+    for bucket in ["alpha", "alphabet"] {
+        file.transaction(|tx| tx.create_bucket(bucket, DEFAULT_ACCOUNT, 5))
+            .unwrap()
+            .unwrap();
+    }
+    file.transaction(|tx| {
+        tx.track_inventory("alpha", "daily")?;
+        tx.track_inventory("alpha", "weekly")?;
+        tx.track_inventory("alphabet", "daily")
+    })
+    .unwrap();
+    assert!(
+        file.transaction(|tx| tx.inventory_ran("alpha", "daily", 42))
+            .unwrap()
+    );
+    // A replaced configuration keeps its last run; an untracked one records
+    // none.
+    file.transaction(|tx| tx.track_inventory("alpha", "daily"))
+        .unwrap();
+    assert!(
+        !file
+            .transaction(|tx| tx.inventory_ran("alpha", "gone", 43))
+            .unwrap()
+    );
+    let runs = |file: &mut ObjFile<'_>| file.inventory_runs().unwrap();
+    assert_eq!(
+        runs(&mut file),
+        [
+            ("alpha".to_string(), "daily".to_string(), 42),
+            ("alpha".to_string(), "weekly".to_string(), 0),
+            ("alphabet".to_string(), "daily".to_string(), 0),
+        ]
+    );
+    file.transaction(|tx| tx.forget_inventory("alpha", "weekly"))
+        .unwrap();
+    // A deleted bucket's are forgotten, its neighbour's kept.
+    file.transaction(|tx| tx.delete_bucket("alpha"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runs(&mut file),
+        [("alphabet".to_string(), "daily".to_string(), 0)]
+    );
+    drop(lock);
+    drop(storage);
+    let storage = open(&path);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).inventory_runs().unwrap(),
+        [("alphabet".to_string(), "daily".to_string(), 0)]
+    );
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
+}
