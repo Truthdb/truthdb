@@ -798,7 +798,11 @@ async fn read_lock(
         if !enabled {
             return Ok(Err(truthdb_object::ObjectError::ObjectLockNotEnabled));
         }
-        Ok(Ok(file.object_lock(info.version)?))
+        Ok(Ok(file.object_lock(
+            &bucket_name,
+            &key_name,
+            info.version,
+        )?))
     })
     .await?;
     found.map_err(|err| crate::objects::object_error(err, bucket, key))
@@ -963,7 +967,7 @@ pub(crate) fn release_keys(
     let fixed = matches!(change, RetentionChange::Set(retention) if retention.event.is_none());
     if fixed && let Ok(info) = file.head_object(bucket, key, which)? {
         let held = file
-            .object_lock(info.version)?
+            .object_lock(bucket, key, info.version)?
             .retention
             .and_then(|retention| retention.event)
             .is_some_and(|event| event.on);

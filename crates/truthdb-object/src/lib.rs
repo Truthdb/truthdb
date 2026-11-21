@@ -37,6 +37,7 @@ mod stored;
 pub mod time;
 mod uploads;
 mod usage;
+mod version_state;
 
 #[cfg(test)]
 mod tests;
@@ -592,9 +593,11 @@ impl<'a> ObjFile<'a> {
         )?;
         self.eng.root = Some(tree.root);
         // A new engine holds nothing: its storage usage is counted from the
-        // start, with no backfill.
+        // start, with no backfill, and its versions' state is keyed by them
+        // from the start, with no migration.
         self.in_txn(|ctx, txn| {
             tree.insert_unique(ctx, &mut OpMode::Txn(txn), usage::DONE_KEY, &[1])?;
+            tree.insert_unique(ctx, &mut OpMode::Txn(txn), version_state::DONE_KEY, &[1])?;
             Ok(())
         })?;
         Ok(tree)

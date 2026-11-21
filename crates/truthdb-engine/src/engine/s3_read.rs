@@ -199,7 +199,13 @@ impl BodyReader {
             ));
         }
         if file
-            .archived_unreadable(info.version, info.storage_class, super::now_ms())
+            .archived_unreadable(
+                bucket,
+                key,
+                info.version,
+                info.storage_class,
+                super::now_ms(),
+            )
             .map_err(super::s3_sql::storage_error)?
         {
             return Err(SqlError::new(

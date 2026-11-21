@@ -908,7 +908,7 @@ async fn deliver(state: &S3State, account: &str, name: &str, created: u64, recor
                     )? {
                         Ok(info) => {
                             if let Some(lock) = &lock {
-                                tx.set_lock(info.version, lock)?;
+                                tx.set_lock(&trail.bucket, &key, info.version, lock)?;
                             }
                             trail.delivered_ms = Some(now);
                             trail.delivery_error = None;

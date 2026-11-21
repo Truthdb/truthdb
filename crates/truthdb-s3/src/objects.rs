@@ -511,7 +511,7 @@ pub async fn put_object(
                     DROP_GRACE_MS,
                 )?;
                 if let (Ok(info), Some(lock)) = (&stored, &lock) {
-                    tx.set_lock(info.version, lock)?;
+                    tx.set_lock(&bucket_name, &key_name, info.version, lock)?;
                 }
                 Ok(stored)
             })?;
@@ -967,8 +967,8 @@ pub(crate) async fn read_object(
         let versioning = versioning_of(file, &lookup_bucket)?;
         let (lock, restore) = match &found {
             Ok(info) => (
-                file.object_lock(info.version)?,
-                file.restore(info.version)?
+                file.object_lock(&lookup_bucket, &lookup_key, info.version)?,
+                file.restore(&lookup_bucket, &lookup_key, info.version)?
                     .and_then(|restore| restore.state(now_ms())),
             ),
             Err(_) => (truthdb_object::ObjectLock::default(), None),

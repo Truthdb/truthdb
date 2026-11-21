@@ -860,7 +860,7 @@ impl ObjFile<'_> {
                     .transpose()?
                     .is_none_or(|next| next != key);
             let tags = if read_tags && !info.delete_marker {
-                self.version_attrs(version)?.tags
+                self.version_attrs(bucket, &key, version)?.tags
             } else {
                 Vec::new()
             };
@@ -885,7 +885,10 @@ impl ObjFile<'_> {
             // protects (a removal is refused by the engine itself).
             let action = match action {
                 Some(Action::Transition(_))
-                    if !current && self.object_lock(version)?.blocks_delete(now_ms, false) =>
+                    if !current
+                        && self
+                            .object_lock(bucket, &key, version)?
+                            .blocks_delete(now_ms, false) =>
                 {
                     None
                 }

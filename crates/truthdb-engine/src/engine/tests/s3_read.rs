@@ -1365,12 +1365,17 @@ fn an_archived_object_is_read_only_while_restored_and_skipped_otherwise() {
     assert_eq!(sql_error_number(&engine, read_one), 4861);
     assert!(
         engine
-            .object(|file| file.restore(version))
+            .object(|file| file.restore("cold", "a/frozen.csv", version))
             .unwrap()
             .is_some()
     );
     engine.object_gc().expect("sweep");
-    assert_eq!(engine.object(|file| file.restore(version)).unwrap(), None);
+    assert_eq!(
+        engine
+            .object(|file| file.restore("cold", "a/frozen.csv", version))
+            .unwrap(),
+        None
+    );
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
