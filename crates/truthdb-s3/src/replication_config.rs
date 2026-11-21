@@ -117,11 +117,13 @@ fn destination(element: &Element) -> Result<Destination, S3Error> {
         .text_of("StorageClass")?
         .map(|name| crate::objects::storage_class(Some(name)))
         .transpose()?;
+    // Its owner is noted as the configuration is put.
     Ok(Destination {
         bucket,
         account,
         storage_class,
         owner_override,
+        owner: None,
     })
 }
 
@@ -430,6 +432,7 @@ pub async fn bucket_replication(
             // The buckets are checked and the configuration set in one
             // transaction: versioning cannot be suspended in between.
             crate::scope::object(state, move |file| {
+                let mut config = config;
                 let Some(info) = file.bucket(&name)? else {
                     return Ok(Err(None));
                 };
@@ -443,6 +446,13 @@ pub async fn bucket_replication(
                     refused_destination(file, &name, &info.owner, info.object_lock, &config)?
                 {
                     return Ok(Err(Some(refused)));
+                }
+                // The owner a destination of this server has now: replicas
+                // go there only while it has it.
+                for rule in &mut config.rules {
+                    rule.destination.owner = file
+                        .bucket(&rule.destination.bucket)?
+                        .map(|destination| destination.owner);
                 }
                 file.transaction(|tx| tx.put_replication(&name, &config))?;
                 Ok(Ok(()))
@@ -526,6 +536,7 @@ mod tests {
                     account: Some("000000000001".into()),
                     storage_class: Some(StorageClass::StandardIa),
                     owner_override: false,
+                    owner: None,
                 },
             }
         );
