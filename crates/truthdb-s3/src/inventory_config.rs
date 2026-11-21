@@ -2,8 +2,8 @@
 //! them, each naming what its report lists (every version or the current
 //! ones, under a prefix, with optional fields), where it goes (a bucket of
 //! the same owner, CSV or Parquet; ORC and SSE-KMS are not supported) and
-//! how often (daily or weekly). The reports themselves are made by the
-//! object jobs.
+//! how often (daily or weekly). The reports themselves are made by
+//! `inventory_run`.
 
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
@@ -338,12 +338,16 @@ pub async fn bucket_inventory(
                         return Ok(Some("TooManyConfigurations"));
                     }
                     tx.put_bucket_config(&bucket, BUCKET_INVENTORY, &id, &document)?;
+                    tx.track_inventory(&bucket, &id)?;
                     Ok(None)
                 })
             })
             .await?;
             match refused {
-                None => Ok(empty(StatusCode::OK)),
+                None => {
+                    crate::inventory_run::wake();
+                    Ok(empty(StatusCode::OK))
+                }
                 Some("TooManyConfigurations") => Err(S3Error::new(
                     400,
                     "TooManyConfigurations",
@@ -363,7 +367,10 @@ pub async fn bucket_inventory(
         }
         Method::DELETE => {
             let deleted = crate::scope::object(state, move |file| {
-                file.transaction(|tx| tx.delete_bucket_config(&bucket, BUCKET_INVENTORY, &id))
+                file.transaction(|tx| {
+                    tx.forget_inventory(&bucket, &id)?;
+                    tx.delete_bucket_config(&bucket, BUCKET_INVENTORY, &id)
+                })
             })
             .await?;
             if !deleted {

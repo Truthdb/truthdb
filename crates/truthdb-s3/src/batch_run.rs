@@ -61,7 +61,7 @@ const MAX_RESULT_TEXT: usize = 256;
 const MOVED: &str = "the batch job moved";
 /// How keys are written in reports and generated manifests: URL-encoded,
 /// '/' kept.
-const REPORT_KEY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+pub(crate) const REPORT_KEY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
@@ -174,7 +174,7 @@ impl Invoking {
 }
 
 /// Runs `op` on the object engine (for the runner: no request scope).
-async fn object<T, F>(state: &S3State, op: F) -> Result<T, String>
+pub(crate) async fn object<T, F>(state: &S3State, op: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&mut ObjFile<'_>) -> Result<T, StorageError> + Send + 'static,

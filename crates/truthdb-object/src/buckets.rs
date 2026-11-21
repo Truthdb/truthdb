@@ -275,6 +275,7 @@ impl ObjTxn<'_, '_> {
         self.drop_fulltext(name)?;
         self.forget_usage(name)?;
         self.forget_metrics(name)?;
+        self.forget_inventories(name)?;
         Ok(Ok(()))
     }
 }

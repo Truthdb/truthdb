@@ -193,6 +193,9 @@ const METRIC_SERIES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 40;
 const ACTIVITY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 41;
 /// (time, event key) -> nothing: the events by when they were made.
 const ACTIVITY_EXPIRY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 42;
+/// (bucket, 0, inventory configuration id) -> when its last report run
+/// started (see `inventory`).
+const INVENTORY_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 43;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -317,7 +320,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 43;
+const TREE_COUNT: usize = 44;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -461,6 +464,9 @@ impl Trees {
     }
     pub fn activity_expiry(&self) -> BTree {
         self.tree(ACTIVITY_EXPIRY_TREE)
+    }
+    pub fn inventory_state(&self) -> BTree {
+        self.tree(INVENTORY_STATE_TREE)
     }
 }
 

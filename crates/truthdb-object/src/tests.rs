@@ -353,6 +353,33 @@ fn a_slow_upload_that_keeps_writing_is_not_taken_for_abandoned() {
 }
 
 #[test]
+fn a_touched_writer_is_not_taken_for_abandoned_before_it_fills_a_segment() {
+    let path = temp_path("touched");
+    let storage = create(&path);
+    let mut touched = BodyWriter::begin(&storage, now()).unwrap();
+    let mut idle = BodyWriter::begin(&storage, now()).unwrap();
+    for writer in [&mut touched, &mut idle] {
+        writer
+            .write(&storage, b"short of a segment", now())
+            .unwrap();
+    }
+    touched.touch(&storage, now() + ABANDON - 1).unwrap();
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now() + ABANDON, ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(freed.bodies, 1, "only the idle one");
+    assert!(idle.finish(&storage, now() + ABANDON).is_err());
+    let sealed = touched.finish(&storage, now() + ABANDON).unwrap();
+    let body = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| sealed.seal_in(tx))
+        .unwrap()
+        .body;
+    assert_eq!(read(&storage, body, 0, 5).unwrap(), b"short");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_writer_refuses_further_use_after_an_error() {
     let path = temp_path("poison");
     let storage = create(&path);
@@ -6416,4 +6443,64 @@ fn a_metric_write_reaches_every_resolution_or_none_across_a_crash() {
         }
         crash_at += 1;
     }
+}
+
+#[test]
+fn inventory_runs_are_tracked_until_their_configuration_or_bucket_goes() {
+    let path = temp_path("inventory-runs");
+    let storage = create(&path);
+    let mut lock = storage.lock();
+    let mut file = ObjFile::new(&mut lock);
+    for bucket in ["alpha", "alphabet"] {
+        file.transaction(|tx| tx.create_bucket(bucket, DEFAULT_ACCOUNT, 5))
+            .unwrap()
+            .unwrap();
+    }
+    file.transaction(|tx| {
+        tx.track_inventory("alpha", "daily")?;
+        tx.track_inventory("alpha", "weekly")?;
+        tx.track_inventory("alphabet", "daily")
+    })
+    .unwrap();
+    assert!(
+        file.transaction(|tx| tx.inventory_ran("alpha", "daily", 42))
+            .unwrap()
+    );
+    // A replaced configuration keeps its last run; an untracked one records
+    // none.
+    file.transaction(|tx| tx.track_inventory("alpha", "daily"))
+        .unwrap();
+    assert!(
+        !file
+            .transaction(|tx| tx.inventory_ran("alpha", "gone", 43))
+            .unwrap()
+    );
+    let runs = |file: &mut ObjFile<'_>| file.inventory_runs().unwrap();
+    assert_eq!(
+        runs(&mut file),
+        [
+            ("alpha".to_string(), "daily".to_string(), 42),
+            ("alpha".to_string(), "weekly".to_string(), 0),
+            ("alphabet".to_string(), "daily".to_string(), 0),
+        ]
+    );
+    file.transaction(|tx| tx.forget_inventory("alpha", "weekly"))
+        .unwrap();
+    // A deleted bucket's are forgotten, its neighbour's kept.
+    file.transaction(|tx| tx.delete_bucket("alpha"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runs(&mut file),
+        [("alphabet".to_string(), "daily".to_string(), 0)]
+    );
+    drop(lock);
+    drop(storage);
+    let storage = open(&path);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).inventory_runs().unwrap(),
+        [("alphabet".to_string(), "daily".to_string(), 0)]
+    );
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
 }
