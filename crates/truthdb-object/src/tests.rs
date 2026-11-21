@@ -6837,6 +6837,8 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
             off.enabled = false;
             let config = ReplicationConfig {
                 role: "role".to_string(),
+                account: DEFAULT_ACCOUNT.to_string(),
+                user: Some("deployer".to_string()),
                 rules: vec![
                     rule("logs", 1, "logs/", None),
                     rule("cold", 2, "logs/cold/", Some(StorageClass::StandardIa)),
@@ -6876,6 +6878,16 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
         Some(ReplicationStatus::Pending)
     );
     assert_eq!(status("src", "other", other), None);
+    // An archived version is not replicated (until restored and copied).
+    let frozen = put_at(
+        &storage,
+        "src",
+        "logs/frozen",
+        10,
+        StorageClass::Glacier,
+        T0,
+    );
+    assert_eq!(status("src", "logs/frozen", frozen), None);
     let queued = queue();
     assert_eq!(
         queued

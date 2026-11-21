@@ -12,7 +12,15 @@
 //! version's tags or lock is queued for its replica too.
 //!
 //! A version's status is kept in the replication status tree under its row
-//! key in the objects tree; it goes with the version.
+//! key in the objects tree; it goes with the version. A version in an
+//! archive class (GLACIER, DEEP_ARCHIVE) is not replicated, as S3 does not
+//! replicate one until it is restored and copied.
+//!
+//! A configuration is replicated as the one who put it (the account, and
+//! its user), as S3 replicates as the role the configuration names. A
+//! configuration stored as XML by an earlier build of this release is read
+//! as none until the runner stores it anew (see `truthdb-s3`'s
+//! `replication_run`).
 
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
@@ -35,6 +43,10 @@ pub struct ReplicationConfig {
     /// The role S3 would assume; kept as given (there are no roles here).
     pub role: String,
     pub rules: Vec<ReplicationRule>,
+    /// Who put it: the account and its user (none for the account's root);
+    /// replicas are written as them.
+    pub account: String,
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +73,14 @@ impl ReplicationConfig {
         let mut out = Writer::default();
         out.u8(FORMAT);
         out.str(&self.role);
+        out.str(&self.account);
+        match &self.user {
+            None => out.u8(0),
+            Some(user) => {
+                out.u8(1);
+                out.str(user);
+            }
+        }
         out.u32(self.rules.len() as u32);
         for rule in &self.rules {
             out.str(&rule.id);
@@ -95,6 +115,8 @@ impl ReplicationConfig {
             return Err(input.corrupt());
         }
         let role = input.str()?;
+        let account = input.str()?;
+        let user = input.present()?.then(|| input.str()).transpose()?;
         let mut rules = Vec::new();
         for _ in 0..input.count()? {
             let id = input.str()?;
@@ -123,7 +145,20 @@ impl ReplicationConfig {
         if !input.rest().is_empty() {
             return Err(input.corrupt());
         }
-        Ok(ReplicationConfig { role, rules })
+        Ok(ReplicationConfig {
+            role,
+            rules,
+            account,
+            user,
+        })
+    }
+
+    /// A stored configuration; none for one an earlier build stored as XML.
+    fn decode_stored(bytes: &[u8]) -> Result<Option<Self>, StorageError> {
+        match bytes.first() {
+            Some(b'<') => Ok(None),
+            _ => Self::decode(bytes).map(Some),
+        }
     }
 
     /// The rule that replicates a new version of `key`: of the enabled rules
@@ -270,9 +305,11 @@ impl ObjTxn<'_, '_> {
         &mut self,
         bucket: &str,
     ) -> Result<Option<ReplicationConfig>, StorageError> {
-        self.bucket_config_in(bucket, BUCKET_REPLICATION, "")?
-            .map(|bytes| ReplicationConfig::decode(&bytes))
-            .transpose()
+        Ok(self
+            .bucket_config_in(bucket, BUCKET_REPLICATION, "")?
+            .map(|bytes| ReplicationConfig::decode_stored(&bytes))
+            .transpose()?
+            .flatten())
     }
 
     /// The replication status of version `version` of `bucket`'s `key`.
@@ -345,6 +382,9 @@ impl ObjTxn<'_, '_> {
         let Some(rule) = config.rule_for(key) else {
             return Ok(());
         };
+        if info.storage_class.is_archived() {
+            return Ok(());
+        }
         let queued = QueuedReplication {
             number: 0,
             work: ReplicationWork::Create,
@@ -413,6 +453,24 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
+    /// Takes queued replication `number` off the queue unmade, as no rule
+    /// sends its version there any more: a version still PENDING is no
+    /// longer replicated, and has no status.
+    pub fn drop_replication(&mut self, queued: &QueuedReplication) -> Result<(), StorageError> {
+        self.trees.replication_queue().delete(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &queued.number.to_be_bytes(),
+        )?;
+        if queued.work == ReplicationWork::Create
+            && self.replication_status_of(&queued.bucket, &queued.key, queued.version)?
+                == Some(ReplicationStatus::Pending)
+        {
+            self.forget_replication_status(&queued.bucket, &queued.key, queued.version)?;
+        }
+        Ok(())
+    }
+
     /// Writes the replica of `source` in `bucket` as `key`: the same version
     /// number and time, with `attrs`, in `class`, locked by `lock`, sharing
     /// the source's body; its status is REPLICA. The bucket must have
@@ -472,9 +530,19 @@ impl ObjTxn<'_, '_> {
 impl ObjFile<'_> {
     /// The bucket's replication configuration, if it has one.
     pub fn replication(&mut self, bucket: &str) -> Result<Option<ReplicationConfig>, StorageError> {
-        self.bucket_config(bucket, BUCKET_REPLICATION, "")?
-            .map(|bytes| ReplicationConfig::decode(&bytes))
-            .transpose()
+        Ok(self
+            .bucket_config(bucket, BUCKET_REPLICATION, "")?
+            .map(|bytes| ReplicationConfig::decode_stored(&bytes))
+            .transpose()?
+            .flatten())
+    }
+
+    /// The bucket's replication configuration as an earlier build stored it
+    /// (XML), if it is stored so.
+    pub fn replication_xml(&mut self, bucket: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self
+            .bucket_config(bucket, BUCKET_REPLICATION, "")?
+            .filter(|bytes| bytes.first() == Some(&b'<')))
     }
 
     /// The replication status of version `version` of `bucket`'s `key`.

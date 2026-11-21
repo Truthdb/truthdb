@@ -10,7 +10,8 @@
 //! replication time and metrics, and existing-object replication.
 //!
 //! The `Role` is kept as given: there are no IAM roles, so replication acts
-//! as the source bucket's owner. The object engine keeps the configuration
+//! as the one who put the configuration (its account, and its user): it
+//! writes a replica only where they may `s3:ReplicateObject`. The object engine keeps the configuration
 //! and queues what it replicates (see `truthdb_object::ReplicationConfig`);
 //! `replication_run` writes the replicas.
 
@@ -215,7 +216,13 @@ pub fn parse(body: &[u8]) -> Result<ReplicationConfig, S3Error> {
     {
         return Err(not_yet("Replication to more than one destination"));
     }
-    Ok(ReplicationConfig { role, rules })
+    // Who puts it is the request's (see `bucket_replication`).
+    Ok(ReplicationConfig {
+        role,
+        rules,
+        account: String::new(),
+        user: None,
+    })
 }
 
 /// The configuration as GetBucketReplication answers it.
@@ -370,8 +377,15 @@ pub async fn bucket_replication(
                 .expect("a valid response"))
         }
         Method::PUT => {
+            // Replicas are written as the one who puts it.
+            let principal = auth
+                .principal
+                .clone()
+                .ok_or_else(|| S3Error::access_denied("Access Denied"))?;
             let body = read_checked_body(request, auth, MAX_BODY).await?;
-            let config = parse(&body)?;
+            let mut config = parse(&body)?;
+            config.account = principal.account;
+            config.user = principal.user;
             // The buckets are checked and the configuration set in one
             // transaction: versioning cannot be suspended in between.
             crate::scope::object(state, move |file| {
