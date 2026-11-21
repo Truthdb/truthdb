@@ -46,6 +46,9 @@ pub const ACCOUNT_TRAIL: u8 = 12;
 /// Bucket configurations: its request metrics configurations, by id (the
 /// rendered XML).
 pub const BUCKET_METRICS: u8 = 11;
+/// Bucket configuration: its replication configuration (the rendered XML).
+/// While it is set, the bucket's versioning stays enabled.
+pub const BUCKET_REPLICATION: u8 = 13;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()
@@ -262,6 +265,17 @@ impl ObjTxn<'_, '_> {
     ) -> Result<bool, StorageError> {
         let tree = self.trees.bucket_config();
         self.delete_document(&tree, &config_prefix(bucket, kind, id))
+    }
+
+    /// Whether bucket configuration `kind` is set.
+    pub(crate) fn has_bucket_config(
+        &mut self,
+        bucket: &str,
+        kind: u8,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        let tree = self.trees.bucket_config();
+        Ok(!chunks(self.ctx, &tree, &config_prefix(bucket, kind, id))?.is_empty())
     }
 
     /// The ids of the bucket's configurations of `kind`, in order.

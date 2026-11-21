@@ -6504,3 +6504,45 @@ fn inventory_runs_are_tracked_until_their_configuration_or_bucket_goes() {
     drop(storage);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_bucket_with_replication_keeps_its_versioning_enabled() {
+    use crate::{BUCKET_REPLICATION, BucketError, Versioning};
+    let path = temp_path("replication-versioning");
+    let storage = create(&path);
+    let txn = |body: &mut dyn FnMut(&mut crate::ObjTxn<'_, '_>) -> Result<_, StorageError>| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| body(tx))
+            .unwrap()
+    };
+    txn(&mut |tx| {
+        tx.create_bucket("source", DEFAULT_ACCOUNT, now())?.unwrap();
+        tx.set_versioning("source", Versioning::Enabled)
+    })
+    .unwrap();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.put_bucket_config("source", BUCKET_REPLICATION, "", b"<config/>"))
+        .unwrap();
+    assert_eq!(
+        txn(&mut |tx| tx.set_versioning("source", Versioning::Suspended)),
+        Err(BucketError::InvalidBucketState(
+            "Replication is configured on the bucket, so its versioning cannot be suspended"
+        ))
+    );
+    // Enabling it again is no change, and allowed.
+    txn(&mut |tx| tx.set_versioning("source", Versioning::Enabled)).unwrap();
+    // Without the configuration, it can be suspended.
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_bucket_config("source", BUCKET_REPLICATION, ""))
+            .unwrap()
+    );
+    txn(&mut |tx| tx.set_versioning("source", Versioning::Suspended)).unwrap();
+    let bucket = ObjFile::new(&mut storage.lock())
+        .bucket("source")
+        .unwrap()
+        .unwrap();
+    assert_eq!(bucket.versioning, Versioning::Suspended);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

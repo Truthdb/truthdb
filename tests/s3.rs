@@ -13244,6 +13244,152 @@ print("ok")
 "#;
 
 #[test]
+fn replication_configurations_are_checked_and_kept_per_bucket() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "replicator");
+    let (other_account, other_key, other_secret) = account_with_key(&server, "neighbour");
+    let script = server.dir.join("replication_config.py");
+    std::fs::write(&script, REPLICATION_CONFIG_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other_account,
+            &other_key,
+            &other_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The activity log names the three operations.
+    let names = || {
+        sql_rows(
+            server.native_port,
+            "SELECT DISTINCT event_name FROM sys.dm_s3_api_activity \
+             WHERE event_name LIKE '%BucketReplication' ORDER BY event_name",
+        )
+    };
+    let deadline = Instant::now() + DEADLINE;
+    while names().len() < 3 {
+        assert!(Instant::now() < deadline, "{:?}", names());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        names(),
+        [
+            ["DeleteBucketReplication"],
+            ["GetBucketReplication"],
+            ["PutBucketReplication"]
+        ]
+    );
+}
+
+const REPLICATION_CONFIG_SCRIPT: &str = r#"
+import sys, json
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other_account, other_key, other_secret = sys.argv[1:8]
+def client(access, secret_key):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3, other = client(key, secret), client(other_key, other_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+def versioned(client, bucket, **extra):
+    client.create_bucket(Bucket=bucket, **extra)
+    client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+for bucket in ["source", "copies"]:
+    versioned(s3, bucket)
+s3.create_bucket(Bucket="plain")
+s3.create_bucket(Bucket="locked", ObjectLockEnabledForBucket=True)
+s3.create_bucket(Bucket="locked-copies", ObjectLockEnabledForBucket=True)
+versioned(other, "theirs")
+ROLE = f"arn:aws:iam::{account}:role/replication"
+def rule(destination="copies", **extra):
+    r = {"ID": "all", "Priority": 1, "Status": "Enabled", "Filter": {},
+        "DeleteMarkerReplication": {"Status": "Disabled"},
+        "Destination": {"Bucket": f"arn:aws:s3:::{destination}"}}
+    r.update(extra)
+    return r
+def put(bucket, *rules):
+    s3.put_bucket_replication(Bucket=bucket,
+        ReplicationConfiguration={"Role": ROLE, "Rules": list(rules)})
+refused(lambda: s3.get_bucket_replication(Bucket="source"), "ReplicationConfigurationNotFoundError")
+refused(lambda: s3.get_bucket_replication(Bucket="nowhere"), "NoSuchBucket")
+# Versioning on the source and the destination, a destination that exists,
+# is another bucket, and is the owner's.
+refused(lambda: put("plain", rule()), "InvalidRequest")
+refused(lambda: put("source", rule("plain")), "InvalidRequest")
+refused(lambda: put("source", rule("missing")), "InvalidRequest")
+refused(lambda: put("source", rule("source")), "InvalidRequest")
+refused(lambda: put("nowhere", rule()), "NoSuchBucket")
+refused(lambda: put("source", rule("theirs")), "NotImplemented")
+refused(lambda: put("source", rule(Destination={"Bucket": "arn:aws:s3:::copies",
+    "Account": other_account})), "InvalidArgument")
+# Object Lock on the source needs it on the destination.
+refused(lambda: put("locked", rule()), "InvalidRequest")
+put("locked", rule("locked-copies"))
+# What later steps build is refused, not ignored.
+refused(lambda: put("source", rule(Filter={"Tag": {"Key": "a", "Value": "b"}})), "NotImplemented")
+refused(lambda: put("source", rule(DeleteMarkerReplication={"Status": "Enabled"})), "NotImplemented")
+refused(lambda: put("source", rule(), dict(rule("locked-copies"), ID="two")), "NotImplemented")
+# Kept as given and read back.
+rules = [
+    rule(ID="logs", Priority=2, Filter={"Prefix": "logs/"},
+        Destination={"Bucket": "arn:aws:s3:::copies", "Account": account, "StorageClass": "STANDARD_IA"}),
+    rule(ID="rest", Status="Disabled"),
+]
+put("source", *rules)
+got = s3.get_bucket_replication(Bucket="source")["ReplicationConfiguration"]
+assert got == {"Role": ROLE, "Rules": rules}, got
+# While it is set, the source's versioning stays enabled.
+refused(lambda: s3.put_bucket_versioning(Bucket="source",
+    VersioningConfiguration={"Status": "Suspended"}), "InvalidBucketState")
+# Only those the policies allow read or change it.
+refused(lambda: other.get_bucket_replication(Bucket="source"), "AccessDenied")
+refused(lambda: other.delete_bucket_replication(Bucket="source"), "AccessDenied")
+s3.put_bucket_policy(Bucket="source", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{other_account}:root"},
+    "Action": "s3:GetReplicationConfiguration", "Resource": "arn:aws:s3:::source"}]}))
+assert other.get_bucket_replication(Bucket="source")["ReplicationConfiguration"]["Rules"] == rules
+refused(lambda: other.delete_bucket_replication(Bucket="source"), "AccessDenied")
+s3.delete_bucket_policy(Bucket="source")
+# A refused change leaves it as it was.
+refused(lambda: put("source", rule("missing")), "InvalidRequest")
+assert s3.get_bucket_replication(Bucket="source")["ReplicationConfiguration"]["Rules"] == rules
+# Deleted, it is gone and versioning may be suspended.
+s3.delete_bucket_replication(Bucket="source")
+refused(lambda: s3.get_bucket_replication(Bucket="source"), "ReplicationConfigurationNotFoundError")
+s3.put_bucket_versioning(Bucket="source", VersioningConfiguration={"Status": "Suspended"})
+# It goes with its bucket.
+s3.put_bucket_versioning(Bucket="copies", VersioningConfiguration={"Status": "Enabled"})
+versioned(s3, "brief")
+s3.put_bucket_replication(Bucket="brief",
+    ReplicationConfiguration={"Role": ROLE, "Rules": [rule()]})
+s3.delete_bucket(Bucket="brief")
+versioned(s3, "brief")
+refused(lambda: s3.get_bucket_replication(Bucket="brief"), "ReplicationConfigurationNotFoundError")
+print("ok")
+"#;
+
+#[test]
 fn inventory_configurations_are_kept_per_bucket() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

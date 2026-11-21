@@ -122,7 +122,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "metadataJournalTable",
     "metadataTable",
     "renameObject",
-    "replication",
     "requestPayment",
     "select",
     "session",
@@ -148,6 +147,7 @@ const SUBRESOURCES: &[&str] = &[
     "policy",
     "policyStatus",
     "publicAccessBlock",
+    "replication",
     "restore",
     "retention",
     "tagging",
@@ -686,6 +686,19 @@ async fn route(
         }
         (Target::Object(..), _) if has_param(&request, "lifecycle") => Err(
             S3Error::not_implemented("an object has no ?lifecycle configuration"),
+        ),
+        (Target::Bucket(bucket), method) if has_param(&request, "replication") => {
+            let action = match method {
+                Method::GET => "s3:GetReplicationConfiguration",
+                Method::PUT | Method::DELETE => "s3:PutReplicationConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?replication"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::replication_config::bucket_replication(state, request, auth, bucket, method)
+                .await
+        }
+        (Target::Object(..), _) if has_param(&request, "replication") => Err(
+            S3Error::not_implemented("an object has no ?replication configuration"),
         ),
         (Target::Bucket(bucket), method) if has_param(&request, "notification") => {
             let action = match method {
