@@ -351,9 +351,12 @@ fn refused_destination(
             "Destination bucket must exist",
         )));
     };
-    // As S3: the Account named must be the destination's owner.
-    if let Some(account) = &destination.account
-        && *account != info.owner
+    // As S3: an Account named (in any rule) must be the destination's owner.
+    if config
+        .rules
+        .iter()
+        .filter_map(|rule| rule.destination.account.as_ref())
+        .any(|account| *account != info.owner)
     {
         return Ok(Some(invalid(
             "The AWS account specified in the <Account> element must match the destination \

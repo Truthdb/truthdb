@@ -802,11 +802,16 @@ fn replicate(
         // A tag change only: the lock is not used.
         ReplicationWork::Create | ReplicationWork::Metadata => source_lock,
     };
+    // Journalled as the configuration's creator; in another account's
+    // bucket, as its account only (its user's name is not told there).
+    let same_owner = file
+        .bucket(&queued.destination)?
+        .is_some_and(|destination| destination.owner == bucket.owner);
     file.set_origin(Origin {
         operation: "Replicate".to_string(),
         request_id: format!("replication-{}", queued.number),
         account: Some(config.account.clone()),
-        user: config.user.clone(),
+        user: config.user.clone().filter(|_| same_owner),
         ..Origin::default()
     });
     let destination = queued.destination.clone();

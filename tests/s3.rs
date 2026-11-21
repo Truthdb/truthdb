@@ -13350,6 +13350,9 @@ assert got["AccessControlTranslation"] == {"Owner": "Destination"}, got
 for named in [account, "000000000999"]:
     refused(lambda: put("source", rule(Destination={"Bucket": "arn:aws:s3:::theirs",
         "Account": named})), "InvalidArgument")
+# Every rule's Account is checked, not only the first's.
+refused(lambda: put("source", rule("theirs"), dict(rule(Destination={"Bucket": "arn:aws:s3:::theirs",
+    "Account": account}), ID="second")), "InvalidArgument")
 s3.delete_bucket_replication(Bucket="source")
 refused(lambda: put("source", rule(Destination={"Bucket": "arn:aws:s3:::copies",
     "Account": other_account})), "InvalidArgument")
