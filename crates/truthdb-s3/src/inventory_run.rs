@@ -1,8 +1,9 @@
 //! S3 Inventory reports: a task beside the S3 listener that makes each
 //! enabled configuration's report when it is due (see [`due`]), one at a
 //! time. A run lists the source bucket a page at a time, each page under
-//! one storage-lock hold, into a gzipped CSV body; then one transaction
-//! writes the list, its `manifest.json`, `manifest.checksum` and Hive
+//! one storage-lock hold, into a body (a gzipped CSV, or a Parquet file
+//! compressed with Snappy, a row group a page); then one transaction writes
+//! the list, its `manifest.json`, `manifest.checksum` and Hive
 //! `symlink.txt` to the destination and records the run, once it has checked
 //! that the source bucket and the configuration are still the ones listed
 //! and that the destination is still the source owner's. A run cut short (a
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use parquet::file::writer::SerializedFileWriter;
 use tokio::sync::watch;
 use truthdb_core::storage::{Storage, StorageError};
 use truthdb_object::{
@@ -48,30 +50,106 @@ const DAY_MS: u64 = 86_400_000;
 /// taken for abandoned.
 const TOUCH_MS: u64 = 5 * 60 * 1000;
 
-/// The optional columns, in the order S3 writes them (after Bucket, Key,
-/// and with every version VersionId, IsLatest, IsDeleteMarker). The event
-/// hold's duration brings its unit's column after it.
-const OPTIONAL_COLUMNS: [&str; 19] = [
-    "Size",
-    "LastModifiedDate",
-    "ETag",
-    "StorageClass",
-    "IsMultipartUploaded",
-    "ReplicationStatus",
-    "EncryptionStatus",
-    "ObjectLockRetainUntilDate",
-    "ObjectLockMode",
-    "ObjectLockLegalHoldStatus",
-    "ObjectLockEventHoldStatus",
-    "ObjectLockEventHoldDuration",
-    "IntelligentTieringAccessTier",
-    "BucketKeyStatus",
-    "ChecksumAlgorithm",
-    "ObjectAccessControlList",
-    "ObjectOwner",
-    "LifecycleExpirationDate",
-    "IntelligentTieringReferenceDate",
+/// How a column's values are typed in a Parquet list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Flag,
+    Count,
+    /// A 32-bit count (the event hold's duration).
+    Small,
+    /// A time, in milliseconds since the epoch.
+    Millis,
+}
+
+/// Every column in the order S3 writes them: its name (in a CSV list's
+/// schema), its Parquet name and type. Bucket and Key are always there,
+/// VersionId, IsLatest and IsDeleteMarker with every version, the others
+/// when asked for (the event hold's duration brings its unit).
+const COLUMNS: [(&str, &str, Kind); 25] = [
+    ("Bucket", "bucket", Kind::Text),
+    ("Key", "key", Kind::Text),
+    ("VersionId", "version_id", Kind::Text),
+    ("IsLatest", "is_latest", Kind::Flag),
+    ("IsDeleteMarker", "is_delete_marker", Kind::Flag),
+    ("Size", "size", Kind::Count),
+    ("LastModifiedDate", "last_modified_date", Kind::Millis),
+    ("ETag", "e_tag", Kind::Text),
+    ("StorageClass", "storage_class", Kind::Text),
+    ("IsMultipartUploaded", "is_multipart_uploaded", Kind::Flag),
+    ("ReplicationStatus", "replication_status", Kind::Text),
+    ("EncryptionStatus", "encryption_status", Kind::Text),
+    (
+        "ObjectLockRetainUntilDate",
+        "object_lock_retain_until_date",
+        Kind::Millis,
+    ),
+    ("ObjectLockMode", "object_lock_mode", Kind::Text),
+    (
+        "ObjectLockLegalHoldStatus",
+        "object_lock_legal_hold_status",
+        Kind::Text,
+    ),
+    (
+        "ObjectLockEventHoldStatus",
+        "object_lock_event_hold_status",
+        Kind::Text,
+    ),
+    (
+        "ObjectLockEventHoldDuration",
+        "object_lock_event_hold_duration",
+        Kind::Small,
+    ),
+    (
+        "ObjectLockEventHoldDurationUnit",
+        "object_lock_event_hold_duration_unit",
+        Kind::Text,
+    ),
+    (
+        "IntelligentTieringAccessTier",
+        "intelligent_tiering_access_tier",
+        Kind::Text,
+    ),
+    ("BucketKeyStatus", "bucket_key_status", Kind::Text),
+    ("ChecksumAlgorithm", "checksum_algorithm", Kind::Text),
+    (
+        "ObjectAccessControlList",
+        "object_access_control_list",
+        Kind::Text,
+    ),
+    ("ObjectOwner", "object_owner", Kind::Text),
+    (
+        "LifecycleExpirationDate",
+        "lifecycle_expiration_date",
+        Kind::Millis,
+    ),
+    (
+        "IntelligentTieringReferenceDate",
+        "intelligent_tiering_reference_date",
+        Kind::Millis,
+    ),
 ];
+
+/// The columns of a configuration's list.
+fn columns(config: &InventoryConfig) -> Vec<(&'static str, &'static str, Kind)> {
+    COLUMNS
+        .into_iter()
+        .filter(|(name, _, _)| match *name {
+            "Bucket" | "Key" => true,
+            "VersionId" | "IsLatest" | "IsDeleteMarker" => config.all_versions,
+            "ObjectLockEventHoldDurationUnit" => config
+                .optional_fields
+                .iter()
+                .any(|field| field == "ObjectLockEventHoldDuration"),
+            _ => config.optional_fields.iter().any(|field| field == name),
+        })
+        .collect()
+}
+
+/// Whether a column always has a value (Bucket and Key).
+fn required(name: &str) -> bool {
+    matches!(name, "Bucket" | "Key")
+}
 
 /// Makes reports until `shutdown` turns true.
 pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
@@ -143,11 +221,7 @@ async fn step(state: &S3State, shutdown: &watch::Receiver<bool>) -> Result<bool,
             let Some(config) = InventoryConfig::decode(&document) else {
                 continue;
             };
-            // Only CSV reports are made.
-            if !config.enabled
-                || config.format != InventoryFormat::Csv
-                || !due(config.frequency, last, now)
-            {
+            if !config.enabled || !due(config.frequency, last, now) {
                 continue;
             }
             let Some(info) = file.bucket(&bucket)? else {
@@ -172,23 +246,75 @@ async fn step(state: &S3State, shutdown: &watch::Receiver<bool>) -> Result<bool,
     Ok(true)
 }
 
-/// The list being written: gzip into a body.
+/// How a list is encoded.
+enum Encoder {
+    Csv(Box<flate2::write::GzEncoder<Vec<u8>>>),
+    /// With its columns' kinds and whether each always has a value.
+    Parquet(Box<SerializedFileWriter<Vec<u8>>>, Vec<(Kind, bool)>),
+}
+
+/// The list being written into a body.
 struct List {
-    encoder: flate2::write::GzEncoder<Vec<u8>>,
+    encoder: Encoder,
     writer: BodyWriter,
-    /// Compressed bytes written so far.
+    /// Bytes written so far.
     size: u64,
     /// When the body was last marked touched.
     touched_ms: u64,
 }
 
+fn parquet_error(err: parquet::errors::ParquetError) -> String {
+    err.to_string()
+}
+
 impl List {
-    /// Adds `text`, writing what the encoder has compressed so far.
-    fn add(&mut self, storage: &Storage, text: &[u8]) -> Result<(), String> {
-        self.encoder
-            .write_all(text)
-            .map_err(|err| err.to_string())?;
-        let out = std::mem::take(self.encoder.get_mut());
+    /// An encoder for a list of `columns` in `format`.
+    fn encoder(
+        format: InventoryFormat,
+        columns: &[(&'static str, &'static str, Kind)],
+    ) -> Result<Encoder, String> {
+        Ok(match format {
+            InventoryFormat::Csv => Encoder::Csv(Box::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ))),
+            InventoryFormat::Parquet => {
+                let schema = parquet::schema::parser::parse_message_type(&parquet_schema(columns))
+                    .map_err(parquet_error)?;
+                let props = parquet::file::properties::WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::SNAPPY)
+                    .build();
+                let writer =
+                    SerializedFileWriter::new(Vec::new(), Arc::new(schema), Arc::new(props))
+                        .map_err(parquet_error)?;
+                let kinds = columns
+                    .iter()
+                    .map(|(name, _, kind)| (*kind, required(name)))
+                    .collect();
+                Encoder::Parquet(Box::new(writer), kinds)
+            }
+        })
+    }
+
+    /// Adds a page's `rows`, writing what is encoded so far.
+    fn add(&mut self, storage: &Storage, rows: &[Vec<Value>]) -> Result<(), String> {
+        let out = match &mut self.encoder {
+            Encoder::Csv(encoder) => {
+                for row in rows {
+                    encoder
+                        .write_all(csv_line(row).as_bytes())
+                        .map_err(|err| err.to_string())?;
+                }
+                std::mem::take(encoder.get_mut())
+            }
+            Encoder::Parquet(writer, kinds) => {
+                write_row_group(writer, kinds, rows).map_err(parquet_error)?;
+                writer.flush().map_err(|err| err.to_string())?;
+                // Taken from under the writer, which counts its offsets
+                // itself.
+                std::mem::take(writer.inner_mut())
+            }
+        };
         self.size += out.len() as u64;
         let now = now_ms();
         self.writer
@@ -203,18 +329,96 @@ impl List {
         Ok(())
     }
 
-    fn finish(mut self, storage: &Storage) -> Result<(SealedBody, u64), String> {
-        let out = self.encoder.finish().map_err(|err| err.to_string())?;
-        self.size += out.len() as u64;
-        self.writer
+    fn finish(self, storage: &Storage) -> Result<(SealedBody, u64), String> {
+        let out = match self.encoder {
+            Encoder::Csv(encoder) => encoder.finish().map_err(|err| err.to_string())?,
+            Encoder::Parquet(mut writer, _) => {
+                writer.finish().map_err(parquet_error)?;
+                writer.flush().map_err(|err| err.to_string())?;
+                std::mem::take(writer.inner_mut())
+            }
+        };
+        let mut writer = self.writer;
+        writer
             .write(storage, &out, now_ms())
             .map_err(|err| err.to_string())?;
-        let sealed = self
-            .writer
+        let sealed = writer
             .finish(storage, now_ms())
             .map_err(|err| err.to_string())?;
-        Ok((sealed, self.size))
+        Ok((sealed, self.size + out.len() as u64))
     }
+}
+
+/// Writes `rows` as one row group.
+fn write_row_group(
+    writer: &mut SerializedFileWriter<Vec<u8>>,
+    kinds: &[(Kind, bool)],
+    rows: &[Vec<Value>],
+) -> parquet::errors::Result<()> {
+    use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int32Type, Int64Type};
+    let mut group = writer.next_row_group()?;
+    for (index, (kind, required)) in kinds.iter().enumerate() {
+        let mut column = group
+            .next_column()?
+            .expect("a column for each of the schema's");
+        let cells = rows.iter().map(|row| &row[index]);
+        let levels: Vec<i16> = cells
+            .clone()
+            .map(|cell| i16::from(*cell != Value::Null))
+            .collect();
+        let levels = (!required).then_some(levels.as_slice());
+        match kind {
+            Kind::Text => {
+                let values: Vec<ByteArray> = cells
+                    .filter_map(|cell| match cell {
+                        Value::Text(text) => Some(ByteArray::from(text.as_bytes().to_vec())),
+                        _ => None,
+                    })
+                    .collect();
+                column
+                    .typed::<ByteArrayType>()
+                    .write_batch(&values, levels, None)?;
+            }
+            Kind::Flag => {
+                let values: Vec<bool> = cells
+                    .filter_map(|cell| match cell {
+                        Value::Flag(on) => Some(*on),
+                        _ => None,
+                    })
+                    .collect();
+                column
+                    .typed::<BoolType>()
+                    .write_batch(&values, levels, None)?;
+            }
+            Kind::Count | Kind::Millis => {
+                let values: Vec<i64> = cells
+                    .filter_map(|cell| match cell {
+                        Value::Count(count) | Value::Millis(count) => {
+                            Some(i64::try_from(*count).unwrap_or(i64::MAX))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                column
+                    .typed::<Int64Type>()
+                    .write_batch(&values, levels, None)?;
+            }
+            Kind::Small => {
+                let values: Vec<i32> = cells
+                    .filter_map(|cell| match cell {
+                        Value::Count(count) => Some(i32::try_from(*count).unwrap_or(i32::MAX)),
+                        _ => None,
+                    })
+                    .collect();
+                column
+                    .typed::<Int32Type>()
+                    .write_batch(&values, levels, None)?;
+            }
+        }
+        column.close()?;
+    }
+    group.close()?;
+    Ok(())
 }
 
 /// Runs `op` on the list without holding up the runtime.
@@ -245,11 +449,12 @@ async fn make_report(
         created_ms,
         versioning,
     } = due;
+    let encoder = List::encoder(config.format, &columns(&config))?;
     let storage = Arc::clone(&state.storage);
     let mut list = tokio::task::spawn_blocking(move || {
         let now = now_ms();
         BodyWriter::begin(&storage, now).map(|writer| List {
-            encoder: flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()),
+            encoder,
             writer,
             size: 0,
             touched_ms: now,
@@ -290,7 +495,7 @@ async fn make_report(
             let Ok(listing) = listing else {
                 return Ok(None);
             };
-            let mut text = String::new();
+            let mut rows = Vec::new();
             for object in &listing.objects {
                 if !all && (!object.latest || object.info.delete_marker) {
                     continue;
@@ -299,17 +504,17 @@ async fn make_report(
                     true => file.object_lock(object.info.version)?,
                     false => ObjectLock::default(),
                 };
-                text.push_str(&row.line(object, &lock, started));
+                rows.push(row.values(object, &lock, started));
             }
             let next = listing.last.map(|(key, _)| (key, listing.last_version));
-            Ok(Some((text, next, listing.truncated)))
+            Ok(Some((rows, next, listing.truncated)))
         })
         .await?;
-        let Some((text, next, truncated)) = page else {
+        let Some((rows, next, truncated)) = page else {
             return Ok(());
         };
         list = on_list(state, list, move |storage, mut list| {
-            list.add(storage, text.as_bytes())?;
+            list.add(storage, &rows)?;
             Ok(list)
         })
         .await?;
@@ -385,7 +590,21 @@ async fn report_files(
         format!("{bucket}/{}/{started}", config.id).as_bytes(),
     )
     .as_ref()[..16]);
-    let data_key = format!("{base}/data/{name}.csv.gz");
+    let (extension, format, schema, content_type) = match config.format {
+        InventoryFormat::Csv => (
+            "csv.gz",
+            "CSV",
+            csv_schema(&columns(config)),
+            "application/x-gzip",
+        ),
+        InventoryFormat::Parquet => (
+            "parquet",
+            "Parquet",
+            parquet_schema(&columns(config)),
+            "application/octet-stream",
+        ),
+    };
+    let data_key = format!("{base}/data/{name}.{extension}");
     let stamp = iso8601(started);
     let (date, hour, minute) = (&stamp[..10], &stamp[11..13], &stamp[14..16]);
     let manifest = serde_json::json!({
@@ -393,8 +612,8 @@ async fn report_files(
         "destinationBucket": format!("arn:aws:s3:::{}", config.destination),
         "version": "2016-11-30",
         "creationTimestamp": started.to_string(),
-        "fileFormat": "CSV",
-        "fileSchema": schema(config),
+        "fileFormat": format,
+        "fileSchema": schema,
         "files": [{"key": data_key, "size": size, "MD5checksum": hex(&data.md5)}],
     })
     .to_string();
@@ -404,7 +623,7 @@ async fn report_files(
     };
     let symlink = format!("s3://{}/{data_key}\n", config.destination);
     Ok(vec![
-        (data_key, data, "application/x-gzip"),
+        (data_key, data, content_type),
         (
             format!("{base}/{date}T{hour}-{minute}Z/manifest.json"),
             small_body(state, manifest.into_bytes()).await?,
@@ -517,27 +736,81 @@ fn deliver_in(
 /// it rolls back, and the run is recorded without its files.
 const UNWRITTEN: &str = "an inventory file cannot be written";
 
-/// The report's columns (its manifest's fileSchema).
-fn schema(config: &InventoryConfig) -> String {
-    let mut columns = vec!["Bucket", "Key"];
-    if config.all_versions {
-        columns.extend(["VersionId", "IsLatest", "IsDeleteMarker"]);
-    }
-    for column in OPTIONAL_COLUMNS {
-        if config.optional_fields.iter().any(|field| field == column) {
-            columns.push(column);
-            if column == "ObjectLockEventHoldDuration" {
-                columns.push("ObjectLockEventHoldDurationUnit");
-            }
-        }
-    }
-    columns.join(", ")
+/// A CSV list's schema (its manifest's fileSchema).
+fn csv_schema(columns: &[(&'static str, &'static str, Kind)]) -> String {
+    columns
+        .iter()
+        .map(|(name, _, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// How a configuration's rows are written.
+/// A Parquet list's schema, as S3 writes it in the manifest (and as the
+/// file holds it).
+fn parquet_schema(columns: &[(&'static str, &'static str, Kind)]) -> String {
+    let fields: Vec<String> = columns
+        .iter()
+        .map(|(name, field, kind)| {
+            let repetition = if required(name) {
+                "required"
+            } else {
+                "optional"
+            };
+            let ty = match kind {
+                Kind::Text => "binary",
+                Kind::Flag => "boolean",
+                Kind::Count | Kind::Millis => "int64",
+                Kind::Small => "int32",
+            };
+            let annotation = match kind {
+                Kind::Text => " (UTF8)",
+                Kind::Millis => " (TIMESTAMP_MILLIS)",
+                _ => "",
+            };
+            format!("{repetition} {ty} {field}{annotation}")
+        })
+        .collect();
+    format!("message s3.inventory {{ {};}}", fields.join("; "))
+}
+
+/// A column's value in one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Value {
+    Null,
+    Text(String),
+    Flag(bool),
+    Count(u64),
+    Millis(u64),
+}
+
+/// A CSV list's line: every value quoted, the key (the second) URL-encoded.
+fn csv_line(values: &[Value]) -> String {
+    let mut line = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let text = match value {
+                Value::Null => String::new(),
+                Value::Text(text) if index == 1 => {
+                    percent_encoding::utf8_percent_encode(text, REPORT_KEY).to_string()
+                }
+                Value::Text(text) => text.clone(),
+                Value::Flag(on) => if *on { "True" } else { "False" }.to_string(),
+                Value::Count(count) => count.to_string(),
+                Value::Millis(ms) => iso8601(*ms),
+            };
+            // No value holds a quote (a key is URL-encoded).
+            format!("\"{text}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    line.push('\n');
+    line
+}
+
+/// How a configuration's rows are made.
 struct Row {
     bucket: String,
-    all_versions: bool,
     versioned: bool,
     columns: Vec<&'static str>,
     /// Whether any Object Lock column is asked for (each row then reads its
@@ -558,9 +831,9 @@ impl Row {
         versioning: Versioning,
         encrypted: bool,
     ) -> Row {
-        let columns: Vec<&'static str> = OPTIONAL_COLUMNS
+        let columns: Vec<&'static str> = columns(config)
             .into_iter()
-            .filter(|column| config.optional_fields.iter().any(|field| field == column))
+            .map(|(name, _, _)| name)
             .collect();
         let owner_id = truthdb_sigv4::sha256_hex(owner.as_bytes());
         // In S3's order of its members.
@@ -569,7 +842,6 @@ impl Row {
         );
         Row {
             bucket: bucket.to_string(),
-            all_versions: config.all_versions,
             versioned: versioning != Versioning::Unversioned,
             locks: columns
                 .iter()
@@ -581,94 +853,66 @@ impl Row {
         }
     }
 
-    /// `object`'s line, every value quoted, at `now_ms` (an event hold's
+    /// `object`'s values, a column each, at `now_ms` (an event hold's
     /// retain-until date moves with it).
-    fn line(&self, object: &ListedObject, lock: &ObjectLock, now_ms: u64) -> String {
+    fn values(&self, object: &ListedObject, lock: &ObjectLock, now_ms: u64) -> Vec<Value> {
         let info = &object.info;
         let marker = info.delete_marker;
-        let flag = |on: bool| if on { "True" } else { "False" }.to_string();
-        let mut values = vec![
-            self.bucket.clone(),
-            percent_encoding::utf8_percent_encode(&object.key, REPORT_KEY).to_string(),
-        ];
-        if self.all_versions {
-            // A null version's id is empty (as S3 writes it).
-            values.push(match self.versioned && !info.null_version {
-                true => info.version.to_string(),
-                false => String::new(),
-            });
-            values.push(flag(object.latest));
-            values.push(flag(marker));
-        }
+        let text = |text: &str| Value::Text(text.to_string());
         let retention = lock.retention;
         let event = retention.and_then(|retention| retention.event);
-        for column in &self.columns {
-            match *column {
-                "Size" if !marker => values.push(info.size.to_string()),
-                "LastModifiedDate" => values.push(iso8601(info.mtime_ms)),
-                "ETag" if !marker => values.push(info.etag().trim_matches('"').to_string()),
-                "StorageClass" if !marker => values.push(info.storage_class.as_str().to_string()),
-                "IsMultipartUploaded" if !marker => values.push(flag(info.parts > 0)),
-                "EncryptionStatus" if !marker => values.push(
-                    match (info.attrs.customer_key.is_some(), self.encrypted) {
+        self.columns
+            .iter()
+            .map(|column| match *column {
+                "Bucket" => text(&self.bucket),
+                "Key" => text(&object.key),
+                // A null version has no id (S3 writes it empty).
+                "VersionId" if self.versioned && !info.null_version => {
+                    Value::Text(info.version.to_string())
+                }
+                "IsLatest" => Value::Flag(object.latest),
+                "IsDeleteMarker" => Value::Flag(marker),
+                "Size" if !marker => Value::Count(info.size),
+                "LastModifiedDate" => Value::Millis(info.mtime_ms),
+                "ETag" if !marker => text(info.etag().trim_matches('"')),
+                "StorageClass" if !marker => text(info.storage_class.as_str()),
+                "IsMultipartUploaded" if !marker => Value::Flag(info.parts > 0),
+                "EncryptionStatus" if !marker => {
+                    text(match (info.attrs.customer_key.is_some(), self.encrypted) {
                         (true, _) => "SSE-C",
                         (false, true) => "SSE-S3",
                         (false, false) => "NOT-SSE",
-                    }
-                    .to_string(),
-                ),
-                "ObjectLockRetainUntilDate" => values.push(
-                    retention
-                        .map(|retention| iso8601(retention.effective_until(now_ms)))
-                        .unwrap_or_default(),
-                ),
-                "ObjectLockMode" => values.push(
-                    match retention.map(|retention| retention.mode) {
-                        Some(RetentionMode::Governance) => "GOVERNANCE",
-                        Some(RetentionMode::Compliance) => "COMPLIANCE",
-                        None => "",
-                    }
-                    .to_string(),
-                ),
-                "ObjectLockLegalHoldStatus" => values.push(
-                    match lock.legal_hold == Some(true) {
-                        true => "ON",
-                        false => "OFF",
-                    }
-                    .to_string(),
-                ),
-                "ObjectLockEventHoldStatus" => values.push(
-                    event
-                        .map(|event| if event.on { "ON" } else { "OFF" }.to_string())
-                        .unwrap_or_default(),
-                ),
-                "ObjectLockEventHoldDuration" => {
-                    values.push(
-                        event
-                            .map(|event| event.count.to_string())
-                            .unwrap_or_default(),
-                    );
-                    values.push(
-                        event
-                            .map(|event| if event.years { "YEARS" } else { "DAYS" }.to_string())
-                            .unwrap_or_default(),
-                    );
+                    })
                 }
-                "ObjectAccessControlList" if !marker => values.push(self.acl.clone()),
-                "ObjectOwner" => values.push(self.owner_id.clone()),
+                "ObjectLockRetainUntilDate" => retention.map_or(Value::Null, |retention| {
+                    Value::Millis(retention.effective_until(now_ms))
+                }),
+                "ObjectLockMode" => match retention.map(|retention| retention.mode) {
+                    Some(RetentionMode::Governance) => text("GOVERNANCE"),
+                    Some(RetentionMode::Compliance) => text("COMPLIANCE"),
+                    None => Value::Null,
+                },
+                "ObjectLockLegalHoldStatus" => text(if lock.legal_hold == Some(true) {
+                    "ON"
+                } else {
+                    "OFF"
+                }),
+                "ObjectLockEventHoldStatus" => event.map_or(Value::Null, |event| {
+                    text(if event.on { "ON" } else { "OFF" })
+                }),
+                "ObjectLockEventHoldDuration" => {
+                    event.map_or(Value::Null, |event| Value::Count(u64::from(event.count)))
+                }
+                "ObjectLockEventHoldDurationUnit" => event.map_or(Value::Null, |event| {
+                    text(if event.years { "YEARS" } else { "DAYS" })
+                }),
+                "ObjectAccessControlList" if !marker => text(&self.acl),
+                "ObjectOwner" => text(&self.owner_id),
                 // Nothing kept fills the others (and a delete marker has no
                 // size, ETag, class or encryption).
-                _ => values.push(String::new()),
-            }
-        }
-        let mut line = values
-            .iter()
-            // No value holds a quote (a key is URL-encoded).
-            .map(|value| format!("\"{value}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        line.push('\n');
-        line
+                _ => Value::Null,
+            })
+            .collect()
     }
 }
 
@@ -864,9 +1108,9 @@ mod tests {
             format: InventoryFormat::Csv,
             sse_s3: false,
             all_versions: true,
-            optional_fields: OPTIONAL_COLUMNS
+            optional_fields: COLUMNS[5..]
                 .iter()
-                .map(|field| field.to_string())
+                .map(|(field, _, _)| field.to_string())
                 .collect(),
             frequency: InventoryFrequency::Daily,
         };
@@ -912,7 +1156,11 @@ mod tests {
         // An event hold on: retain-until moves with the report's time.
         let until = iso8601(10 * DAY_MS + 2 * DAY_MS);
         assert_eq!(
-            fields(row.line(&object(false, false), &lock, 10 * DAY_MS)),
+            fields(csv_line(&row.values(
+                &object(false, false),
+                &lock,
+                10 * DAY_MS
+            ))),
             [
                 "src",
                 "a%20b/%22c%22.txt",
@@ -950,7 +1198,7 @@ mod tests {
             verifier: String::new(),
         });
         let none = ObjectLock::default();
-        let line = fields(row.line(&keyed, &none, 0));
+        let line = fields(csv_line(&row.values(&keyed, &none, 0)));
         assert_eq!(
             &line[2..12],
             [
@@ -968,11 +1216,110 @@ mod tests {
         );
         assert_eq!(&line[12..18], ["", "", "OFF", "", "", ""]);
         keyed.info.delete_marker = false;
-        assert_eq!(fields(row.line(&keyed, &none, 0))[11], "SSE-C");
+        assert_eq!(fields(csv_line(&row.values(&keyed, &none, 0)))[11], "SSE-C");
         let plain = Row::new(&config, "src", "111111111111", Versioning::Enabled, false);
         assert_eq!(
-            fields(plain.line(&object(false, false), &none, 0))[11],
+            fields(csv_line(&plain.values(&object(false, false), &none, 0)))[11],
             "NOT-SSE"
+        );
+    }
+
+    #[test]
+    fn a_parquet_list_written_a_row_group_at_a_time_reads_back() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::record::Field;
+        let config = InventoryConfig {
+            id: "r".into(),
+            enabled: true,
+            prefix: None,
+            destination: "d".into(),
+            destination_account: None,
+            destination_prefix: None,
+            format: InventoryFormat::Parquet,
+            sse_s3: false,
+            all_versions: true,
+            optional_fields: ["Size", "LastModifiedDate", "ObjectLockEventHoldDuration"]
+                .map(str::to_string)
+                .to_vec(),
+            frequency: InventoryFrequency::Daily,
+        };
+        let columns = columns(&config);
+        let Encoder::Parquet(mut writer, kinds) = List::encoder(config.format, &columns).unwrap()
+        else {
+            panic!("a Parquet encoder");
+        };
+        let row = |key: &str, marker: bool| {
+            vec![
+                Value::Text("src".into()),
+                Value::Text(key.into()),
+                Value::Text("7".into()),
+                Value::Flag(true),
+                Value::Flag(marker),
+                if marker {
+                    Value::Null
+                } else {
+                    Value::Count(12)
+                },
+                Value::Millis(1_000),
+                Value::Null,
+                Value::Null,
+            ]
+        };
+        // Taken from under the writer after each row group, as a run does.
+        let mut file = Vec::new();
+        for rows in [
+            vec![row("a b", false)],
+            vec![row("c", true), row("d", false)],
+        ] {
+            write_row_group(&mut writer, &kinds, &rows).unwrap();
+            writer.flush().unwrap();
+            file.append(writer.inner_mut());
+        }
+        writer.finish().unwrap();
+        writer.flush().unwrap();
+        file.append(writer.inner_mut());
+        let reader = SerializedFileReader::new(bytes::Bytes::from(file)).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        let rows: Vec<Vec<Field>> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|row| {
+                row.unwrap()
+                    .get_column_iter()
+                    .map(|(_, field)| field.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        // The key is as it is (only a CSV list URL-encodes it).
+        assert_eq!(rows[0][1], Field::Str("a b".into()));
+        assert_eq!(rows[0][5], Field::Long(12));
+        assert_eq!(rows[0][6], Field::TimestampMillis(1_000));
+        assert_eq!(rows[1][4], Field::Bool(true));
+        assert_eq!(rows[1][5], Field::Null);
+        assert_eq!(rows[2][7], Field::Null);
+        // The schema the file holds is the manifest's.
+        let names: Vec<&str> = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .map(|column| column.name())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "bucket",
+                "key",
+                "version_id",
+                "is_latest",
+                "is_delete_marker",
+                "size",
+                "last_modified_date",
+                "object_lock_event_hold_duration",
+                "object_lock_event_hold_duration_unit"
+            ]
         );
     }
 
@@ -996,9 +1343,18 @@ mod tests {
             frequency: InventoryFrequency::Daily,
         };
         assert_eq!(
-            schema(&config),
+            csv_schema(&columns(&config)),
             "Bucket, Key, VersionId, IsLatest, IsDeleteMarker, Size, \
              ObjectLockEventHoldDuration, ObjectLockEventHoldDurationUnit, ObjectOwner"
+        );
+        assert_eq!(
+            parquet_schema(&columns(&config)),
+            "message s3.inventory { required binary bucket (UTF8); required binary key (UTF8); \
+             optional binary version_id (UTF8); optional boolean is_latest; \
+             optional boolean is_delete_marker; optional int64 size; \
+             optional int32 object_lock_event_hold_duration; \
+             optional binary object_lock_event_hold_duration_unit (UTF8); \
+             optional binary object_owner (UTF8);}"
         );
     }
 }
