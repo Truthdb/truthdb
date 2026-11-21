@@ -26,7 +26,7 @@ use tokio::sync::watch;
 use truthdb_core::storage::StorageError;
 use truthdb_object::{
     BucketInfo, ObjFile, ObjectLock, Origin, QueuedReplication, ReplicationConfig,
-    ReplicationStatus, ReplicationWork, VersionSel, Versioning,
+    ReplicationStatus, ReplicationWork, Retention, RetentionMode, VersionSel, Versioning,
 };
 
 use crate::authz::{Authz, Resource};
@@ -74,20 +74,33 @@ async fn store_xml_anew(state: &S3State) -> Result<(), String> {
 }
 
 /// [`store_xml_anew`] in `file`.
+/// A bucket whose configuration cannot be read or stored is passed over
+/// (and said so), the others stored.
 fn store_anew(file: &mut ObjFile<'_>) -> Result<(), StorageError> {
     for bucket in file.list_buckets()? {
-        let Some(xml) = file.replication_xml(&bucket.name)? else {
-            continue;
-        };
-        match crate::replication_config::parse(&xml) {
-            Ok(mut config) => {
-                config.account = bucket.owner.clone();
-                file.transaction(|tx| tx.put_replication(&bucket.name, &config))?;
+        let stored = (|| {
+            let Some(xml) = file.replication_xml(&bucket.name)? else {
+                return Ok(());
+            };
+            match crate::replication_config::parse(&xml) {
+                Ok(mut config) => {
+                    config.account = bucket.owner.clone();
+                    file.transaction(|tx| tx.put_replication(&bucket.name, &config))
+                }
+                Err(err) => {
+                    eprintln!(
+                        "replication: the configuration of {} cannot be read: {}",
+                        bucket.name, err.message
+                    );
+                    Ok(())
+                }
             }
-            Err(err) => eprintln!(
-                "replication: the configuration of {} cannot be read: {}",
-                bucket.name, err.message
-            ),
+        })();
+        if let Err(err) = stored {
+            eprintln!(
+                "replication: the configuration of {} cannot be stored anew: {err}",
+                bucket.name
+            );
         }
     }
     Ok(())
@@ -134,17 +147,28 @@ fn refused(
         let authz = Authz::load_now(
             file,
             &principal,
-            vec![queued.destination.clone()],
+            vec![queued.destination.clone(), queued.bucket.clone()],
             Vec::new(),
             now_ms(),
         )?;
-        authz
+        // As S3's role: it reads the source version and writes the replica.
+        if authz
             .check(
-                "s3:ReplicateObject",
-                Resource::Object(&queued.destination, &queued.key),
+                "s3:GetObjectVersionForReplication",
+                Resource::Object(&queued.bucket, &queued.key),
             )
-            .err()
-            .map(|_| "the configuration's creator may not s3:ReplicateObject there")
+            .is_err()
+        {
+            Some("the configuration's creator may not s3:GetObjectVersionForReplication the source")
+        } else {
+            authz
+                .check(
+                    "s3:ReplicateObject",
+                    Resource::Object(&queued.destination, &queued.key),
+                )
+                .err()
+                .map(|_| "the configuration's creator may not s3:ReplicateObject there")
+        }
     })
 }
 
@@ -166,7 +190,8 @@ fn replicate(
     let Some((bucket, source)) = found else {
         return file.transaction(|tx| tx.finish_replication(queued, None));
     };
-    // A rule must still send the version there.
+    // A rule must still send the version there; its class is the one it
+    // names now.
     let config = file.replication(&queued.bucket)?.filter(|config| {
         config
             .rule_for(&queued.key)
@@ -175,6 +200,9 @@ fn replicate(
     let Some(config) = config else {
         return file.transaction(|tx| tx.drop_replication(queued));
     };
+    let rule_class = config
+        .rule_for(&queued.key)
+        .and_then(|rule| rule.destination.storage_class);
     if let Some(why) = refused(file, &bucket, &config, queued)? {
         eprintln!(
             "replication: {}/{} version {} is not replicated to {}: {why}",
@@ -217,7 +245,7 @@ fn replicate(
     let key = queued.key.clone();
     match queued.work {
         ReplicationWork::Create => file.transaction(|tx| {
-            let class = queued.storage_class.unwrap_or(source.storage_class);
+            let class = rule_class.unwrap_or(source.storage_class);
             match tx.insert_replica(
                 &destination,
                 &key,
@@ -259,24 +287,31 @@ fn replicate(
 }
 
 /// The replica's lock `replica` with what the source's lock `source` adds
-/// to it: a legal hold, a retention where it has none, or a later date in
-/// the same mode. Nothing it has is taken away or shortened.
+/// to it: a legal hold; a retention where it has none, or none still
+/// active; else the stronger of the two (COMPLIANCE over GOVERNANCE, the
+/// later date, an event hold on). Nothing it has is taken away or
+/// shortened while active.
 fn added(replica: ObjectLock, source: ObjectLock, now: u64) -> ObjectLock {
     let mut lock = replica;
     if source.legal_hold == Some(true) {
         lock.legal_hold = Some(true);
     }
     if let Some(new) = source.retention {
-        match lock.retention {
-            None => lock.retention = Some(new),
-            Some(current)
-                if current.mode == new.mode
-                    && new.effective_until(now) > current.effective_until(now) =>
-            {
-                lock.retention = Some(new)
-            }
-            Some(_) => {}
-        }
+        lock.retention = Some(match lock.retention {
+            Some(current) if current.effective_until(now) > now => Retention {
+                mode: if current.mode == RetentionMode::Compliance {
+                    RetentionMode::Compliance
+                } else {
+                    new.mode
+                },
+                until_ms: current.until_ms.max(new.until_ms),
+                event: match (current.event, new.event) {
+                    (_, Some(held)) if held.on => Some(held),
+                    (kept, _) => kept,
+                },
+            },
+            _ => new,
+        });
     }
     lock
 }
@@ -284,7 +319,6 @@ fn added(replica: ObjectLock, source: ObjectLock, now: u64) -> ObjectLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use truthdb_object::{Retention, RetentionMode};
 
     fn retention(mode: RetentionMode, until_ms: u64) -> Option<Retention> {
         Some(Retention {
@@ -319,7 +353,8 @@ mod tests {
                 lock(None, Some(true)),
                 lock(None, Some(true)),
             ),
-            // A retention is never shortened, nor its mode changed.
+            // An active retention is never shortened nor weakened: the
+            // stronger mode and the later date of the two.
             (
                 lock(compliance(40), None),
                 lock(compliance(30), None),
@@ -333,7 +368,12 @@ mod tests {
             (
                 lock(compliance(40), None),
                 lock(governance(50), None),
-                lock(compliance(40), None),
+                lock(compliance(50), None),
+            ),
+            (
+                lock(governance(50), None),
+                lock(compliance(20), None),
+                lock(compliance(50), None),
             ),
             (
                 lock(None, None),
@@ -352,6 +392,30 @@ mod tests {
                 "{replica:?} {source:?}"
             );
         }
+        // A retention no longer active is replaced, whatever its mode.
+        assert_eq!(
+            added(lock(compliance(40), None), lock(governance(150), None), 100),
+            lock(governance(150), None)
+        );
+        // An event hold the source turns on reaches the replica, its date
+        // the later of the two.
+        let held = truthdb_object::EventHold {
+            on: true,
+            count: 30,
+            years: false,
+        };
+        let source = lock(
+            Some(Retention {
+                mode: RetentionMode::Compliance,
+                until_ms: 50,
+                event: Some(held),
+            }),
+            None,
+        );
+        let merged = added(lock(compliance(60), None), source, 0)
+            .retention
+            .unwrap();
+        assert_eq!((merged.until_ms, merged.event), (60, Some(held)));
     }
 
     fn create(path: &std::path::Path) -> truthdb_core::storage::Storage {
@@ -445,7 +509,9 @@ mod tests {
                     "src-only",
                     br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
                         "Action":["s3:PutObject","s3:PutReplicationConfiguration"],
-                        "Resource":["arn:aws:s3:::src","arn:aws:s3:::src/*"]}]}"#,
+                        "Resource":["arn:aws:s3:::src","arn:aws:s3:::src/*"]},
+                        {"Effect":"Allow","Action":"s3:ReplicateObject",
+                        "Resource":"arn:aws:s3:::dst/*"}]}"#,
                 )?;
                 for bucket in ["src", "dst"] {
                     tx.create_bucket(bucket, me, 1)?.unwrap();
@@ -454,7 +520,8 @@ mod tests {
                 tx.put_replication("src", &config(Some("dev")))
             })
             .unwrap();
-        // Put by a user who may not write in the destination: FAILED.
+        // Put by a user who may write replicas in the destination but not
+        // read the source's versions for replication: FAILED.
         let by_dev = put("a");
         step();
         assert_eq!(status("src", "a", by_dev), Some(ReplicationStatus::Failed));
@@ -475,6 +542,26 @@ mod tests {
         );
         // Queued, then the configuration is deleted: not replicated, and no
         // status.
+        // The rule's class is the one it names when the replica is made.
+        let queued_standard = put("classed");
+        let mut cold = config(None);
+        cold.rules[0].destination.storage_class = Some(StorageClass::StandardIa);
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_replication("src", &cold))
+            .unwrap();
+        step();
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .object_version(
+                    "dst",
+                    "classed",
+                    truthdb_object::VersionSel::Seq(queued_standard)
+                )
+                .unwrap()
+                .unwrap()
+                .storage_class,
+            StorageClass::StandardIa
+        );
         let orphan = put("c");
         assert_eq!(status("src", "c", orphan), Some(ReplicationStatus::Pending));
         ObjFile::new(&mut storage.lock())
@@ -515,6 +602,15 @@ mod tests {
         );
         let before = put("d");
         assert_eq!(status("src", "d", before), None);
+        // Until then it blocks enabling Object Lock on the bucket.
+        assert!(
+            crate::replication_config::blocks_object_lock(
+                &mut ObjFile::new(&mut storage.lock()),
+                "src",
+                me
+            )
+            .unwrap()
+        );
         store_anew(&mut ObjFile::new(&mut storage.lock())).unwrap();
         let stored = ObjFile::new(&mut storage.lock())
             .replication("src")

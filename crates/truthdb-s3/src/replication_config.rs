@@ -278,6 +278,11 @@ pub(crate) fn blocks_object_lock(
     bucket: &str,
     owner: &str,
 ) -> Result<bool, truthdb_core::storage::StorageError> {
+    // One an earlier build stored as XML, not yet stored anew: it may name
+    // any destination.
+    if file.replication_xml(bucket)?.is_some() {
+        return Ok(true);
+    }
     let Some(config) = file.replication(bucket)? else {
         return Ok(false);
     };
