@@ -344,7 +344,10 @@ pub async fn bucket_inventory(
             })
             .await?;
             match refused {
-                None => Ok(empty(StatusCode::OK)),
+                None => {
+                    crate::inventory_run::wake();
+                    Ok(empty(StatusCode::OK))
+                }
                 Some("TooManyConfigurations") => Err(S3Error::new(
                     400,
                     "TooManyConfigurations",

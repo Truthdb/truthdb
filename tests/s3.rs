@@ -13407,7 +13407,9 @@ def lists(bucket, prefix):
     # A run's list is named by when it started: one a run.
     return s3.list_objects_v2(Bucket=bucket, Prefix=prefix + "data/").get("KeyCount", 0)
 def wait_manifest(bucket, prefix):
-    deadline = time.time() + 60
+    # Well under the runner's idle poll: a report comes as its
+    # configuration is put.
+    deadline = time.time() + 30
     while time.time() < deadline:
         found = manifests(bucket, prefix)
         if found:

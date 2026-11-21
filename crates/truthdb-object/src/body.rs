@@ -98,6 +98,29 @@ impl ObjTxn<'_, '_> {
         self.append_stored(body, data, data.len(), false, now_ms)
     }
 
+    /// Marks a staging body touched at `now_ms` without writing to it: a
+    /// writer that is slow to fill a segment is not taken for abandoned.
+    pub fn touch_body(&mut self, body: u64, now_ms: u64) -> Result<(), StorageError> {
+        let mut row = self.load_body(body)?;
+        if row.state != BodyState::Staging {
+            return Err(invalid(format!("body {body} is sealed")));
+        }
+        let staging = self.trees.staging();
+        staging.delete(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::timed_key(row.touched_ms, body),
+        )?;
+        staging.insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::timed_key(now_ms, body),
+            &[],
+        )?;
+        row.touched_ms = now_ms;
+        self.store_body(body, &row)
+    }
+
     /// [`Self::append_segment`] for a segment of `plain_len` bytes stored as
     /// the zstd `frame` of them (see [`crate::pack_segment`]).
     pub fn append_packed_segment(
@@ -610,6 +633,16 @@ impl BodyWriter {
 
     pub fn body(&self) -> u64 {
         self.body
+    }
+
+    /// Marks the body touched at `now_ms` (its own transaction): what is
+    /// buffered is not written yet.
+    pub fn touch(&mut self, storage: &Storage, now_ms: u64) -> Result<(), StorageError> {
+        self.check()?;
+        let touched =
+            ObjFile::new(&mut storage.lock()).transaction(|tx| tx.touch_body(self.body, now_ms));
+        self.failed = touched.is_err();
+        touched
     }
 
     fn check(&self) -> Result<(), StorageError> {

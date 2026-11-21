@@ -353,6 +353,33 @@ fn a_slow_upload_that_keeps_writing_is_not_taken_for_abandoned() {
 }
 
 #[test]
+fn a_touched_writer_is_not_taken_for_abandoned_before_it_fills_a_segment() {
+    let path = temp_path("touched");
+    let storage = create(&path);
+    let mut touched = BodyWriter::begin(&storage, now()).unwrap();
+    let mut idle = BodyWriter::begin(&storage, now()).unwrap();
+    for writer in [&mut touched, &mut idle] {
+        writer
+            .write(&storage, b"short of a segment", now())
+            .unwrap();
+    }
+    touched.touch(&storage, now() + ABANDON - 1).unwrap();
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now() + ABANDON, ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(freed.bodies, 1, "only the idle one");
+    assert!(idle.finish(&storage, now() + ABANDON).is_err());
+    let sealed = touched.finish(&storage, now() + ABANDON).unwrap();
+    let body = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| sealed.seal_in(tx))
+        .unwrap()
+        .body;
+    assert_eq!(read(&storage, body, 0, 5).unwrap(), b"short");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_writer_refuses_further_use_after_an_error() {
     let path = temp_path("poison");
     let storage = create(&path);

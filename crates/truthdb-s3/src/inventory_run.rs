@@ -27,13 +27,26 @@ use crate::batch_run::{REPORT_KEY, object};
 use crate::objects::{DROP_GRACE_MS, now_ms};
 use crate::server::S3State;
 
-/// How long the runner waits when no report is due, and after a run failed
-/// (a storage error).
-const IDLE: Duration = Duration::from_secs(1);
+/// How long the runner waits when no report is due (unless a configuration
+/// is put meanwhile, see [`wake`]), and after a run failed (a storage
+/// error).
+const IDLE: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_secs(60);
+
+/// Wakes the runner (a configuration was put: its first report is due).
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Tells the runner a configuration was put.
+pub(crate) fn wake() {
+    WAKE.notify_one();
+}
 /// Versions listed a page (one lock hold).
 const PAGE: usize = 1000;
 const DAY_MS: u64 = 86_400_000;
+/// How often a list being written is marked touched: one whose pages add
+/// little takes long to fill a segment, and a body untouched for an hour is
+/// taken for abandoned.
+const TOUCH_MS: u64 = 5 * 60 * 1000;
 
 /// The optional columns, in the order S3 writes them (after Bucket, Key,
 /// and with every version VersionId, IsLatest, IsDeleteMarker). The event
@@ -80,6 +93,7 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            _ = WAKE.notified() => {}
             _ = shutdown.changed() => {}
         }
     }
@@ -118,6 +132,11 @@ async fn step(state: &S3State, shutdown: &watch::Receiver<bool>) -> Result<bool,
     let now = now_ms();
     let next = object(state, move |file| {
         for (bucket, id, last) in file.inventory_runs()? {
+            // Run today: due tomorrow at the earliest, whatever its
+            // frequency (its document is not read).
+            if last != 0 && last / DAY_MS == now / DAY_MS {
+                continue;
+            }
             let Some(document) = file.bucket_config(&bucket, BUCKET_INVENTORY, &id)? else {
                 continue;
             };
@@ -159,6 +178,8 @@ struct List {
     writer: BodyWriter,
     /// Compressed bytes written so far.
     size: u64,
+    /// When the body was last marked touched.
+    touched_ms: u64,
 }
 
 impl List {
@@ -169,11 +190,17 @@ impl List {
             .map_err(|err| err.to_string())?;
         let out = std::mem::take(self.encoder.get_mut());
         self.size += out.len() as u64;
-        // The body's time is now (not the run's start): a body untouched
-        // for long is taken for abandoned.
+        let now = now_ms();
         self.writer
-            .write(storage, &out, now_ms())
-            .map_err(|err| err.to_string())
+            .write(storage, &out, now)
+            .map_err(|err| err.to_string())?;
+        if now.saturating_sub(self.touched_ms) >= TOUCH_MS {
+            self.writer
+                .touch(storage, now)
+                .map_err(|err| err.to_string())?;
+            self.touched_ms = now;
+        }
+        Ok(())
     }
 
     fn finish(mut self, storage: &Storage) -> Result<(SealedBody, u64), String> {
@@ -220,10 +247,12 @@ async fn make_report(
     } = due;
     let storage = Arc::clone(&state.storage);
     let mut list = tokio::task::spawn_blocking(move || {
-        BodyWriter::begin(&storage, now_ms()).map(|writer| List {
+        let now = now_ms();
+        BodyWriter::begin(&storage, now).map(|writer| List {
             encoder: flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()),
             writer,
             size: 0,
+            touched_ms: now,
         })
     })
     .await
