@@ -13999,14 +13999,26 @@ time.sleep(1.5)
 assert tags("src", "docs/team", team) == {"team": "a"}
 # With it (a rule on the replicas' bucket back to the source), it is; the
 # sync ends (no change goes back and forth).
+# Sync asked for on the replicas' bucket only (as AWS writes it, without
+# SseKmsEncryptedObjects): the source has not asked for it, nothing reaches it.
 s3.put_bucket_replication(Bucket="dst", ReplicationConfiguration={"Role": ROLE, "Rules": [dict(back,
-    SourceSelectionCriteria={"ReplicaModifications": {"Status": "Enabled"},
-        "SseKmsEncryptedObjects": {"Status": "Disabled"}})]})
+    SourceSelectionCriteria={"ReplicaModifications": {"Status": "Enabled"}})]})
 s3.put_object_tagging(Bucket="dst", Key="docs/team", VersionId=team,
     Tagging={"TagSet": [{"Key": "team", "Value": "a"}, {"Key": "seen", "Value": "2"}]})
-wait(lambda: tags("src", "docs/team", team) == {"team": "a", "seen": "2"}, "synced back")
+time.sleep(1.5)
+assert tags("src", "docs/team", team) == {"team": "a"}, "not without the source's consent"
+# The source's rule asks for it too: the change reaches it.
+sync = {"ReplicaModifications": {"Status": "Enabled"}}
+s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE, "Rules": [
+    rule("gold", 2, {"Tag": {"Key": "tier", "Value": "gold"}}, StorageClass="STANDARD_IA"),
+    dict(rule("team", 1, {"And": {"Prefix": "docs/", "Tags": [{"Key": "team", "Value": "a"}]}}),
+        SourceSelectionCriteria=sync),
+]})
+s3.put_object_tagging(Bucket="dst", Key="docs/team", VersionId=team,
+    Tagging={"TagSet": [{"Key": "team", "Value": "a"}, {"Key": "seen", "Value": "3"}]})
+wait(lambda: tags("src", "docs/team", team) == {"team": "a", "seen": "3"}, "synced back")
 time.sleep(2)
-assert tags("dst", "docs/team", team) == {"team": "a", "seen": "2"}
+assert tags("dst", "docs/team", team) == {"team": "a", "seen": "3"}
 versions = lambda b: len(s3.list_object_versions(Bucket=b, Prefix="docs/team")["Versions"])
 assert versions("src") == 1 and versions("dst") == 1
 print("ok")

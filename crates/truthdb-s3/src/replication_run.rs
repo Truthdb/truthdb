@@ -599,8 +599,7 @@ fn refused(
     // made again by another account takes none. Another account's bucket
     // takes replicas as its bucket policy allows (checked below, as the
     // configuration's creator).
-    let owner = config
-        .rule_for(&queued.key, &version.attrs.tags)
+    let owner = rule_naming(config, queued, &version.attrs.tags)
         .and_then(|rule| rule.destination.owner.clone())
         .unwrap_or_else(|| source.owner.clone());
     Ok(if destination.owner != owner {
@@ -730,6 +729,34 @@ fn remote_job(
     }))
 }
 
+/// The rule that still sends queued replication `queued` to its
+/// destination, the source version having `tags` now. A new replica was
+/// queued under the tags it was written with, as S3 replicates tag-filtered
+/// versions: any enabled rule naming its destination still sends it (one
+/// whose filter names it first). A tag change goes by the rule its tags
+/// now name.
+fn rule_naming<'c>(
+    config: &'c ReplicationConfig,
+    queued: &QueuedReplication,
+    tags: &[(String, String)],
+) -> Option<&'c truthdb_object::ReplicationRule> {
+    match queued.work {
+        ReplicationWork::Create => config
+            .rule_for(&queued.key, tags)
+            .filter(|rule| rule.destination.bucket == queued.destination)
+            .or_else(|| {
+                config.rules.iter().find(|rule| {
+                    rule.enabled
+                        && rule.destination.bucket == queued.destination
+                        && rule.filter.names_key(&queued.key)
+                })
+            }),
+        ReplicationWork::Metadata => config
+            .rule_for(&queued.key, tags)
+            .filter(|rule| rule.destination.bucket == queued.destination),
+    }
+}
+
 /// Makes one queued replication in this server and takes it off the
 /// queue, or prepares one for another service.
 fn replicate(
@@ -753,18 +780,15 @@ fn replicate(
     };
     // A rule must still send the version there; its class is the one it
     // names now.
-    let config = file.replication(&queued.bucket)?.filter(|config| {
-        config
-            .rule_for(&queued.key, &source.attrs.tags)
-            .is_some_and(|rule| rule.destination.bucket == queued.destination)
-    });
+    let config = file
+        .replication(&queued.bucket)?
+        .filter(|config| rule_naming(config, queued, &source.attrs.tags).is_some());
     let Some(config) = config else {
         return file
             .transaction(|tx| tx.drop_replication(queued))
             .map(|()| None);
     };
-    let rule_class = config
-        .rule_for(&queued.key, &source.attrs.tags)
+    let rule_class = rule_naming(&config, queued, &source.attrs.tags)
         .and_then(|rule| rule.destination.storage_class);
     // A bucket of this server first, then one on another service.
     if file.bucket(&queued.destination)?.is_none()
@@ -841,11 +865,26 @@ fn replicate(
             // of a replica sent back) its source; version numbers are one
             // count for every bucket. Tags it has already are not set again,
             // so a two-way sync ends.
-            let differs = file
+            let there = file
                 .object_version(&destination, &key, VersionSel::Seq(queued.version))?
                 .ok()
-                .filter(|there| !there.delete_marker)
-                .is_some_and(|there| there.attrs.tags != source.attrs.tags);
+                .filter(|there| !there.delete_marker);
+            // A change sent back reaches a source only if it asks for them
+            // too, as S3 needs replica modification sync on both buckets:
+            // its own rule to the replicas' bucket enables it.
+            let consents = match file.replication_status(&destination, &key, queued.version)? {
+                Some(ReplicationStatus::Replica) => true,
+                _ => match (file.replication(&destination)?, &there) {
+                    (Some(theirs), Some(there)) => theirs
+                        .rule_for(&key, &there.attrs.tags)
+                        .is_some_and(|rule| {
+                            rule.destination.bucket == queued.bucket && rule.replica_modifications
+                        }),
+                    _ => false,
+                },
+            };
+            let differs =
+                consents && there.is_some_and(|there| there.attrs.tags != source.attrs.tags);
             file.transaction(|tx| {
                 if differs {
                     tx.set_tags(
@@ -1615,6 +1654,95 @@ mod tests {
             "the local replica is made though far's work comes first"
         );
         assert_eq!(steps, 2);
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_version_is_replicated_as_its_tags_were_when_written() {
+        use truthdb_object::{
+            BodyWriter, ObjectAttrs, ReplicationDestination, ReplicationFilter, ReplicationRule,
+            StorageClass,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-s3-replication-tags-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let storage = create(&path);
+        let me = "111111111111";
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_account(me, "me", 1)?.unwrap();
+                for bucket in ["src", "dst"] {
+                    tx.create_bucket(bucket, me, 1)?.unwrap();
+                    tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+                }
+                tx.put_replication(
+                    "src",
+                    &ReplicationConfig {
+                        role: "role".into(),
+                        rules: vec![ReplicationRule {
+                            id: "gold".into(),
+                            priority: 1,
+                            enabled: true,
+                            filter: ReplicationFilter::Tag("tier".into(), "gold".into()),
+                            replica_modifications: false,
+                            destination: ReplicationDestination {
+                                bucket: "dst".into(),
+                                account: None,
+                                storage_class: None,
+                                owner_override: false,
+                                owner: Some(me.into()),
+                            },
+                        }],
+                        account: me.into(),
+                        user: None,
+                    },
+                )
+            })
+            .unwrap();
+        let mut writer = BodyWriter::begin(&storage, 1).unwrap();
+        writer.write(&storage, b"gold", 1).unwrap();
+        let sealed = writer.finish(&storage, 1).unwrap();
+        let version = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_object(
+                    "src",
+                    "k",
+                    &sealed,
+                    &ObjectAttrs {
+                        tags: vec![("tier".into(), "gold".into())],
+                        ..ObjectAttrs::default()
+                    },
+                    StorageClass::Standard,
+                    1,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap()
+            .version;
+        // Its tag is taken off before the runner comes to it: it was
+        // written under the rule, and is replicated.
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.set_tags("src", "k", VersionSel::Seq(version), Vec::new(), 1))
+            .unwrap()
+            .unwrap();
+        {
+            let mut lock = storage.lock();
+            let mut file = ObjFile::new(&mut lock);
+            for queued in file.replication_queue(None, 10).unwrap() {
+                replicate(&mut file, &queued, now_ms()).unwrap();
+            }
+        }
+        let status = |bucket: &str| {
+            ObjFile::new(&mut storage.lock())
+                .replication_status(bucket, "k", version)
+                .unwrap()
+        };
+        assert_eq!(status("src"), Some(ReplicationStatus::Completed));
+        assert_eq!(status("dst"), Some(ReplicationStatus::Replica));
         drop(storage);
         std::fs::remove_file(&path).ok();
     }

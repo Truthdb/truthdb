@@ -211,13 +211,12 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
         None => false,
         Some(criteria) => {
             criteria.only(&["ReplicaModifications", "SseKmsEncryptedObjects"])?;
-            // As S3: required once SourceSelectionCriteria is given.
-            let kms = criteria
-                .one("SseKmsEncryptedObjects")?
-                .ok_or_else(malformed)?;
-            kms.only(&["Status"])?;
-            if status(kms)? {
-                return Err(not_yet("Replication of objects under KMS keys"));
+            // Objects under KMS keys are not offered (there is no KMS).
+            if let Some(kms) = criteria.one("SseKmsEncryptedObjects")? {
+                kms.only(&["Status"])?;
+                if status(kms)? {
+                    return Err(not_yet("Replication of objects under KMS keys"));
+                }
             }
             match criteria.one("ReplicaModifications")? {
                 None => false,
@@ -768,10 +767,7 @@ mod tests {
                 malformed.clone(),
             ),
             (
-                rule_with(
-                    "<Filter/><SourceSelectionCriteria><ReplicaModifications><Status>Enabled\
-                     </Status></ReplicaModifications></SourceSelectionCriteria>",
-                ),
+                rule_with("<Filter/><SourceSelectionCriteria><Other/></SourceSelectionCriteria>"),
                 malformed.clone(),
             ),
             (

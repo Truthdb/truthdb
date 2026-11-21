@@ -87,6 +87,19 @@ pub enum ReplicationFilter {
 }
 
 impl ReplicationFilter {
+    /// Whether a version of `key` is one this filter names, its tags left
+    /// aside (its prefix, if any).
+    pub fn names_key(&self, key: &str) -> bool {
+        match self {
+            ReplicationFilter::Prefix(prefix)
+            | ReplicationFilter::And {
+                prefix: Some(prefix),
+                ..
+            } => key.starts_with(prefix.as_str()),
+            _ => true,
+        }
+    }
+
     /// Whether a version of `key` with `tags` is one this filter names.
     pub fn matches(&self, key: &str, tags: &[(String, String)]) -> bool {
         let tagged = |name: &str, value: &str| {
