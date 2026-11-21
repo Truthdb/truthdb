@@ -116,7 +116,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "annotation",
     "attributes",
     "intelligent-tiering",
-    "inventory",
     "metadataAnnotationTable",
     "metadataConfiguration",
     "metadataInventoryTable",
@@ -139,6 +138,7 @@ const SUBRESOURCES: &[&str] = &[
     "encryption",
     "legal-hold",
     "lifecycle",
+    "inventory",
     "location",
     "logging",
     "metrics",
@@ -522,12 +522,13 @@ async fn route(
     // not implemented, perhaps one added since) is refused, whichever route
     // its other parameters would select.
     if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
-        // A metrics configuration is named by its id.
-        let configuration_id: &[&str] = if has_param(&request, "metrics") {
-            &["id"]
-        } else {
-            &[]
-        };
+        // A metrics or inventory configuration is named by its id.
+        let configuration_id: &[&str] =
+            if has_param(&request, "metrics") || has_param(&request, "inventory") {
+                &["id"]
+            } else {
+                &[]
+            };
         let known: Vec<&str> = SUBRESOURCES
             .iter()
             .chain(&["versionId", "partNumber"])
@@ -636,6 +637,18 @@ async fn route(
         }
         (Target::Object(..), _) if has_param(&request, "logging") => Err(
             S3Error::not_implemented("an object has no ?logging configuration"),
+        ),
+        (Target::Bucket(bucket), method) if has_param(&request, "inventory") => {
+            let action = match method {
+                Method::GET => "s3:GetInventoryConfiguration",
+                Method::PUT | Method::DELETE => "s3:PutInventoryConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?inventory"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::inventory_config::bucket_inventory(state, request, auth, bucket, method).await
+        }
+        (Target::Object(..), _) if has_param(&request, "inventory") => Err(
+            S3Error::not_implemented("an object has no ?inventory configuration"),
         ),
         (Target::Bucket(bucket), method) if has_param(&request, "metrics") => {
             let action = match method {

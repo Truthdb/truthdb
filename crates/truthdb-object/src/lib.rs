@@ -22,6 +22,7 @@ mod documents;
 mod fulltext;
 mod gc;
 mod imports;
+mod inventory;
 mod jobs;
 mod journal;
 mod lifecycle;
@@ -57,9 +58,9 @@ pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
 pub use credentials::AccessKey;
 pub use documents::{
-    ACCOUNT_TRAIL, BUCKET_CORS, BUCKET_ENCRYPTION, BUCKET_LIFECYCLE, BUCKET_LOGGING,
-    BUCKET_METRICS, BUCKET_POLICY, BUCKET_WEBSITE, ManagedPolicy, OBJECT_LOCK_DEFAULT,
-    PUBLIC_ACCESS_BLOCK,
+    ACCOUNT_TRAIL, BUCKET_CORS, BUCKET_ENCRYPTION, BUCKET_INVENTORY, BUCKET_LIFECYCLE,
+    BUCKET_LOGGING, BUCKET_METRICS, BUCKET_POLICY, BUCKET_WEBSITE, ManagedPolicy,
+    OBJECT_LOCK_DEFAULT, PUBLIC_ACCESS_BLOCK,
 };
 pub use fulltext::{
     DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,
@@ -67,6 +68,7 @@ pub use fulltext::{
 };
 pub use gc::GcOutcome;
 pub use imports::{Import, ImportFailure, ImportSource, ImportState};
+pub use inventory::{InventoryConfig, InventoryFormat, InventoryFrequency};
 pub use jobs::{Job, JobResult, JobStatus};
 pub use journal::{JournalObject, JournalRecord, Notice, Origin, RecordType};
 pub use lifecycle::{

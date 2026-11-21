@@ -274,6 +274,14 @@ fn bucket_event(request: &hyper::Request<Incoming>, method: &Method) -> Option<&
             "PutBucketLifecycle",
             Some("DeleteBucketLifecycle"),
         ),
+        Some("inventory") if *method == Method::GET && !has_param(request, "id") => {
+            Some("ListBucketInventoryConfigurations")
+        }
+        Some("inventory") => by_method(
+            "GetBucketInventoryConfiguration",
+            "PutBucketInventoryConfiguration",
+            Some("DeleteBucketInventoryConfiguration"),
+        ),
         Some("location") if *method == Method::GET => Some("GetBucketLocation"),
         Some("logging") => by_method("GetBucketLogging", "PutBucketLogging", None),
         Some("metrics") if *method == Method::GET && !has_param(request, "id") => {
