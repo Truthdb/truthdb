@@ -253,13 +253,24 @@ enum Encoder {
     Parquet(Box<SerializedFileWriter<Vec<u8>>>, Vec<(Kind, bool)>),
 }
 
-/// The list being written into a body.
+/// Row groups (a page each) a Parquet list file holds at most: a list of
+/// more goes on in another file, so neither a file's footer nor what the
+/// writer keeps of it grows with the bucket.
+const GROUPS_PER_FILE: usize = 100;
+
+/// The list being written: its files, each a body.
 struct List {
+    format: InventoryFormat,
+    columns: Vec<(&'static str, &'static str, Kind)>,
     encoder: Encoder,
     writer: BodyWriter,
-    /// Bytes written so far.
+    /// Bytes written to the file being written so far.
     size: u64,
-    /// When the body was last marked touched.
+    /// Row groups in the file being written.
+    groups: usize,
+    /// The files written whole, and their sizes.
+    done: Vec<(SealedBody, u64)>,
+    /// When the bodies were last marked touched.
     touched_ms: u64,
 }
 
@@ -268,6 +279,26 @@ fn parquet_error(err: parquet::errors::ParquetError) -> String {
 }
 
 impl List {
+    fn begin(
+        storage: &Storage,
+        format: InventoryFormat,
+        columns: Vec<(&'static str, &'static str, Kind)>,
+    ) -> Result<List, String> {
+        let encoder = List::encoder(format, &columns)?;
+        let now = now_ms();
+        let writer = BodyWriter::begin(storage, now).map_err(|err| err.to_string())?;
+        Ok(List {
+            format,
+            columns,
+            encoder,
+            writer,
+            size: 0,
+            groups: 0,
+            done: Vec::new(),
+            touched_ms: now,
+        })
+    }
+
     /// An encoder for a list of `columns` in `format`.
     fn encoder(
         format: InventoryFormat,
@@ -309,6 +340,7 @@ impl List {
             }
             Encoder::Parquet(writer, kinds) => {
                 write_row_group(writer, kinds, rows).map_err(parquet_error)?;
+                self.groups += 1;
                 writer.flush().map_err(|err| err.to_string())?;
                 // Taken from under the writer, which counts its offsets
                 // itself.
@@ -320,33 +352,69 @@ impl List {
         self.writer
             .write(storage, &out, now)
             .map_err(|err| err.to_string())?;
+        if self.groups == GROUPS_PER_FILE {
+            let encoder = List::encoder(self.format, &self.columns)?;
+            let writer = BodyWriter::begin(storage, now).map_err(|err| err.to_string())?;
+            let full = (
+                std::mem::replace(&mut self.encoder, encoder),
+                std::mem::replace(&mut self.writer, writer),
+            );
+            let file = seal(storage, full.0, full.1, self.size)?;
+            self.done.push(file);
+            self.size = 0;
+            self.groups = 0;
+        }
         if now.saturating_sub(self.touched_ms) >= TOUCH_MS {
             self.writer
                 .touch(storage, now)
+                .map_err(|err| err.to_string())?;
+            // The files written whole wait for the delivery as they are.
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| {
+                    for (body, _) in &self.done {
+                        tx.touch_body(body.body, now)?;
+                    }
+                    Ok(())
+                })
                 .map_err(|err| err.to_string())?;
             self.touched_ms = now;
         }
         Ok(())
     }
 
-    fn finish(self, storage: &Storage) -> Result<(SealedBody, u64), String> {
-        let out = match self.encoder {
-            Encoder::Csv(encoder) => encoder.finish().map_err(|err| err.to_string())?,
-            Encoder::Parquet(mut writer, _) => {
-                writer.finish().map_err(parquet_error)?;
-                writer.flush().map_err(|err| err.to_string())?;
-                std::mem::take(writer.inner_mut())
-            }
-        };
-        let mut writer = self.writer;
-        writer
-            .write(storage, &out, now_ms())
-            .map_err(|err| err.to_string())?;
-        let sealed = writer
-            .finish(storage, now_ms())
-            .map_err(|err| err.to_string())?;
-        Ok((sealed, self.size + out.len() as u64))
+    /// The list's files, and their sizes.
+    fn finish(self, storage: &Storage) -> Result<Vec<(SealedBody, u64)>, String> {
+        let mut files = self.done;
+        // A Parquet list that ended with a file just made full has no more.
+        if files.is_empty() || self.groups > 0 || self.format == InventoryFormat::Csv {
+            files.push(seal(storage, self.encoder, self.writer, self.size)?);
+        }
+        Ok(files)
     }
+}
+
+/// Ends a list file (`size` bytes written so far): its body and its size.
+fn seal(
+    storage: &Storage,
+    encoder: Encoder,
+    mut writer: BodyWriter,
+    size: u64,
+) -> Result<(SealedBody, u64), String> {
+    let out = match encoder {
+        Encoder::Csv(encoder) => encoder.finish().map_err(|err| err.to_string())?,
+        Encoder::Parquet(mut encoder, _) => {
+            encoder.finish().map_err(parquet_error)?;
+            encoder.flush().map_err(|err| err.to_string())?;
+            std::mem::take(encoder.inner_mut())
+        }
+    };
+    writer
+        .write(storage, &out, now_ms())
+        .map_err(|err| err.to_string())?;
+    let sealed = writer
+        .finish(storage, now_ms())
+        .map_err(|err| err.to_string())?;
+    Ok((sealed, size + out.len() as u64))
 }
 
 /// Writes `rows` as one row group.
@@ -449,20 +517,11 @@ async fn make_report(
         created_ms,
         versioning,
     } = due;
-    let encoder = List::encoder(config.format, &columns(&config))?;
-    let storage = Arc::clone(&state.storage);
-    let mut list = tokio::task::spawn_blocking(move || {
-        let now = now_ms();
-        BodyWriter::begin(&storage, now).map(|writer| List {
-            encoder,
-            writer,
-            size: 0,
-            touched_ms: now,
-        })
-    })
-    .await
-    .map_err(|err| err.to_string())?
-    .map_err(|err| err.to_string())?;
+    let (storage, format, list_columns) =
+        (Arc::clone(&state.storage), config.format, columns(&config));
+    let mut list = tokio::task::spawn_blocking(move || List::begin(&storage, format, list_columns))
+        .await
+        .map_err(|err| err.to_string())??;
     let encrypted = state.storage.is_encrypted();
     let row = Arc::new(Row::new(&config, &bucket, &owner, versioning, encrypted));
     let mut after: Option<(String, Option<u64>)> = None;
@@ -523,7 +582,7 @@ async fn make_report(
         }
         after = next;
     }
-    let (data, size) = on_list(state, list, |storage, list| list.finish(storage)).await?;
+    let data = on_list(state, list, |storage, list| list.finish(storage)).await?;
     let due = Due {
         bucket,
         document,
@@ -532,7 +591,7 @@ async fn make_report(
         created_ms,
         versioning,
     };
-    let files = report_files(state, &due, started, data, size).await?;
+    let files = report_files(state, &due, started, data).await?;
     let delivery = object(state, move |file| {
         deliver_in(file, &due, started, &files, now_ms())
     })
@@ -565,15 +624,14 @@ fn hex(bytes: &[u8]) -> String {
 /// A report's files: its key, body and content type each.
 type Files = Vec<(String, SealedBody, &'static str)>;
 
-/// The report's files for a run started at `started`: the list (`data`,
-/// `size` bytes), its manifest, checksum and Hive symlink, keyed as S3 keys
-/// them under the destination's prefix.
+/// The report's files for a run started at `started`: the list's (`data`,
+/// each with its size), its manifest, checksum and Hive symlink, keyed as S3
+/// keys them under the destination's prefix.
 async fn report_files(
     state: &S3State,
     due: &Due,
     started: u64,
-    data: SealedBody,
-    size: u64,
+    data: Vec<(SealedBody, u64)>,
 ) -> Result<Files, String> {
     let (bucket, config) = (&due.bucket, &due.config);
     let base = match config
@@ -604,7 +662,23 @@ async fn report_files(
             "application/octet-stream",
         ),
     };
-    let data_key = format!("{base}/data/{name}.{extension}");
+    let data: Vec<(String, SealedBody, u64)> = data
+        .into_iter()
+        .enumerate()
+        .map(|(index, (body, size))| {
+            (
+                format!("{base}/data/{name}-{index}.{extension}"),
+                body,
+                size,
+            )
+        })
+        .collect();
+    let listed: Vec<serde_json::Value> = data
+        .iter()
+        .map(|(key, body, size)| {
+            serde_json::json!({"key": key, "size": size, "MD5checksum": hex(&body.md5)})
+        })
+        .collect();
     let stamp = iso8601(started);
     let (date, hour, minute) = (&stamp[..10], &stamp[11..13], &stamp[14..16]);
     let manifest = serde_json::json!({
@@ -614,16 +688,22 @@ async fn report_files(
         "creationTimestamp": started.to_string(),
         "fileFormat": format,
         "fileSchema": schema,
-        "files": [{"key": data_key, "size": size, "MD5checksum": hex(&data.md5)}],
+        "files": listed,
     })
     .to_string();
     let checksum = {
         use md5::Digest as _;
         hex(&md5::Md5::digest(manifest.as_bytes()))
     };
-    let symlink = format!("s3://{}/{data_key}\n", config.destination);
-    Ok(vec![
-        (data_key, data, content_type),
+    let symlink: String = data
+        .iter()
+        .map(|(key, _, _)| format!("s3://{}/{key}\n", config.destination))
+        .collect();
+    let mut files: Files = data
+        .into_iter()
+        .map(|(key, body, _)| (key, body, content_type))
+        .collect();
+    files.extend([
         (
             format!("{base}/{date}T{hour}-{minute}Z/manifest.json"),
             small_body(state, manifest.into_bytes()).await?,
@@ -639,7 +719,8 @@ async fn report_files(
             small_body(state, symlink.into_bytes()).await?,
             "text/plain",
         ),
-    ])
+    ]);
+    Ok(files)
 }
 
 /// What became of a run's report.
@@ -1321,6 +1402,49 @@ mod tests {
                 "object_lock_event_hold_duration_unit"
             ]
         );
+    }
+
+    #[test]
+    fn a_long_parquet_list_goes_on_in_another_file_every_hundred_row_groups() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-s3-inventory-files-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let storage = create(&path);
+        let columns = vec![COLUMNS[0], COLUMNS[1]];
+        let row = |n: usize| vec![Value::Text("src".into()), Value::Text(format!("k{n}"))];
+        let rows_per_file = |pages: usize| -> Vec<i64> {
+            let mut list =
+                List::begin(&storage, InventoryFormat::Parquet, columns.clone()).unwrap();
+            for page in 0..pages {
+                list.add(&storage, &[row(page)]).unwrap();
+            }
+            list.finish(&storage)
+                .unwrap()
+                .into_iter()
+                .map(|(sealed, size)| {
+                    let mut lock = storage.lock();
+                    let mut file = ObjFile::new(&mut lock);
+                    let body = file.transaction(|tx| sealed.seal_in(tx)).unwrap().body;
+                    let mut bytes = vec![0; size as usize];
+                    file.read_body(body, 0, &mut bytes).unwrap();
+                    SerializedFileReader::new(bytes::Bytes::from(bytes))
+                        .unwrap()
+                        .metadata()
+                        .file_metadata()
+                        .num_rows()
+                })
+                .collect()
+        };
+        assert_eq!(rows_per_file(250), [100, 100, 50]);
+        // A list that ends as a file fills has no empty one after it; an
+        // empty list is one empty file.
+        assert_eq!(rows_per_file(200), [100, 100]);
+        assert_eq!(rows_per_file(0), [0]);
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
