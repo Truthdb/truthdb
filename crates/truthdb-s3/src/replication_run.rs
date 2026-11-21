@@ -160,12 +160,26 @@ struct Runner {
     after: Option<u64>,
     held: HashMap<String, u64>,
     tries: HashMap<u64, u32>,
+    /// Where the queue was read up to when it was last read again from a
+    /// released bucket's first entry: no bucket is released again before
+    /// it is reached, so the reading always gets further.
+    rewound_from: Option<u64>,
 }
 
 /// How often a replication's body may fail to be read before it is FAILED.
 const MAX_TRIES: u32 = 10;
 
 impl Runner {
+    /// Makes remote bucket `name` wait (doubling from [`IDLE`]).
+    fn wait(&mut self, name: &str) {
+        let wait = self
+            .waits
+            .get(name)
+            .map_or(IDLE, |(_, wait)| (*wait * 2).clamp(IDLE, MAX_WAIT));
+        self.waits
+            .insert(name.to_string(), (Instant::now() + wait, wait));
+    }
+
     /// Holds remote bucket `name` from queued replication `number` on.
     fn hold(&mut self, name: &str, number: u64) {
         let first = self.held.entry(name.to_string()).or_insert(number);
@@ -180,6 +194,7 @@ impl Runner {
     fn held_now(&mut self) -> HashSet<String> {
         if self.after.is_none() {
             self.held.clear();
+            self.rewound_from = None;
         }
         let now = Instant::now();
         let waited: HashSet<String> = self
@@ -188,16 +203,28 @@ impl Runner {
             .filter(|(_, (until, _))| *until > now)
             .map(|(name, _)| name.clone())
             .collect();
-        let released: Vec<(String, u64)> = self
-            .held
-            .iter()
-            .filter(|(name, _)| !waited.contains(*name))
-            .map(|(name, first)| (name.clone(), *first))
-            .collect();
+        // Not before the last reading again has caught up.
+        let caught_up = match (self.rewound_from, self.after) {
+            (Some(from), Some(after)) => after >= from,
+            _ => true,
+        };
+        let released: Vec<(String, u64)> = match caught_up {
+            true => self
+                .held
+                .iter()
+                .filter(|(name, _)| !waited.contains(*name))
+                .map(|(name, first)| (name.clone(), *first))
+                .collect(),
+            false => Vec::new(),
+        };
+        let from = self.after;
         for (name, first) in released {
             self.held.remove(&name);
             let back = first.saturating_sub(1);
             self.after = Some(self.after.map_or(back, |after| after.min(back)));
+        }
+        if self.after != from {
+            self.rewound_from = from;
         }
         let mut held = waited;
         held.extend(self.held.keys().cloned());
@@ -218,12 +245,7 @@ impl Runner {
             }
             Err(Fail::Passing(why)) => {
                 self.hold(name, number);
-                let wait = self
-                    .waits
-                    .get(name)
-                    .map_or(IDLE, |(_, wait)| (*wait * 2).clamp(IDLE, MAX_WAIT));
-                self.waits
-                    .insert(name.to_string(), (Instant::now() + wait, wait));
+                self.wait(name);
                 Err(Fail::Passing(why))
             }
             Err(Fail::Unreadable(why)) => {
@@ -295,6 +317,7 @@ async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
         // not finished is still queued: its bucket is held.
         if let Err(err) = object(state, move |file| finish_remote(file, &job, outcome)).await {
             runner.hold(&name, number);
+            runner.wait(&name);
             failed.get_or_insert(err);
         }
     }
@@ -1262,6 +1285,19 @@ mod tests {
         runner.after = Some(100);
         assert!(!runner.held_now().contains("far"));
         assert_eq!(runner.after, Some(6));
+        // No other bucket is let go before the reading again has caught up
+        // with where it was (100): the reading always gets further.
+        let mut again = Runner {
+            after: Some(6),
+            rewound_from: Some(100),
+            ..Runner::default()
+        };
+        again.hold("near", 20);
+        assert!(again.held_now().contains("near"));
+        assert_eq!(again.after, Some(6));
+        again.after = Some(100);
+        assert!(!again.held_now().contains("near"));
+        assert_eq!((again.after, again.rewound_from), (Some(19), Some(100)));
         // Held while waited for; a new pass starts with nothing else held.
         runner
             .waits
