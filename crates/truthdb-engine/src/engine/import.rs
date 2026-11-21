@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use truthdb_object::{
     BodyWriter, Import, ImportState, ObjectAttrs, ObjectError, Origin, StorageClass, VersionSel,
 };
-use truthdb_s3client::{Client, Config, Error as S3Error, Listed};
+use truthdb_s3client::{Client, Config, Listed};
 
 use super::{Engine, EngineError};
 
@@ -73,19 +73,6 @@ enum Outcome {
     Stopped,
 }
 
-/// Whether a source error will not clear by waiting: anything but a
-/// transport failure, a 5xx answer, a timeout (408), throttling (429) or a
-/// clock skew.
-fn permanent(err: &S3Error) -> bool {
-    match err {
-        S3Error::Invalid(_) => true,
-        S3Error::Service { status, code, .. } => {
-            *status < 500 && !matches!(*status, 408 | 429) && code != "RequestTimeTooSkewed"
-        }
-        S3Error::Transport(_) => false,
-    }
-}
-
 impl Engine {
     /// One step of the running import that waited longest (of those not
     /// waiting to be tried again); returns whether to step again at once.
@@ -131,7 +118,7 @@ impl Engine {
             &import.after,
         )) {
             Ok(page) => page,
-            Err(err) if permanent(&err) => {
+            Err(err) if err.permanent() => {
                 return self.end_import(import, ImportState::Failed, err.to_string());
             }
             Err(err) => return self.wait_import(import, err.to_string(), waits),
@@ -257,7 +244,7 @@ impl Engine {
         let mut download =
             match runtime.block_on(client.get_object(&import.source.bucket, &object.key)) {
                 Ok(download) => download,
-                Err(err) if permanent(&err) => return Ok(Outcome::Failed(err.to_string())),
+                Err(err) if err.permanent() => return Ok(Outcome::Failed(err.to_string())),
                 Err(err) => return Ok(Outcome::Retry(err.to_string())),
             };
         // Held to the limits an upload is.
@@ -431,7 +418,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use truthdb_s3client::Error as S3Error;
 
     #[test]
     fn only_lasting_refusals_are_permanent() {
@@ -440,14 +427,14 @@ mod tests {
             code: code.to_string(),
             message: String::new(),
         };
-        assert!(permanent(&S3Error::Invalid("x".into())));
-        assert!(permanent(&service(403, "AccessDenied")));
-        assert!(permanent(&service(404, "NoSuchBucket")));
-        assert!(permanent(&service(301, "PermanentRedirect")));
-        assert!(!permanent(&service(403, "RequestTimeTooSkewed")));
-        assert!(!permanent(&service(408, "RequestTimeout")));
-        assert!(!permanent(&service(429, "SlowDown")));
-        assert!(!permanent(&service(503, "SlowDown")));
-        assert!(!permanent(&S3Error::Transport("reset".into())));
+        assert!(S3Error::Invalid("x".into()).permanent());
+        assert!(service(403, "AccessDenied").permanent());
+        assert!(service(404, "NoSuchBucket").permanent());
+        assert!(service(301, "PermanentRedirect").permanent());
+        assert!(!service(403, "RequestTimeTooSkewed").permanent());
+        assert!(!service(408, "RequestTimeout").permanent());
+        assert!(!service(429, "SlowDown").permanent());
+        assert!(!service(503, "SlowDown").permanent());
+        assert!(!S3Error::Transport("reset".into()).permanent());
     }
 }

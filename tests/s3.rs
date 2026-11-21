@@ -13585,6 +13585,188 @@ else:
 "#;
 
 #[test]
+fn replicas_are_sent_to_a_bucket_of_another_server_and_wait_while_it_is_down() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let mut source = start_server();
+    let mut target = start_server();
+    let (account, key, secret) = account_with_key(&source, "near");
+    let (_, far_key, far_secret) = account_with_key(&target, "far");
+    let script = source.dir.join("remote_replication.py");
+    std::fs::write(&script, REMOTE_REPLICATION_SCRIPT).expect("script");
+    let run = |phase: &str, source: &Server, target: &Server| {
+        let output = Command::new(&python)
+            .arg(&script)
+            .args([
+                phase,
+                &source.s3_port.to_string(),
+                &target.s3_port.to_string(),
+                &account,
+                &key,
+                &secret,
+                &far_key,
+                &far_secret,
+            ])
+            .output()
+            .expect("run python");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success() && stdout.contains("ok"),
+            "{phase}\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run("buckets", &source, &target);
+    // The remote buckets: one there, one missing there; a name a bucket of
+    // this server has, a bad name and a bad endpoint are refused.
+    let endpoint = format!("http://127.0.0.1:{}", target.s3_port);
+    for name in ["far", "missing"] {
+        let made = native(
+            source.native_port,
+            &format!("s3 create remote bucket {name} {endpoint} us-east-1 {far_key} {far_secret}"),
+        );
+        assert_eq!(made["remote_bucket"], name, "{made}");
+    }
+    for bad in [
+        format!("s3 create remote bucket far {endpoint} us-east-1 k s"),
+        format!("s3 create remote bucket src {endpoint} us-east-1 k s"),
+        format!("s3 create remote bucket Bad_Name {endpoint} us-east-1 k s"),
+        "s3 create remote bucket other nonsense us-east-1 k s".to_string(),
+        format!("s3 create remote bucket other {endpoint} us-east-1 k s /no/such/ca.pem"),
+    ] {
+        let reply = native_text(source.native_port, &bad);
+        assert!(!reply.contains("\"remote_bucket\""), "{bad}: {reply}");
+    }
+    let listed = sql_rows(
+        source.native_port,
+        "SELECT bucket, endpoint, region, access_key, ca FROM sys.dm_s3_remote_buckets ORDER BY bucket",
+    );
+    assert_eq!(
+        listed,
+        [
+            [
+                "far",
+                endpoint.as_str(),
+                "us-east-1",
+                far_key.as_str(),
+                "SYSTEM"
+            ],
+            [
+                "missing",
+                endpoint.as_str(),
+                "us-east-1",
+                far_key.as_str(),
+                "SYSTEM"
+            ],
+        ]
+    );
+    let all = sql_rows(source.native_port, "SELECT * FROM sys.dm_s3_remote_buckets");
+    assert!(
+        !format!("{all:?}").contains(&far_secret),
+        "the secret is not shown"
+    );
+    run("replicas", &source, &target);
+    // The other server down: versions wait, PENDING, and are sent once it
+    // is back.
+    target.child.kill().expect("kill");
+    target.child.wait().expect("wait");
+    run("down", &source, &target);
+    crash_and_restart(&mut target);
+    run("back", &source, &target);
+    // Versions queued when this server is killed are sent after it.
+    run("arm", &source, &target);
+    crash_and_restart(&mut source);
+    run("after", &source, &target);
+    let dropped = native(source.native_port, "s3 drop remote bucket missing");
+    assert_eq!(dropped["dropped"], true, "{dropped}");
+}
+
+const REMOTE_REPLICATION_SCRIPT: &str = r#"
+import sys, time
+import boto3, botocore.config
+phase, port, far_port, account, key, secret, far_key, far_secret = sys.argv[1:9]
+def client(p, k, s):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{p}", region_name="us-east-1",
+        aws_access_key_id=k, aws_secret_access_key=s,
+        config=botocore.config.Config(retries={"max_attempts": 1}, connect_timeout=2, read_timeout=10))
+s3, far = client(port, key, secret), client(far_port, far_key, far_secret)
+ROLE = f"arn:aws:iam::{account}:role/replication"
+def status(key, version):
+    return s3.head_object(Bucket="src", Key=key, VersionId=version).get("ReplicationStatus")
+def wait(test, what, seconds=30):
+    deadline = time.time() + seconds
+    while not test():
+        assert time.time() < deadline, what
+        time.sleep(0.2)
+def far_versions(prefix):
+    return [v for v in far.list_object_versions(Bucket="far", Prefix=prefix).get("Versions", [])]
+if phase == "buckets":
+    for c, bucket in [(s3, "src"), (far, "far")]:
+        c.create_bucket(Bucket=bucket)
+        c.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    print("ok")
+elif phase == "replicas":
+    rule = lambda prefix, destination, priority: {"ID": prefix, "Priority": priority, "Status": "Enabled",
+        "Filter": {"Prefix": prefix}, "DeleteMarkerReplication": {"Status": "Disabled"},
+        "Destination": {"Bucket": f"arn:aws:s3:::{destination}", "StorageClass": "STANDARD_IA"}}
+    # Only one destination a configuration (until slice 32): "missing" is
+    # tried by a second configuration below.
+    s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE,
+        "Rules": [rule("docs/", "far", 1)]})
+    small = s3.put_object(Bucket="src", Key="docs/small.txt", Body=b"hello far", ContentType="text/plain",
+        Metadata={"m": "v"}, Tagging="t=1&a%20b=c%26d", CacheControl="no-cache")["VersionId"]
+    big_body = bytes(range(256)) * (9 * 4096 + 7)
+    big = s3.put_object(Bucket="src", Key="docs/big.bin", Body=big_body)["VersionId"]
+    for k, v in [("docs/small.txt", small), ("docs/big.bin", big)]:
+        wait(lambda: status(k, v) == "COMPLETED", f"{k} sent")
+    got = far.get_object(Bucket="far", Key="docs/small.txt")
+    assert got["Body"].read() == b"hello far"
+    assert got["ContentType"] == "text/plain" and got["Metadata"] == {"m": "v"}, got
+    assert got["CacheControl"] == "no-cache" and got["StorageClass"] == "STANDARD_IA", got
+    assert sorted((t["Key"], t["Value"]) for t in far.get_object_tagging(Bucket="far",
+        Key="docs/small.txt")["TagSet"]) == [("a b", "c&d"), ("t", "1")]
+    assert far.get_object(Bucket="far", Key="docs/big.bin")["Body"].read() == big_body
+    assert far.head_object(Bucket="far", Key="docs/big.bin")["ETag"].endswith('-2"'), "in parts"
+    # A remote replica is a version of the other server's own.
+    assert len(far_versions("docs/small.txt")) == 1
+    # A bucket the other server does not have: FAILED, not tried again.
+    s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE,
+        "Rules": [rule("lost/", "missing", 1)]})
+    lost = s3.put_object(Bucket="src", Key="lost/x", Body=b"x")["VersionId"]
+    wait(lambda: status("lost/x", lost) == "FAILED", "failed")
+    s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE,
+        "Rules": [rule("docs/", "far", 1)]})
+    print("ok")
+elif phase == "down":
+    down = s3.put_object(Bucket="src", Key="docs/while-down", Body=b"wait")["VersionId"]
+    time.sleep(3)
+    assert status("docs/while-down", down) == "PENDING", "it waits"
+    print("ok")
+elif phase == "back":
+    versions = s3.list_object_versions(Bucket="src", Prefix="docs/while-down")["Versions"]
+    v = versions[0]["VersionId"]
+    wait(lambda: status("docs/while-down", v) == "COMPLETED", "sent once back", 60)
+    assert far.get_object(Bucket="far", Key="docs/while-down")["Body"].read() == b"wait"
+    print("ok")
+elif phase == "arm":
+    for i in range(40):
+        s3.put_object(Bucket="src", Key=f"docs/burst/{i:02}", Body=f"b{i}".encode())
+    print("ok")
+else:
+    for v in s3.list_object_versions(Bucket="src", Prefix="docs/burst/")["Versions"]:
+        wait(lambda: status(v["Key"], v["VersionId"]) == "COMPLETED", f"{v['Key']} sent", 60)
+    sent = far_versions("docs/burst/")
+    keys = sorted({v["Key"] for v in sent})
+    assert keys == [f"docs/burst/{i:02}" for i in range(40)], keys
+    # At least once: a replica sent just before the crash may be sent again.
+    assert 40 <= len(sent) <= 80, len(sent)
+    print("ok")
+"#;
+
+#[test]
 fn inventory_configurations_are_kept_per_bucket() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

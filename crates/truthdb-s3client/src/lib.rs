@@ -59,6 +59,21 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether the same request would fail again: a refusal that lasts (not
+    /// a timeout, throttling, a clock skew or a server error), or a request
+    /// that cannot be made. Anything else may succeed when tried again.
+    pub fn permanent(&self) -> bool {
+        match self {
+            Error::Invalid(_) => true,
+            Error::Service { status, code, .. } => {
+                *status < 500 && !matches!(*status, 408 | 429) && code != "RequestTimeTooSkewed"
+            }
+            Error::Transport(_) => false,
+        }
+    }
+}
+
 /// An object as listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
