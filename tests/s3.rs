@@ -13341,11 +13341,27 @@ refused(lambda: put("source", rule("missing")), "InvalidRequest")
 refused(lambda: put("source", rule("source")), "InvalidRequest")
 refused(lambda: put("nowhere", rule()), "NoSuchBucket")
 refused(lambda: put("source", rule("theirs")), "NotImplemented")
+# Another account's bucket is refused alike whatever Account is named: its
+# owner is not told.
+for named in [other_account, account, "000000000999"]:
+    refused(lambda: put("source", rule(Destination={"Bucket": "arn:aws:s3:::theirs",
+        "Account": named})), "NotImplemented")
 refused(lambda: put("source", rule(Destination={"Bucket": "arn:aws:s3:::copies",
     "Account": other_account})), "InvalidArgument")
-# Object Lock on the source needs it on the destination.
+# Object Lock on the source needs it on the destination, also when it is
+# enabled on the source after the configuration is put.
 refused(lambda: put("locked", rule()), "InvalidRequest")
 put("locked", rule("locked-copies"))
+versioned(s3, "unlocked")
+s3.put_bucket_replication(Bucket="unlocked",
+    ReplicationConfiguration={"Role": ROLE, "Rules": [rule()]})
+LOCK = {"ObjectLockEnabled": "Enabled"}
+refused(lambda: s3.put_object_lock_configuration(Bucket="unlocked",
+    ObjectLockConfiguration=LOCK), "InvalidBucketState")
+s3.put_bucket_replication(Bucket="unlocked",
+    ReplicationConfiguration={"Role": ROLE, "Rules": [rule("locked-copies")]})
+s3.put_object_lock_configuration(Bucket="unlocked", ObjectLockConfiguration=LOCK)
+assert s3.get_object_lock_configuration(Bucket="unlocked")["ObjectLockConfiguration"] == LOCK
 # What later steps build is refused, not ignored.
 refused(lambda: put("source", rule(Filter={"Tag": {"Key": "a", "Value": "b"}})), "NotImplemented")
 refused(lambda: put("source", rule(DeleteMarkerReplication={"Status": "Enabled"})), "NotImplemented")

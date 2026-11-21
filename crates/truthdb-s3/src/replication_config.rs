@@ -61,6 +61,14 @@ fn not_yet(what: &str) -> S3Error {
     S3Error::not_implemented(format!("{what} is not implemented"))
 }
 
+/// The text of the child named `name`, which holds no elements.
+fn text<'a>(element: &'a Element, name: &str) -> Result<Option<&'a str>, S3Error> {
+    match element.one(name)? {
+        Some(child) if !child.children.is_empty() => Err(malformed()),
+        child => Ok(child.map(|child| child.text.as_str())),
+    }
+}
+
 fn status(element: &Element) -> Result<bool, S3Error> {
     match element.text_of("Status")? {
         Some("Enabled") => Ok(true),
@@ -131,7 +139,7 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
         "SourceSelectionCriteria",
         "ExistingObjectReplication",
     ])?;
-    let id = element.text_of("ID")?.unwrap_or("").to_string();
+    let id = text(element, "ID")?.unwrap_or("").to_string();
     if id.chars().count() > MAX_ID {
         return Err(invalid("ID length should not exceed allowed limit of 255"));
     }
@@ -152,7 +160,12 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
     }
     let prefix = match filter.children.first() {
         None => None,
-        Some(only) if only.name == "Prefix" => Some(only.text.clone()),
+        Some(only) if only.name == "Prefix" => {
+            if !only.children.is_empty() {
+                return Err(malformed());
+            }
+            Some(only.text.clone())
+        }
         Some(_) => return Err(not_yet("Filtering replication by tags")),
     };
     let priority = element.text_of("Priority")?.ok_or_else(|| {
@@ -270,6 +283,29 @@ pub fn render(config: &ReplicationConfig) -> String {
     out
 }
 
+/// Whether `bucket`'s replication configuration, if it has one, names a
+/// destination without Object Lock: enabling Object Lock on the bucket is
+/// then refused, as the configuration could not be put with it.
+pub(crate) fn blocks_object_lock(
+    file: &mut truthdb_object::ObjFile<'_>,
+    bucket: &str,
+) -> Result<bool, truthdb_core::storage::StorageError> {
+    let Some(document) = file.bucket_config(bucket, BUCKET_REPLICATION, "")? else {
+        return Ok(false);
+    };
+    // A stored configuration is one this module rendered.
+    let Ok(config) = parse(&document) else {
+        return Ok(true);
+    };
+    for rule in &config.rules {
+        match file.bucket(&rule.destination.bucket)? {
+            Some(info) if info.object_lock => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
 /// Why the destination of `config`, for source `source` (of `owner`, with
 /// Object Lock or not), cannot be replicated to, if it cannot.
 fn refused_destination(
@@ -290,6 +326,11 @@ fn refused_destination(
             "Destination bucket must exist",
         )));
     };
+    // Whose bucket it is, before the Account is compared with its owner:
+    // another account's owner is not told.
+    if info.owner != owner {
+        return Ok(Some(not_yet("Replication to another account's bucket")));
+    }
     if let Some(account) = &destination.account
         && *account != info.owner
     {
@@ -297,9 +338,6 @@ fn refused_destination(
             "The AWS account specified in the <Account> element must match the destination \
              bucket owner.",
         )));
-    }
-    if info.owner != owner {
-        return Ok(Some(not_yet("Replication to another account's bucket")));
     }
     if info.versioning != Versioning::Enabled {
         return Ok(Some(S3Error::invalid_request(
@@ -496,6 +534,14 @@ mod tests {
                 malformed.clone(),
             ),
             (rule_with("<Filter/><Prefix>a</Prefix>"), malformed.clone()),
+            // A text element holding elements is not taken for empty text.
+            (
+                rule_with(
+                    "<Filter><Prefix><Tag><Key>a</Key><Value>b</Value></Tag></Prefix></Filter>",
+                ),
+                malformed.clone(),
+            ),
+            (rule_with("<ID><x/></ID><Filter/>"), malformed.clone()),
             (
                 rule_with(&format!("<ID>{}</ID><Filter/>", "i".repeat(MAX_ID + 1))),
                 invalid.clone(),
