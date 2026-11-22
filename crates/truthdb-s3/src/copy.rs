@@ -288,8 +288,14 @@ async fn copy_whole(
         if !shared {
             // Checked before the copy is streamed, and again at its write.
             if let Some(condition) = &condition {
-                let current = file.head_object(&dst_bucket, &dst_key, VersionSel::Latest)?;
-                if let Err(err) = condition.check(current.ok().map(|info| info.etag()).as_deref()) {
+                let current = match file.head_object(&dst_bucket, &dst_key, VersionSel::Latest)? {
+                    // An invalid key is said first, as for the shared copy.
+                    Err(err @ truthdb_object::ObjectError::InvalidKey(_)) => {
+                        return Ok(Err(object_error(err, &dst_bucket, &dst_key)));
+                    }
+                    current => current.ok().map(|info| info.etag()),
+                };
+                if let Err(err) = condition.check(current.as_deref()) {
                     return Ok(Err(err));
                 }
             }
