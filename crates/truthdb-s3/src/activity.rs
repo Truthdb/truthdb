@@ -187,9 +187,11 @@ impl Call {
         };
         Call {
             name,
-            read_only: ["Get", "List", "Head"]
-                .iter()
-                .any(|verb| name.starts_with(verb)),
+            // CreateSession too, as AWS records it.
+            read_only: name == "CreateSession"
+                || ["Get", "List", "Head"]
+                    .iter()
+                    .any(|verb| name.starts_with(verb)),
             bucket,
             key,
             data,
@@ -234,6 +236,7 @@ fn data_event(
         },
         (false, Some("versions")) if *method == Method::GET => "ListObjectVersions",
         (false, Some("delete")) if *method == Method::POST => "DeleteObjects",
+        (false, Some("session")) if *method == Method::GET => "CreateSession",
         (false, _) => return None,
         (true, None) => match *method {
             Method::GET => "GetObject",

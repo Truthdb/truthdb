@@ -47,6 +47,9 @@ pub struct Authz {
     /// request (a batch job's or replication's work, which acts on no
     /// directory bucket).
     region: Option<String>,
+    /// The session the request was signed with: its directory bucket, and
+    /// whether it is ReadOnly.
+    session: Option<(String, bool)>,
 }
 
 /// The resource an operation acts on.
@@ -312,6 +315,7 @@ impl Authz {
             existing_tags: loaded.existing_tags,
             context,
             region: Some(state.region.clone()),
+            session: None,
         })
     }
 
@@ -333,6 +337,7 @@ impl Authz {
             existing_tags: loaded.existing_tags,
             context: context(&HeaderMap::new(), "", &[], None, None, now_ms),
             region: None,
+            session: None,
         })
     }
 
@@ -523,6 +528,20 @@ impl Authz {
             let express = action.replacen("s3:", "s3express:", 1);
             return self.decide(&express, &arn, Some(owner), policy, context);
         }
+        // A new session: its mode is the context's (never a session's own).
+        if action == "s3express:CreateSession" {
+            return self.decide(action, &arn, Some(owner), policy, context);
+        }
+        // A session of this bucket allows what its mode does: S3 Express
+        // authorizes its requests at CreateSession.
+        if let Some((of, read_only)) = &self.session
+            && of == bucket
+        {
+            return match !read_only || READS.contains(&action) {
+                true => Ok(()),
+                false => Err(S3Error::access_denied("Access Denied")),
+            };
+        }
         let modes: &[&str] = if READS.contains(&action) {
             &["ReadWrite", "ReadOnly"]
         } else {
@@ -538,6 +557,27 @@ impl Authz {
             }
         }
         denied
+    }
+
+    /// Checks that the caller may create a session of directory bucket
+    /// `bucket`, ReadOnly or ReadWrite (`s3express:CreateSession`, with its
+    /// `s3express:SessionMode`).
+    pub fn check_session(&self, bucket: &str, read_only: bool) -> Result<(), S3Error> {
+        let mut context = self.context.clone();
+        let mode = if read_only { "ReadOnly" } else { "ReadWrite" };
+        context.set("s3express:SessionMode", vec![mode.to_string()]);
+        self.check_with(
+            "s3express:CreateSession",
+            Resource::Bucket(bucket),
+            &context,
+        )
+    }
+
+    /// This authorization for a request signed with a session of directory
+    /// bucket `bucket` (ReadOnly or not).
+    pub fn with_session(mut self, bucket: String, read_only: bool) -> Authz {
+        self.session = Some((bucket, read_only));
+        self
     }
 
     /// The zone of `bucket` if it is a directory bucket the request names.

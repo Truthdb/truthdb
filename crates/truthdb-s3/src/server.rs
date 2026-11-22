@@ -70,6 +70,8 @@ pub struct S3State {
     pub trail_flush: std::time::Duration,
     /// Each account's logging trails, for data events.
     pub trail_selectors: std::sync::Arc<crate::trails::TrailCache>,
+    /// Directory buckets' sessions (CreateSession), in memory.
+    pub sessions: std::sync::Arc<crate::session::Sessions>,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -113,6 +115,9 @@ pub struct Authenticated {
     /// bucket's requests (and ListDirectoryBuckets, which only that tells
     /// from ListBuckets), rather than `s3`.
     pub express: bool,
+    /// Signed with a session's credentials: its directory bucket, and
+    /// whether it is ReadOnly.
+    pub session: Option<(String, bool)>,
 }
 
 /// Serves S3 requests on `listener` (over TLS when `tls` is set) until
@@ -742,7 +747,29 @@ pub async fn verify_signature(
         account: key.account,
         user: key.user,
     };
+    let key = verify_with(
+        state,
+        (method, uri, request_headers),
+        auth,
+        amz_date,
+        payload_hash,
+        raw_query,
+        &secret,
+    )?;
+    Ok((key, principal))
+}
 
+/// Verifies the request's signature over `payload_hash` against `secret`
+/// (an access key's, or a session's); returns the signing key.
+fn verify_with(
+    state: &S3State,
+    (method, uri, request_headers): (&hyper::Method, &hyper::Uri, &hyper::HeaderMap),
+    auth: &sigv4::AuthHeader,
+    amz_date: &str,
+    payload_hash: &str,
+    raw_query: &str,
+    secret: &str,
+) -> Result<ring::hmac::Key, S3Error> {
     let headers: Vec<(String, String)> = request_headers
         .iter()
         .filter_map(|(name, value)| {
@@ -764,7 +791,7 @@ pub async fn verify_signature(
     .map_err(|sigv4::AuthError::Malformed(why)| {
         S3Error::new(400, "AuthorizationHeaderMalformed", why)
     })?;
-    let key = state.signing_keys.signing_key(&secret, &auth.credential);
+    let key = state.signing_keys.signing_key(secret, &auth.credential);
     if !sigv4::verify(
         &key,
         &sigv4::string_to_sign(amz_date, &auth.credential.scope(), &canonical),
@@ -772,7 +799,7 @@ pub async fn verify_signature(
     ) {
         return Err(S3Error::signature_mismatch());
     }
-    Ok((key, principal))
+    Ok(key)
 }
 
 /// Checks the request's SigV4 signature against the access key's secret.
@@ -795,17 +822,43 @@ pub async fn authenticate(
         &["host", "x-amz-date", "x-amz-content-sha256"],
         &[],
     )?;
-    let (key, principal) = verify_signature(
-        state,
-        request.method(),
-        request.uri(),
-        request.headers(),
-        &auth,
-        amz_date,
-        &payload_hash,
-        request.uri().query().unwrap_or(""),
-    )
-    .await?;
+    // Signed with a session's credentials (a directory bucket's): its
+    // secret, and who made it.
+    let session = match header(request, crate::session::TOKEN_HEADER) {
+        Some(token) => Some(state.sessions.verify(
+            &auth.credential.access_key,
+            token,
+            crate::objects::now_ms(),
+        )?),
+        None => None,
+    };
+    let (key, principal) = match &session {
+        Some(session) => (
+            verify_with(
+                state,
+                (request.method(), request.uri(), request.headers()),
+                &auth,
+                amz_date,
+                &payload_hash,
+                request.uri().query().unwrap_or(""),
+                &session.secret,
+            )?,
+            session.principal.clone(),
+        ),
+        None => {
+            verify_signature(
+                state,
+                request.method(),
+                request.uri(),
+                request.headers(),
+                &auth,
+                amz_date,
+                &payload_hash,
+                request.uri().query().unwrap_or(""),
+            )
+            .await?
+        }
+    };
     let scope = auth.credential.scope();
 
     let framing = match payload_hash.as_str() {
@@ -835,6 +888,7 @@ pub async fn authenticate(
         framing,
         checksum: checksum_of(request),
         express,
+        session: session.map(|session| (session.bucket, session.read_only)),
     })
 }
 
@@ -945,6 +999,7 @@ pub async fn authenticate_presigned(
         framing,
         checksum: checksum_of(request),
         express: false,
+        session: None,
     })
 }
 
@@ -1007,6 +1062,7 @@ fn anonymous(request: &Request<Incoming>) -> Result<Option<Authenticated>, S3Err
         framing,
         checksum: checksum_of(request),
         express: false,
+        session: None,
     }))
 }
 

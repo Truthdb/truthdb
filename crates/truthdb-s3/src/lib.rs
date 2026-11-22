@@ -44,6 +44,7 @@ pub mod selectors;
 pub mod server;
 pub mod signed_body;
 pub use truthdb_sigv4 as sigv4;
+pub mod session;
 pub mod sse;
 pub mod ssec;
 pub mod tagging;

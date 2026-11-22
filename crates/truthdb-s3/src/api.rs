@@ -123,7 +123,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "renameObject",
     "requestPayment",
     "select",
-    "session",
     "torrent",
 ];
 
@@ -150,6 +149,7 @@ const SUBRESOURCES: &[&str] = &[
     "replication",
     "restore",
     "retention",
+    "session",
     "tagging",
     "uploadId",
     "uploads",
@@ -328,6 +328,12 @@ pub async fn dispatch(
             "A request names at most one sub-resource",
         ));
     }
+    // A session's credentials act in its directory bucket only.
+    let session_denied =
+        || S3Error::access_denied("A session's credentials are its directory bucket's only");
+    if auth.session.is_some() && control_route(&request).is_some() {
+        return Err(session_denied());
+    }
     match control_route(&request) {
         Some(ControlRoute::PublicAccessBlock) => {
             return account_public_access(state, request, auth, method).await;
@@ -338,6 +344,11 @@ pub async fn dispatch(
         None => {}
     }
     let target = target(&request)?;
+    if let Some((session_bucket, _)) = &auth.session
+        && !matches!(&target, Target::Bucket(bucket) | Target::Object(bucket, _) if bucket == session_bucket)
+    {
+        return Err(session_denied());
+    }
     let principal = auth.principal.clone();
     let raw_query = request.uri().query().unwrap_or("").to_string();
     // A bucket being created may be another account's: that is the
@@ -394,6 +405,10 @@ pub async fn dispatch(
         objects,
     )
     .await?;
+    let authz = match &auth.session {
+        Some((bucket, read_only)) => authz.with_session(bucket.clone(), *read_only),
+        None => authz,
+    };
     // The request's bucket exists: it counts in the request metrics.
     if let Target::Bucket(bucket) | Target::Object(bucket, _) = &target
         && let Some((_, Some(owner))) = authz
@@ -582,6 +597,23 @@ async fn route(
         (Target::Bucket(_), _) if has_param(&request, "tagging") => Err(S3Error::not_implemented(
             "bucket tagging is not implemented",
         )),
+        // CreateSession: a directory bucket's only.
+        (Target::Bucket(bucket), Method::GET) if has_param(&request, "session") => {
+            let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
+            if authz.zone(&bucket).is_none() {
+                let exists = authz
+                    .owners()
+                    .into_iter()
+                    .any(|(name, owner)| name == bucket && owner.is_some());
+                return Err(match exists {
+                    true => S3Error::not_implemented(
+                        "CreateSession is supported for directory buckets only",
+                    ),
+                    false => bucket_error(BucketError::NoSuchBucket, &bucket),
+                });
+            }
+            crate::session::create_session(state, &request, authz, principal, &bucket).await
+        }
         // ListDirectoryBuckets is the same request, signed for S3 Express.
         (Target::Service, Method::GET) if auth.express => {
             let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
