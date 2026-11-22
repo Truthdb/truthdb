@@ -1065,7 +1065,7 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
         writer.write(&storage, data, now()).unwrap();
         let sealed = writer.finish(&storage, now()).unwrap();
         let result = ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.upload_part(upload, number, &sealed, now(), 0))
+            .transaction(|tx| tx.upload_part(upload, number, &sealed, None, now(), 0))
             .unwrap();
         // The log is small in these tests: checkpoint between parts.
         storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
@@ -1084,7 +1084,7 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
 
     let complete = |listed: &[(u32, [u8; 16])]| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.complete_upload(upload, listed, now(), 0))
+            .transaction(|tx| tx.complete_upload(upload, listed, None, now(), 0))
             .unwrap()
     };
     assert_eq!(
@@ -1152,7 +1152,7 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
     writer.write(&storage, b"part", now()).unwrap();
     let sealed = writer.finish(&storage, now()).unwrap();
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.upload_part(aborted, 1, &sealed, now(), 0))
+        .transaction(|tx| tx.upload_part(aborted, 1, &sealed, None, now(), 0))
         .unwrap()
         .unwrap();
     let (listed, _) = ObjFile::new(&mut storage.lock())
@@ -1323,7 +1323,7 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
         .unwrap();
     let first = writer.finish(&storage, now()).unwrap();
     let part1 = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.upload_part(upload, 1, &first, now(), 0))
+        .transaction(|tx| tx.upload_part(upload, 1, &first, None, now(), 0))
         .unwrap()
         .unwrap();
     storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
@@ -1333,7 +1333,9 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
         .unwrap();
     assert_eq!((part2.body, part2.md5), (copied.body, copied.md5));
     let joined = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.complete_upload(upload, &[(1, part1.md5), (2, part2.md5)], now(), 0))
+        .transaction(|tx| {
+            tx.complete_upload(upload, &[(1, part1.md5), (2, part2.md5)], None, now(), 0)
+        })
         .unwrap()
         .unwrap();
     let other = ObjFile::new(&mut storage.lock())
@@ -2939,12 +2941,12 @@ fn an_uploads_lock_passes_to_its_object_or_goes_with_the_abort() {
     writer.write(&storage, b"part", now()).unwrap();
     let sealed = writer.finish(&storage, now()).unwrap();
     let md5 = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.upload_part(upload, 1, &sealed, now(), 0))
+        .transaction(|tx| tx.upload_part(upload, 1, &sealed, None, now(), 0))
         .unwrap()
         .unwrap()
         .md5;
     let object = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.complete_upload(upload, &[(1, md5)], now(), 0))
+        .transaction(|tx| tx.complete_upload(upload, &[(1, md5)], None, now(), 0))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -3627,14 +3629,14 @@ fn a_cold_multipart_objects_parts_are_packed() {
         }
         let sealed = writer.finish(&storage, now()).unwrap();
         let info = ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.upload_part(upload, number as u32 + 1, &sealed, now(), 0))
+            .transaction(|tx| tx.upload_part(upload, number as u32 + 1, &sealed, None, now(), 0))
             .unwrap()
             .unwrap();
         listed.push((number as u32 + 1, info.md5));
         storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
     }
     let object = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.complete_upload(upload, &listed, now(), 0))
+        .transaction(|tx| tx.complete_upload(upload, &listed, None, now(), 0))
         .unwrap()
         .unwrap();
     let before = allocated_pages(&storage);
@@ -5664,7 +5666,9 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
                     let body = sealed(step as u8, 1 + next(3000) as usize);
                     let number = 1 + next(3) as u32;
                     txn(&mut |tx| {
-                        let _ = tx.upload_part(upload, number, &body, now(), 0).unwrap();
+                        let _ = tx
+                            .upload_part(upload, number, &body, None, now(), 0)
+                            .unwrap();
                     });
                 }
             }
@@ -5688,7 +5692,7 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
                             .collect();
                         txn(&mut |tx| {
                             if tx
-                                .complete_upload(upload, &listed, now(), 0)
+                                .complete_upload(upload, &listed, None, now(), 0)
                                 .unwrap()
                                 .is_err()
                             {
@@ -5722,7 +5726,7 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
             });
             let part = sealed(3, 700);
             txn(&mut |tx| {
-                tx.upload_part(pending, 1, &part, now(), 0)
+                tx.upload_part(pending, 1, &part, None, now(), 0)
                     .unwrap()
                     .unwrap();
             });
@@ -5735,7 +5739,7 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
                 let part = sealed(4, 1 + next(900) as usize);
                 let number = 1 + next(2) as u32;
                 txn(&mut |tx| {
-                    tx.upload_part(pending, number, &part, now(), 0)
+                    tx.upload_part(pending, number, &part, None, now(), 0)
                         .unwrap()
                         .unwrap();
                 });
@@ -5917,7 +5921,7 @@ fn a_usage_backfill_counts_every_key_once_whatever_its_step() {
                         now(),
                     )?
                     .unwrap();
-                tx.upload_part(upload, 1, &part, now(), 0).map(|_| ())
+                tx.upload_part(upload, 1, &part, None, now(), 0).map(|_| ())
             })
             .unwrap();
     }

@@ -287,14 +287,16 @@ fn a_prefix_reads_every_object_under_it_and_a_multipart_body_reads_whole() {
         writer.write(storage, data, 1).unwrap();
         let sealed = writer.finish(storage, 1).unwrap();
         let part = engine
-            .object(|file| file.transaction(|tx| tx.upload_part(upload, number, &sealed, 1, 0)))
+            .object(|file| {
+                file.transaction(|tx| tx.upload_part(upload, number, &sealed, None, 1, 0))
+            })
             .expect("part")
             .expect("part accepted");
         md5s.push((number, part.md5));
     }
     assert!(part1.len() as u64 >= truthdb_object::MIN_PART_BYTES);
     engine
-        .object(|file| file.transaction(|tx| tx.complete_upload(upload, &md5s, 2_000, 0)))
+        .object(|file| file.transaction(|tx| tx.complete_upload(upload, &md5s, None, 2_000, 0)))
         .expect("complete")
         .expect("completed");
     assert_eq!(

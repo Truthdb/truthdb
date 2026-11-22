@@ -11942,6 +11942,137 @@ print("ok")
 }
 
 #[test]
+fn multipart_checksums_are_made_of_the_parts_as_s3_makes_them() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    let script = server.dir.join("multipart_checksums.py");
+    std::fs::write(&script, MULTIPART_CHECKSUMS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const MULTIPART_CHECKSUMS_SCRIPT: &str = r#"
+import sys, base64, hashlib, zlib
+import boto3, botocore.config, botocore.exceptions
+port, key, secret = sys.argv[1:4]
+def client(**config):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}, **config))
+s3 = client()
+bare = client(request_checksum_calculation="when_required", response_checksum_validation="when_required")
+s3.create_bucket(Bucket="mpsums")
+b64 = lambda raw: base64.b64encode(raw).decode()
+def crc64nvme(data):
+    crc = 0xFFFFFFFFFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x9A6C9329AC4BC9B5 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFFFFFFFFFF
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+first, last = bytes(range(256)) * (5 * 1024 * 4 + 1), b"the last part"
+whole = first + last
+def upload(client, key, parts, **create):
+    made = client.create_multipart_upload(Bucket="mpsums", Key=key, **create)
+    listed = []
+    for number, data in enumerate(parts, 1):
+        extra = {"ChecksumAlgorithm": create["ChecksumAlgorithm"]} if "ChecksumAlgorithm" in create else {}
+        answer = client.upload_part(Bucket="mpsums", Key=key, UploadId=made["UploadId"],
+            PartNumber=number, Body=data, **extra)
+        listed.append({"PartNumber": number, "ETag": answer["ETag"],
+            **{name: value for name, value in answer.items() if name.startswith("Checksum")}})
+    return made, listed
+# FULL_OBJECT CRC32: the whole object's CRC, from the parts'.
+made, listed = upload(s3, "crc", [first, last], ChecksumAlgorithm="CRC32", ChecksumType="FULL_OBJECT")
+assert (made["ChecksumAlgorithm"], made["ChecksumType"]) == ("CRC32", "FULL_OBJECT"), made
+assert listed[1]["ChecksumCRC32"] == b64(zlib.crc32(last).to_bytes(4, "big")), listed
+parts = s3.list_parts(Bucket="mpsums", Key="crc", UploadId=made["UploadId"])
+assert (parts["ChecksumAlgorithm"], parts["ChecksumType"]) == ("CRC32", "FULL_OBJECT"), parts
+assert [p["ChecksumCRC32"] for p in parts["Parts"]] == [p["ChecksumCRC32"] for p in listed], parts
+crc32 = b64(zlib.crc32(whole).to_bytes(4, "big"))
+# A whole-object checksum sent with it is checked, a wrong one refused; a
+# part listed with a wrong checksum is refused; the type must be the upload's.
+refused(lambda: s3.complete_multipart_upload(Bucket="mpsums", Key="crc", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed}, ChecksumCRC32="AAAAAA==", ChecksumType="FULL_OBJECT"), "BadDigest")
+refused(lambda: s3.complete_multipart_upload(Bucket="mpsums", Key="crc", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed}, ChecksumType="COMPOSITE"), "BadDigest")
+wrong = [dict(listed[0], ChecksumCRC32="AAAAAA=="), listed[1]]
+refused(lambda: s3.complete_multipart_upload(Bucket="mpsums", Key="crc", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": wrong}), "InvalidPart")
+done = s3.complete_multipart_upload(Bucket="mpsums", Key="crc", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed}, ChecksumCRC32=crc32, ChecksumType="FULL_OBJECT")
+assert (done["ChecksumCRC32"], done["ChecksumType"]) == (crc32, "FULL_OBJECT"), done
+head = s3.head_object(Bucket="mpsums", Key="crc", ChecksumMode="ENABLED")
+assert (head["ChecksumCRC32"], head["ChecksumType"]) == (crc32, "FULL_OBJECT"), head
+assert s3.get_object(Bucket="mpsums", Key="crc", ChecksumMode="ENABLED")["Body"].read() == whole
+# COMPOSITE SHA256: the SHA-256 of the parts' SHA-256s, with their count.
+made, listed = upload(s3, "sha", [first, last], ChecksumAlgorithm="SHA256")
+assert made["ChecksumType"] == "COMPOSITE", made
+done = s3.complete_multipart_upload(Bucket="mpsums", Key="sha", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed})
+composite = b64(hashlib.sha256(hashlib.sha256(first).digest() + hashlib.sha256(last).digest()).digest()) + "-2"
+assert (done["ChecksumSHA256"], done["ChecksumType"]) == (composite, "COMPOSITE"), done
+assert s3.head_object(Bucket="mpsums", Key="sha", ChecksumMode="ENABLED")["ChecksumSHA256"] == composite
+# None asked for: the parts' CRC64NVME make the object's, of the whole.
+made, listed = upload(bare, "plain", [first, last])
+done = bare.complete_multipart_upload(Bucket="mpsums", Key="plain", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed})
+expected = b64(crc64nvme(whole).to_bytes(8, "big"))
+assert (done["ChecksumCRC64NVME"], done["ChecksumType"]) == (expected, "FULL_OBJECT"), done
+# None asked for, the parts with the SDK's CRC32s: completed, with no
+# object checksum (its parts have no CRC64NVME to make it of).
+made, listed = upload(s3, "sdkparts", [first, last])
+assert listed[0].get("ChecksumCRC32"), listed
+done = s3.complete_multipart_upload(Bucket="mpsums", Key="sdkparts", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed})
+assert not any(name.startswith("ChecksumCRC64") for name in done), done
+# A part copied with UploadPartCopy keeps no checksum yet: the object gets
+# none, and a whole-object checksum sent with the completion is not held
+# against it; a type S3 does not name is refused.
+made = s3.create_multipart_upload(Bucket="mpsums", Key="copied", ChecksumAlgorithm="CRC32",
+    ChecksumType="FULL_OBJECT")
+s3.put_object(Bucket="mpsums", Key="source", Body=first)
+copied = s3.upload_part_copy(Bucket="mpsums", Key="copied", UploadId=made["UploadId"], PartNumber=1,
+    CopySource={"Bucket": "mpsums", "Key": "source"})["CopyPartResult"]
+tail = s3.upload_part(Bucket="mpsums", Key="copied", UploadId=made["UploadId"], PartNumber=2,
+    Body=last, ChecksumAlgorithm="CRC32")
+assert "ChecksumType" not in tail, tail
+parts = {"Parts": [{"PartNumber": 1, "ETag": copied["ETag"]},
+    {"PartNumber": 2, "ETag": tail["ETag"], "ChecksumCRC32": tail["ChecksumCRC32"]}]}
+refused(lambda: s3.complete_multipart_upload(Bucket="mpsums", Key="copied", UploadId=made["UploadId"],
+    MultipartUpload=parts, ChecksumType="PARTLY"), "InvalidRequest")
+done = s3.complete_multipart_upload(Bucket="mpsums", Key="copied", UploadId=made["UploadId"],
+    MultipartUpload=parts, ChecksumCRC32=crc32, ChecksumType="FULL_OBJECT")
+assert "ChecksumCRC32" not in done, done
+# Refused: a full-object SHA256; a part of another algorithm than its upload's.
+refused(lambda: s3.create_multipart_upload(Bucket="mpsums", Key="x", ChecksumAlgorithm="SHA256",
+    ChecksumType="FULL_OBJECT"), "InvalidRequest")
+made = s3.create_multipart_upload(Bucket="mpsums", Key="mixed", ChecksumAlgorithm="CRC32")
+refused(lambda: s3.upload_part(Bucket="mpsums", Key="mixed", UploadId=made["UploadId"], PartNumber=1,
+    Body=last, ChecksumAlgorithm="SHA256"), "InvalidRequest")
+print("ok")
+"#;
+
+#[test]
 fn checksums_are_kept_and_returned_as_s3_returns_them() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
