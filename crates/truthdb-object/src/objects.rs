@@ -458,8 +458,6 @@ impl ObjTxn<'_, '_> {
         .map(|(_, version, _)| version))
     }
 
-    /// The version `which` picks, unless it is missing or a delete marker:
-    /// its number, whether it is the null version and its storage class.
     /// `key`'s current version as a conditional write or delete reads it, in
     /// this transaction: none, a delete marker (`Some(None)`), or a version
     /// with its quoted ETag.
@@ -494,6 +492,8 @@ impl ObjTxn<'_, '_> {
         }))
     }
 
+    /// The version `which` picks, unless it is missing or a delete marker:
+    /// its number, whether it is the null version and its storage class.
     pub(crate) fn find_live(
         &mut self,
         bucket: &str,

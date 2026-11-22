@@ -276,6 +276,15 @@ async fn copy_whole(
                 Ok(lock) => lock,
                 Err(err) => return Ok(Err(err)),
             };
+        // A destination bucket that is not there is said first, as for an
+        // unconditional copy (a condition would find no version in it).
+        if condition.is_some() && file.bucket(&dst_bucket)?.is_none() {
+            return Ok(Err(object_error(
+                truthdb_object::ObjectError::NoSuchBucket,
+                &dst_bucket,
+                &dst_key,
+            )));
+        }
         if !shared {
             // Checked before the copy is streamed, and again at its write.
             if let Some(condition) = &condition {

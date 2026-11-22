@@ -11981,6 +11981,20 @@ fn writes_and_deletes_hold_to_their_conditions() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // A form upload makes an object with no condition: the policy requiring
+    // conditional writes denies it too.
+    let form = signed_form(
+        &user_key,
+        &user_secret,
+        "2099-01-01T00:00:00.000Z",
+        &[
+            serde_json::json!({"bucket": "enforced"}),
+            serde_json::json!({"key": "f"}),
+        ],
+        &[("key", "f")],
+    );
+    let (_, (status, reply)) = post_form(server.s3_port, "enforced", &form, "f", b"f", 1000);
+    assert_eq!(status, 403, "{reply}");
 }
 
 const CONDITIONAL_WRITES_SCRIPT: &str = r#"
@@ -12092,6 +12106,24 @@ parts = {"Parts": [{"PartNumber": 1, "ETag": part}]}
 refused(lambda: user.complete_multipart_upload(Bucket="enforced", Key="m", UploadId=upload,
     MultipartUpload=parts), "AccessDenied", 403)
 user.complete_multipart_upload(Bucket="enforced", Key="m", UploadId=upload, MultipartUpload=parts, IfNoneMatch="*")
+# A policy requiring conditional deletes (S3's): a delete without If-Match
+# is denied; one with it (or, in DeleteObjects, the object's ETag) is not.
+s3.create_bucket(Bucket="delenforced")
+s3.put_bucket_policy(Bucket="delenforced", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Deny", "Principal": "*", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::delenforced/*",
+    "Condition": {"Null": {"s3:if-match": "true"}}}]}))
+kept = s3.put_object(Bucket="delenforced", Key="d", Body=b"d")["ETag"]
+s3.put_object(Bucket="delenforced", Key="e", Body=b"e")
+refused(lambda: user.delete_object(Bucket="delenforced", Key="d"), "AccessDenied", 403)
+user.delete_object(Bucket="delenforced", Key="d", IfMatch="*")
+result = user.delete_objects(Bucket="delenforced", Delete={"Objects": [{"Key": "e"}]})
+assert [e["Code"] for e in result["Errors"]] == ["AccessDenied"], result
+e_tag = s3.head_object(Bucket="delenforced", Key="e")["ETag"]
+result = user.delete_objects(Bucket="delenforced", Delete={"Objects": [{"Key": "e", "ETag": e_tag}]})
+assert [d["Key"] for d in result.get("Deleted", [])] == ["e"], result
+# A conditional copy into a bucket that is not there: that is what is said.
+refused(lambda: s3.copy_object(Bucket="nowhere", Key="k", CopySource={"Bucket": "cond", "Key": "k"},
+    IfMatch=second), "NoSuchBucket", 404)
 print("ok")
 "#;
 

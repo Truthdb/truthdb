@@ -195,11 +195,6 @@ pub(crate) fn plain(request: &Request<Incoming>, allowed: &[&str]) -> bool {
         .any(|name| !allowed.contains(name) && has_param(request, name))
 }
 
-/// Whether every query parameter of `request` is one a plain write takes:
-/// those in `allowed`, `x-id`, or `x-amz-*` (a presigned URL's, and headers
-/// carried in the query). A write naming anything else, such as an S3
-/// operation this server does not implement (perhaps one added since), is
-/// refused rather than run as the plain PUT or DELETE on its path.
 /// `authz` with a write's conditional keys: `s3:if-match` and
 /// `s3:if-none-match` (its headers', when given) and
 /// `s3:ObjectCreationOperation` (whether it makes an object: S3 counts
@@ -214,6 +209,11 @@ fn creating(
     authz.with_keys(&keys)
 }
 
+/// Whether every query parameter of `request` is one a plain write takes:
+/// those in `allowed`, `x-id`, or `x-amz-*` (a presigned URL's, and headers
+/// carried in the query). A write naming anything else, such as an S3
+/// operation this server does not implement (perhaps one added since), is
+/// refused rather than run as the plain PUT or DELETE on its path.
 fn plain_write(request: &Request<Incoming>, allowed: &[&str]) -> bool {
     request
         .uri()
@@ -1039,6 +1039,9 @@ async fn route(
             .await
         }
         (Target::Object(bucket, key), Method::DELETE) if plain_write(&request, &["versionId"]) => {
+            // A conditional delete's `s3:if-match`, as a policy requiring
+            // them tests it.
+            let authz = &authz.with_keys(&crate::conditional::Condition::keys(request.headers()));
             authz.check(
                 versioned(&request, "s3:DeleteObject", "s3:DeleteObjectVersion"),
                 Object(&bucket, &key),

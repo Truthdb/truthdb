@@ -586,12 +586,16 @@ pub async fn post_object(
             }),
         );
     }
-    authz.check_storing(
-        "s3:PutObject",
-        Resource::Object(&bucket, &key),
-        tags.as_deref(),
-        lock.as_ref(),
-    )?;
+    // It makes an object, with no condition (a form has none): a policy
+    // requiring conditional writes denies it, as for a PutObject.
+    authz
+        .with_keys(&[("s3:ObjectCreationOperation", "true".to_string())])
+        .check_storing(
+            "s3:PutObject",
+            Resource::Object(&bucket, &key),
+            tags.as_deref(),
+            lock.as_ref(),
+        )?;
     if let Some(lock) = &lock {
         crate::object_lock::authorize(&authz, Resource::Object(&bucket, &key), lock)?;
     }

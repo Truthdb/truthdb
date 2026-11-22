@@ -1303,8 +1303,10 @@ fn plan(
     let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
         .ok()
         .flatten();
+    // A copy makes an object, with no condition.
     let target_authz = Authz::load_now(file, creator, vec![copy.bucket.clone()], Vec::new(), now)?
-        .with_keys(&copy_keys);
+        .with_keys(&copy_keys)
+        .with_keys(&[("s3:ObjectCreationOperation", "true".to_string())]);
     if let Err(err) = target_authz.check_storing(
         "s3:PutObject",
         Resource::Object(&copy.bucket, &target),

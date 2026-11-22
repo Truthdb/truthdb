@@ -323,6 +323,12 @@ pub async fn delete_objects(
             Some(VersionSel::Latest) => {}
         }
         let resource = crate::authz::Resource::Object(&bucket, &object.key);
+        // Its own ETag is its `s3:if-match`, as a policy requiring
+        // conditional deletes tests it.
+        match &object.etag {
+            Some(etag) => context.set("s3:if-match", vec![etag.clone()]),
+            None => context.remove("s3:if-match"),
+        }
         let condition = object.etag.clone().map(|etag| Condition {
             if_match: Some(etag),
             if_none_match: false,
