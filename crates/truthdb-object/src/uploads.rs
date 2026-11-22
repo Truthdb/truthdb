@@ -308,6 +308,7 @@ impl ObjTxn<'_, '_> {
         upload: u64,
         number: u32,
         body: u64,
+        checksum: Option<StoredChecksum>,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<Result<BodyInfo, UploadError>, StorageError> {
@@ -329,7 +330,7 @@ impl ObjTxn<'_, '_> {
             len: row.len,
             md5: row.md5,
         };
-        self.store_part(upload, number, shared, row.len, None, now_ms, grace_ms)?;
+        self.store_part(upload, number, shared, row.len, checksum, now_ms, grace_ms)?;
         Ok(Ok(shared))
     }
 
