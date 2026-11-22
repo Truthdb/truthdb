@@ -227,8 +227,11 @@ fn measured(file: &mut ObjFile<'_>, now: u64) -> Result<Vec<Sample>, StorageErro
     if rules.is_empty() {
         return Ok(Vec::new());
     }
-    if rules.iter().any(|(_, rule)| rule.destination.timed()) {
-        file.transaction(|tx| tx.note_missed_thresholds(now, MISSED_BATCH))?;
+    // Its own transaction: one that fails costs no metrics.
+    if rules.iter().any(|(_, rule)| rule.destination.timed())
+        && let Err(err) = file.transaction(|tx| tx.note_missed_thresholds(now, MISSED_BATCH))
+    {
+        eprintln!("replication: the missed thresholds were not told: {err}");
     }
     let backlog = file.replication_backlog()?;
     let mut samples = Vec::new();
