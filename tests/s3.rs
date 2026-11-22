@@ -16296,7 +16296,7 @@ if phase == "reports":
     first = s3.put_object(Bucket="source", Key="docs/x", Body=b"one")["VersionId"]
     second = s3.put_object(Bucket="source", Key="docs/x", Body=b"second")["VersionId"]
     spaced = s3.put_object(Bucket="source", Key="docs/a b.txt", Body=b"spaced")["VersionId"]
-    s3.put_object(Bucket="source", Key="other/y", Body=b"y")
+    s3.put_object(Bucket="source", Key="other/y", Body=b"y", ChecksumAlgorithm="SHA256")
     gone = s3.put_object(Bucket="source", Key="docs/gone", Body=b"g")["VersionId"]
     marker = s3.delete_object(Bucket="source", Key="docs/gone")["VersionId"]
     def configuration(id, bucket, **extra):
@@ -16310,7 +16310,8 @@ if phase == "reports":
     current["Destination"]["S3BucketDestination"]["Prefix"] = "inv/"
     s3.put_bucket_inventory_configuration(Bucket="source", Id="current", InventoryConfiguration=current)
     s3.put_bucket_inventory_configuration(Bucket="source", Id="all", InventoryConfiguration=configuration(
-        "all", "kept", IncludedObjectVersions="All", OptionalFields=["Size", "ObjectLockLegalHoldStatus"]))
+        "all", "kept", IncludedObjectVersions="All",
+        OptionalFields=["Size", "ObjectLockLegalHoldStatus", "ChecksumAlgorithm"]))
     # More than a page (1,000) of each listing.
     s3.create_bucket(Bucket="big")
     s3.put_bucket_versioning(Bucket="big", VersioningConfiguration={"Status": "Enabled"})
@@ -16338,15 +16339,21 @@ if phase == "reports":
     ], rows
 
     manifest, rows, manifest_key = report("kept", "source/all/")
-    assert manifest["fileSchema"] == "Bucket, Key, VersionId, IsLatest, IsDeleteMarker, Size, ObjectLockLegalHoldStatus"
+    assert manifest["fileSchema"] == ("Bucket, Key, VersionId, IsLatest, IsDeleteMarker, Size, "
+        "ObjectLockLegalHoldStatus, ChecksumAlgorithm")
+    # The algorithm of each version's checksum: the SDK's, or the one asked
+    # for; a delete marker has none.
+    sdk = next(name[len("Checksum"):] for name in
+        s3.head_object(Bucket="source", Key="docs/x", ChecksumMode="ENABLED")
+        if name.startswith("Checksum") and name != "ChecksumType")
     assert rows == sorted([
-        ["source", "docs/a%20b.txt", spaced, "True", "False", "6", "OFF"],
-        ["source", "docs/gone", marker, "True", "True", "", "OFF"],
-        ["source", "docs/gone", gone, "False", "False", "1", "OFF"],
-        ["source", "docs/x", second, "True", "False", "6", "OFF"],
-        ["source", "docs/x", first, "False", "False", "3", "OFF"],
-        ["source", "early", "", "True", "False", "5", "OFF"],
-        ["source", "other/y", rows[-1][2], "True", "False", "1", "OFF"],
+        ["source", "docs/a%20b.txt", spaced, "True", "False", "6", "OFF", sdk],
+        ["source", "docs/gone", marker, "True", "True", "", "OFF", ""],
+        ["source", "docs/gone", gone, "False", "False", "1", "OFF", sdk],
+        ["source", "docs/x", second, "True", "False", "6", "OFF", sdk],
+        ["source", "docs/x", first, "False", "False", "3", "OFF", sdk],
+        ["source", "early", "", "True", "False", "5", "OFF", sdk],
+        ["source", "other/y", rows[-1][2], "True", "False", "1", "OFF", "SHA256"],
     ]), rows
     manifest, data, _ = report("lists", "source/pq/", "parquet")
     assert manifest["fileFormat"] == "Parquet" and data[:4] == data[-4:] == b"PAR1", manifest

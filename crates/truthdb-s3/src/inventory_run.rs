@@ -551,13 +551,20 @@ async fn make_report(
                 true => file.list_versions(&name, &prefix, None, after, PAGE)?,
                 false => file.list_objects(&name, &prefix, None, after, PAGE)?,
             };
-            let Ok(listing) = listing else {
+            let Ok(mut listing) = listing else {
                 return Ok(None);
             };
             let mut rows = Vec::new();
-            for object in &listing.objects {
+            for object in &mut listing.objects {
                 if !all && (!object.latest || object.info.delete_marker) {
                     continue;
+                }
+                // A listing gives no attributes: the checksum is read when
+                // asked for.
+                if row.checksums && !object.info.delete_marker {
+                    object.info.attrs.checksum = file
+                        .version_attrs(&name, &object.key, object.info.version)?
+                        .checksum;
                 }
                 let lock = match row.locks {
                     true => file.object_lock(&name, &object.key, object.info.version)?,
@@ -903,6 +910,9 @@ struct Row {
     locks: bool,
     /// Whether the replication status is asked for (each row then reads it).
     statuses: bool,
+    /// Whether the checksum algorithm is asked for (each row then reads its
+    /// version's attributes).
+    checksums: bool,
     encrypted: bool,
     /// The owner's canonical id, and its full control as an ACL document
     /// (base64), as S3 writes them.
@@ -934,6 +944,7 @@ impl Row {
                 .iter()
                 .any(|column| column.starts_with("ObjectLock")),
             statuses: columns.contains(&"ReplicationStatus"),
+            checksums: columns.contains(&"ChecksumAlgorithm"),
             columns,
             encrypted,
             owner_id,
@@ -1001,6 +1012,11 @@ impl Row {
                     text(if event.years { "YEARS" } else { "DAYS" })
                 }),
                 "ObjectAccessControlList" if !marker => text(&self.acl),
+                "ChecksumAlgorithm" => info
+                    .attrs
+                    .checksum
+                    .as_ref()
+                    .map_or(Value::Null, |checksum| text(&checksum.algorithm)),
                 "ObjectOwner" => text(&self.owner_id),
                 "ReplicationStatus" => {
                     replication.map_or(Value::Null, |status| text(status.as_str()))
