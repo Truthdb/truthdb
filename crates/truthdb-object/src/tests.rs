@@ -6993,7 +6993,7 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
                     T0 + DAY,
                     0,
                 )?;
-                tx.finish_replication(queued, Some(ReplicationStatus::Completed))?;
+                tx.finish_replication(queued, Some(ReplicationStatus::Completed), None, T0)?;
                 Ok(written)
             })
             .unwrap()
@@ -7133,6 +7133,163 @@ fn an_account_with_remote_buckets_is_not_dropped() {
 }
 
 #[test]
+fn replication_events_are_journalled_for_the_rules_that_measure_them() {
+    use crate::{
+        REPLICATION_THRESHOLD_MS, ReplicationConfig, ReplicationDestination, ReplicationFilter,
+        ReplicationRule, ReplicationStatus, StorageClass, Versioning,
+    };
+    let path = temp_path("replication-events");
+    let storage = create(&path);
+    let to = |bucket: &str, metrics: Option<bool>, timed: Option<bool>| ReplicationRule {
+        id: format!("to-{bucket}"),
+        priority: 1,
+        enabled: true,
+        filter: ReplicationFilter::All,
+        replica_modifications: false,
+        delete_markers: false,
+        destination: ReplicationDestination {
+            bucket: bucket.to_string(),
+            account: None,
+            storage_class: None,
+            owner_override: false,
+            owner: None,
+            metrics,
+            event_threshold: false,
+            replication_time: timed,
+        },
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["src", "measured", "timed", "quiet"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+            }
+            tx.put_replication(
+                "src",
+                &ReplicationConfig {
+                    role: "role".into(),
+                    rules: vec![
+                        to("measured", Some(true), None),
+                        to("timed", Some(true), Some(true)),
+                        to("quiet", None, None),
+                    ],
+                    account: DEFAULT_ACCOUNT.into(),
+                    user: None,
+                },
+            )
+        })
+        .unwrap();
+    let events = || -> Vec<(String, serde_json::Value)> {
+        ObjFile::new(&mut storage.lock())
+            .journal(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| record.notice)
+            .map(|notice| {
+                let detail: serde_json::Value =
+                    serde_json::from_str(notice.detail.as_deref().unwrap_or("null")).unwrap();
+                (notice.event, detail["replicationEventData"].clone())
+            })
+            .collect()
+    };
+    let queued = |key: &str| {
+        ObjFile::new(&mut storage.lock())
+            .replication_queue(None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|q| q.key == key)
+            .collect::<Vec<_>>()
+    };
+    let finish = |q: &crate::QueuedReplication, how, why: Option<&str>, at| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.finish_replication(q, Some(how), why, at))
+            .unwrap()
+    };
+    put_at(&storage, "src", "a", 10, StorageClass::Standard, T0);
+    let a = queued("a");
+    assert_eq!(
+        a.iter().map(|q| (q.measured, q.timed)).collect::<Vec<_>>(),
+        [(true, false), (true, true), (false, false)]
+    );
+    // A failure: told for a measured rule, with why; not for another.
+    finish(
+        &a[0],
+        ReplicationStatus::Failed,
+        Some("DstBucketUnversioned"),
+        T0 + 1,
+    );
+    finish(
+        &a[2],
+        ReplicationStatus::Failed,
+        Some("DstBucketUnversioned"),
+        T0 + 1,
+    );
+    let told = events();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0].0, "s3:Replication:OperationFailedReplication");
+    let data = &told[0].1;
+    assert_eq!(data["replicationRuleId"], "to-measured");
+    assert_eq!(data["destinationBucket"], "arn:aws:s3:::measured");
+    assert_eq!(data["s3Operation"], "OBJECT_PUT");
+    assert_eq!(data["failureReason"], "DstBucketUnversioned");
+    assert_eq!(data["requestTime"], crate::time::iso8601(T0));
+    // Past its threshold: told once while it waits, and again when made.
+    let missed = |at| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.note_missed_thresholds(at, 1024))
+            .unwrap()
+    };
+    put_at(
+        &storage,
+        "src",
+        "b",
+        10,
+        StorageClass::Standard,
+        T0 + 60_000,
+    );
+    missed(T0 + REPLICATION_THRESHOLD_MS);
+    assert_eq!(events().len(), 1, "not past it yet");
+    missed(T0 + REPLICATION_THRESHOLD_MS + 1);
+    missed(T0 + REPLICATION_THRESHOLD_MS + 2);
+    let missed_once: Vec<String> = events()
+        .into_iter()
+        .skip(1)
+        .map(|(event, _)| event)
+        .collect();
+    assert_eq!(missed_once, ["s3:Replication:OperationMissedThreshold"]);
+    missed(T0 + 60_000 + REPLICATION_THRESHOLD_MS + 1);
+    assert_eq!(events().len(), 3, "b's timed replication past it");
+    finish(
+        &a[1],
+        ReplicationStatus::Completed,
+        None,
+        T0 + REPLICATION_THRESHOLD_MS + 5,
+    );
+    assert_eq!(
+        events().last().unwrap().0,
+        "s3:Replication:OperationReplicatedAfterThreshold"
+    );
+    // Made in time: nothing told.
+    let b = queued("b");
+    finish(&b[1], ReplicationStatus::Completed, None, T0 + 60_000 + 1);
+    assert_eq!(events().len(), 4);
+    // Dropped (its rule no longer sends it): no longer tracked, if measured.
+    for q in &b {
+        if q.number != b[1].number {
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| tx.drop_replication(q, T0 + 70_000))
+                .unwrap();
+        }
+    }
+    let told = events();
+    assert_eq!(told.len(), 5, "{told:?}");
+    assert_eq!(told[4].0, "s3:Replication:OperationNotTracked");
+    assert_eq!(told[4].1["replicationRuleId"], "to-measured");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_rules_backlog_counts_what_it_queued_until_made_failed_or_dropped() {
     use crate::{
         ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
@@ -7215,8 +7372,8 @@ fn a_rules_backlog_counts_what_it_queued_until_made_failed_or_dropped() {
     let take = |q: &crate::QueuedReplication, how: Option<ReplicationStatus>| {
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| match how {
-                Some(how) => tx.finish_replication(q, Some(how)),
-                None => tx.drop_replication(q),
+                Some(how) => tx.finish_replication(q, Some(how), None, T0),
+                None => tx.drop_replication(q, T0),
             })
             .unwrap()
     };
@@ -7490,7 +7647,7 @@ fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
     };
     let finish = |q: &crate::QueuedReplication, how: ReplicationStatus| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.finish_replication(q, Some(how)))
+            .transaction(|tx| tx.finish_replication(q, Some(how), None, T0))
             .unwrap()
     };
     let again = |bucket: &str, key: &str, version: u64| {
@@ -7529,7 +7686,7 @@ fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
     assert!(again("src", "a", a));
     for q in queued("src", "a") {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.drop_replication(&q))
+            .transaction(|tx| tx.drop_replication(&q, T0))
             .unwrap();
     }
     assert_eq!(status("src", "a", a), Some(ReplicationStatus::Completed));
@@ -7656,12 +7813,12 @@ fn a_version_replicated_to_several_destinations_is_completed_once_all_are_made()
     };
     let finish = |q: &crate::QueuedReplication, how: Option<ReplicationStatus>| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.finish_replication(q, how))
+            .transaction(|tx| tx.finish_replication(q, how, None, T0))
             .unwrap()
     };
     let drop_one = |q: &crate::QueuedReplication| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.drop_replication(q))
+            .transaction(|tx| tx.drop_replication(q, T0))
             .unwrap()
     };
     // One queued replication a destination; PENDING until both are made.

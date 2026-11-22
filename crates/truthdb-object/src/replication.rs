@@ -12,7 +12,12 @@
 //! the replica is REPLICA.
 //! A replica is never queued itself. A delete marker a delete makes (not
 //! one lifecycle makes) is queued to the destinations whose rule replicates
-//! delete markers; it has no status. A change to a queued or replicated
+//! delete markers; it has no status. A new replica queued by a rule that
+//! measures its replications (metrics or time control enabled) journals S3's
+//! replication events on its source version, in the transaction that
+//! decides them: failed (with why), no longer tracked (dropped), and, with
+//! time control, past the 15-minute threshold while waiting (once) and
+//! made after it. A change to a queued or replicated
 //! version's tags is queued for its replica too. A change to its lock is
 //! not: the replica's lock is the source's when it is written, and then the
 //! destination's own (merging two locks would either weaken one or lock
@@ -39,6 +44,10 @@ use crate::{
     ObjFile, ObjTxn, ObjectAttrs, ObjectLock, REPLICATION_BACKLOG_TREE, REPLICATION_BY_RULE_TREE,
     REPLICATION_QUEUE_TREE, REPLICATION_STATUS_TREE, StorageClass, Versioning, next_counter,
 };
+
+/// How long a replication with replication time control may take (S3
+/// RTC's 15 minutes) before its threshold events.
+pub const REPLICATION_THRESHOLD_MS: u64 = 15 * 60 * 1000;
 
 /// META key of the next queue entry's number.
 const NEXT_REPLICATION_KEY: &[u8] = b"next_replication";
@@ -503,6 +512,11 @@ pub struct QueuedReplication {
     pub rule: String,
     pub bytes: u64,
     pub queued_ms: u64,
+    /// Whether its rule measured its replications (metrics or time control
+    /// enabled) when it was queued, and timed them (time control): its
+    /// replication events are sent then.
+    pub measured: bool,
+    pub timed: bool,
 }
 
 impl QueuedReplication {
@@ -521,6 +535,7 @@ impl QueuedReplication {
         out.str(&self.rule);
         out.u64(self.bytes);
         out.u64(self.queued_ms);
+        out.u8(u8::from(self.measured) | u8::from(self.timed) << 1);
         out.0
     }
 
@@ -547,11 +562,21 @@ impl QueuedReplication {
             rule: String::new(),
             bytes: 0,
             queued_ms: 0,
+            measured: false,
+            timed: false,
         };
         if !input.rest().is_empty() {
             queued.rule = input.str()?;
             queued.bytes = input.u64()?;
             queued.queued_ms = input.u64()?;
+        }
+        if !input.rest().is_empty() {
+            let flags = input.u8()?;
+            if flags >> 2 != 0 {
+                return Err(input.corrupt());
+            }
+            queued.measured = flags & 1 != 0;
+            queued.timed = flags & 2 != 0;
         }
         if !input.rest().is_empty() {
             return Err(input.corrupt());
@@ -567,6 +592,9 @@ struct BacklogCounts {
     operations: u64,
     bytes: u64,
     failed: u64,
+    /// The last of its queue (by number) looked at for the replication
+    /// time threshold.
+    missed_through: u64,
 }
 
 impl BacklogCounts {
@@ -575,16 +603,22 @@ impl BacklogCounts {
         out.u64(self.operations);
         out.u64(self.bytes);
         out.u64(self.failed);
+        out.u64(self.missed_through);
         out.0
     }
 
     fn decode(row: &[u8]) -> Result<Self, StorageError> {
         let mut input = Reader::new(row, "replication backlog");
-        let counts = BacklogCounts {
+        let mut counts = BacklogCounts {
             operations: input.u64()?,
             bytes: input.u64()?,
             failed: input.u64()?,
+            missed_through: 0,
         };
+        // A row of the build before had no threshold place.
+        if !input.rest().is_empty() {
+            counts.missed_through = input.u64()?;
+        }
         if !input.rest().is_empty() {
             return Err(input.corrupt());
         }
@@ -749,6 +783,8 @@ impl ObjTxn<'_, '_> {
             rule: rule.id.clone(),
             bytes,
             queued_ms: now_ms,
+            measured: rule.destination.measured(),
+            timed: rule.destination.timed(),
         };
         self.trees.replication_queue().insert_unique(
             self.ctx,
@@ -784,12 +820,9 @@ impl ObjTxn<'_, '_> {
         let index_key = Self::by_rule_key(queued);
         match added {
             true => {
-                by_rule.insert_unique(
-                    self.ctx,
-                    &mut OpMode::Txn(self.txn),
-                    &index_key,
-                    &queued.queued_ms.to_be_bytes(),
-                )?;
+                let mut row = queued.queued_ms.to_be_bytes().to_vec();
+                row.push(u8::from(queued.timed));
+                by_rule.insert_unique(self.ctx, &mut OpMode::Txn(self.txn), &index_key, &row)?;
             }
             false => {
                 by_rule.delete(self.ctx, &mut OpMode::Txn(self.txn), &index_key)?;
@@ -811,8 +844,105 @@ impl ObjTxn<'_, '_> {
         counts.failed += u64::from(failed);
         let mode = &mut OpMode::Txn(self.txn);
         tree.delete(self.ctx, mode, &row_key)?;
-        if counts != BacklogCounts::default() {
+        if counts.operations > 0 || counts.failed > 0 {
             tree.insert_unique(self.ctx, mode, &row_key, &counts.encode())?;
+        }
+        Ok(())
+    }
+
+    /// Journals replication event `event` of `queued` (a new replica's: a
+    /// tag change and a delete marker have none) on its source version,
+    /// with S3's `replicationEventData` (and `failureReason`, if given).
+    fn note_replication_event(
+        &mut self,
+        queued: &QueuedReplication,
+        event: &str,
+        failure: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        if queued.work != ReplicationWork::Create {
+            return Ok(());
+        }
+        let mut data = serde_json::json!({
+            "replicationRuleId": queued.rule,
+            "destinationBucket": format!("arn:aws:s3:::{}", queued.destination),
+            "s3Operation": "OBJECT_PUT",
+            "requestTime": crate::time::iso8601(queued.queued_ms),
+        });
+        if let Some(reason) = failure {
+            data["failureReason"] = serde_json::json!(reason);
+        }
+        let detail = serde_json::json!({ "replicationEventData": data }).to_string();
+        self.note_event(
+            &queued.bucket,
+            &queued.key,
+            queued.version,
+            event,
+            Some(detail),
+            now_ms,
+        )
+    }
+
+    /// Journals `s3:Replication:OperationMissedThreshold` for each new
+    /// replica queued by a rule with replication time control that has
+    /// waited past the threshold, once each: a rule's queue is looked at
+    /// from where it was last, in order, up to the first not yet past it
+    /// (at most `limit` a call).
+    pub fn note_missed_thresholds(
+        &mut self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<(), StorageError> {
+        let tree = self.trees.replication_backlog();
+        let by_rule = self.trees.replication_by_rule();
+        for (row_key, row) in tree.scan_range(self.ctx, None, None)? {
+            let mut counts = BacklogCounts::decode(&row)?;
+            if counts.operations == 0 {
+                continue;
+            }
+            let mut lower = row_key.clone();
+            lower.push(0);
+            let mut upper = lower.clone();
+            *upper.last_mut().expect("not empty") = 1;
+            lower.extend_from_slice(&counts.missed_through.saturating_add(1).to_be_bytes());
+            let mut through = counts.missed_through;
+            for (index_key, index_row) in
+                by_rule.scan_range_limit(self.ctx, Some(&lower), Some(&upper), limit)?
+            {
+                let (at, timed) = index_row.split_at(8);
+                let queued_ms =
+                    u64::from_be_bytes(at.try_into().map_err(|_| corrupt("replication by rule"))?);
+                // Past it once it waited longer.
+                if now_ms.saturating_sub(queued_ms) <= REPLICATION_THRESHOLD_MS {
+                    break;
+                }
+                let number = u64::from_be_bytes(
+                    index_key[index_key.len() - 8..]
+                        .try_into()
+                        .map_err(|_| corrupt("replication by rule"))?,
+                );
+                through = number;
+                if timed.first() == Some(&1)
+                    && let Some(entry) = self
+                        .trees
+                        .replication_queue()
+                        .get(self.ctx, &number.to_be_bytes())?
+                {
+                    let queued = QueuedReplication::decode(number, &entry)?;
+                    self.note_replication_event(
+                        &queued,
+                        "s3:Replication:OperationMissedThreshold",
+                        None,
+                        now_ms,
+                    )?;
+                }
+            }
+            if through != counts.missed_through {
+                counts.missed_through = through;
+                let mode = &mut OpMode::Txn(self.txn);
+                tree.delete(self.ctx, mode, &row_key)?;
+                tree.insert_unique(self.ctx, mode, &row_key, &counts.encode())?;
+            }
         }
         Ok(())
     }
@@ -1016,6 +1146,8 @@ impl ObjTxn<'_, '_> {
         &mut self,
         queued: &QueuedReplication,
         status: Option<ReplicationStatus>,
+        failure: Option<&str>,
+        now_ms: u64,
     ) -> Result<(), StorageError> {
         let removed = self.trees.replication_queue().delete(
             self.ctx,
@@ -1024,6 +1156,27 @@ impl ObjTxn<'_, '_> {
         )?;
         if removed.is_some() {
             self.count_backlog(queued, false, status == Some(ReplicationStatus::Failed))?;
+            // Its events, as its rule measured it when it was queued.
+            match status {
+                Some(ReplicationStatus::Failed) if queued.measured => self.note_replication_event(
+                    queued,
+                    "s3:Replication:OperationFailedReplication",
+                    failure,
+                    now_ms,
+                )?,
+                Some(ReplicationStatus::Completed)
+                    if queued.timed
+                        && now_ms.saturating_sub(queued.queued_ms) > REPLICATION_THRESHOLD_MS =>
+                {
+                    self.note_replication_event(
+                        queued,
+                        "s3:Replication:OperationReplicatedAfterThreshold",
+                        None,
+                        now_ms,
+                    )?
+                }
+                _ => {}
+            }
         }
         let Some(status) = status else {
             return Ok(());
@@ -1041,7 +1194,11 @@ impl ObjTxn<'_, '_> {
     /// sends its version there any more: it no longer counts in its
     /// version's tally (a version no destination is left for has no
     /// status).
-    pub fn drop_replication(&mut self, queued: &QueuedReplication) -> Result<(), StorageError> {
+    pub fn drop_replication(
+        &mut self,
+        queued: &QueuedReplication,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
         let removed = self.trees.replication_queue().delete(
             self.ctx,
             &mut OpMode::Txn(self.txn),
@@ -1049,6 +1206,15 @@ impl ObjTxn<'_, '_> {
         )?;
         if removed.is_some() {
             self.count_backlog(queued, false, false)?;
+            // No longer tracked: its rule no longer sends it.
+            if queued.measured {
+                self.note_replication_event(
+                    queued,
+                    "s3:Replication:OperationNotTracked",
+                    None,
+                    now_ms,
+                )?;
+            }
         }
         if queued.work != ReplicationWork::Create {
             return Ok(());
@@ -1154,10 +1320,11 @@ impl ObjFile<'_> {
                     1,
                 )?;
                 if let Some((_, row)) = first.first() {
+                    // Its time, then (from this build on) whether it is timed.
                     let at: [u8; 8] = row
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| corrupt("replication by rule"))?;
+                        .get(..8)
+                        .and_then(|at| at.try_into().ok())
+                        .ok_or_else(|| corrupt("replication by rule"))?;
                     rule.oldest_ms = Some(u64::from_be_bytes(at));
                 }
             }
