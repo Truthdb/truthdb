@@ -23,8 +23,8 @@
 //! its source's. A standby writes none (its log is the primary's).
 //!
 //! A delete marker a rule replicates is made here as a marker of the same
-//! number and time, or sent to another service as a DELETE of its key (not
-//! sent again when the key there is deleted already). It needs the
+//! number and time, or sent to another service as a DELETE of its key
+//! (only to a bucket there with versioning enabled). It needs the
 //! destination's owner and versioning as a replica does, and the
 //! configuration's creator may `s3:ReplicateDelete` there; it has no
 //! status, so one that cannot be made is dropped (its reason logged).
@@ -392,13 +392,15 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
     })
     .map_err(service)?;
     if job.body.is_none() {
-        // Sent once even across a crash: a key whose newest version there
-        // is a delete marker (or that has none) is deleted already.
+        // Only into a bucket with versioning enabled, where a DELETE makes
+        // a marker: in another, it would remove the replica for good.
         let (bucket, key) = (&remote.name, &job.queued.key);
-        return match client.head_object(bucket, key).await.map_err(service)? {
-            None => Ok(()),
-            Some(_) => client.delete_object(bucket, key).await.map_err(service),
-        };
+        if !client.versioning_enabled(bucket).await.map_err(service)? {
+            return Err(Fail::Lasting(
+                "the remote bucket does not have versioning enabled".to_string(),
+            ));
+        }
+        return client.delete_object(bucket, key).await.map_err(service);
     }
     let (tx, mut rx) = mpsc::channel(4);
     let engine = state.engine.clone();

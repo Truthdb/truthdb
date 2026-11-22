@@ -14372,13 +14372,15 @@ fn delete_markers_are_replicated_where_rules_ask_and_deletes_of_versions_never()
         .replace('\n', " ");
     let (user_key, user_secret) = user_with_key(&source, &account, "nodeletes", Some(&policy));
     let endpoint = format!("http://127.0.0.1:{}", target.s3_port);
-    let made = native(
-        source.native_port,
-        &format!(
-            "s3 create remote bucket far-marks {account} {endpoint} us-east-1 {far_key} {far_secret}"
-        ),
-    );
-    assert_eq!(made["remote_bucket"], "far-marks", "{made}");
+    for name in ["far-marks", "far-plain"] {
+        let made = native(
+            source.native_port,
+            &format!(
+                "s3 create remote bucket {name} {account} {endpoint} us-east-1 {far_key} {far_secret}"
+            ),
+        );
+        assert_eq!(made["remote_bucket"], name, "{made}");
+    }
     let script = source.dir.join("delete_markers.py");
     std::fs::write(&script, DELETE_MARKERS_SCRIPT).expect("script");
     let output = Command::new(&python)
@@ -14427,9 +14429,10 @@ def wait(test, what):
 def versioned(client, bucket):
     client.create_bucket(Bucket=bucket)
     client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
-for bucket in ["src", "dst", "unmarked", "src-user", "dst-user"]:
+for bucket in ["src", "dst", "unmarked", "src-user", "dst-user", "src-plain"]:
     versioned(s3, bucket)
 versioned(far, "far-marks")
+far.create_bucket(Bucket="far-plain")
 def rule(destination, priority, markers, **extra):
     return dict({"ID": destination, "Priority": priority, "Status": "Enabled", "Filter": {},
         "DeleteMarkerReplication": {"Status": "Enabled" if markers else "Disabled"},
@@ -14493,6 +14496,15 @@ wait(lambda: status("src-user", "u", u) == "COMPLETED", "u replicated")
 s3.delete_object(Bucket="src-user", Key="u")
 time.sleep(2)
 assert markers(s3, "dst-user", "u") == [] and not gone(s3, "dst-user", "u")
+# A remote bucket without versioning: the object reaches it, its marker
+# does not (a DELETE there would remove the replica for good).
+s3.put_bucket_replication(Bucket="src-plain", ReplicationConfiguration={"Role": ROLE,
+    "Rules": [rule("far-plain", 1, True)]})
+p = s3.put_object(Bucket="src-plain", Key="p", Body=b"p")["VersionId"]
+wait(lambda: status("src-plain", "p", p) == "COMPLETED", "p sent")
+s3.delete_object(Bucket="src-plain", Key="p")
+time.sleep(2)
+assert far.get_object(Bucket="far-plain", Key="p")["Body"].read() == b"p"
 print("ok")
 "#;
 
