@@ -145,7 +145,7 @@ pub(crate) fn decode_upload(upload: u64, row: &[u8]) -> Result<UploadInfo, Stora
     );
     let storage_class = match row.get(at + 8) {
         None => StorageClass::Standard,
-        Some(&code) if code < 8 => StorageClass::from_code(code),
+        Some(&code) if code < 9 => StorageClass::from_code(code),
         Some(_) => return Err(corrupt("upload row")),
     };
     Ok(UploadInfo {

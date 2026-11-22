@@ -208,7 +208,8 @@ pub fn transition_allowed(from: StorageClass, to: StorageClass) -> bool {
         IntelligentTiering => matches!(to, OnezoneIa | GlacierIr | Glacier | DeepArchive),
         OnezoneIa | GlacierIr => matches!(to, Glacier | DeepArchive),
         Glacier => to == DeepArchive,
-        DeepArchive => false,
+        // A directory bucket's objects have no transitions.
+        DeepArchive | ExpressOnezone => false,
     }
 }
 
@@ -217,7 +218,7 @@ pub fn transition_allowed(from: StorageClass, to: StorageClass) -> bool {
 fn coldness(class: StorageClass) -> u8 {
     use StorageClass::*;
     match class {
-        Standard | ReducedRedundancy => 0,
+        Standard | ReducedRedundancy | ExpressOnezone => 0,
         StandardIa => 1,
         IntelligentTiering => 2,
         OnezoneIa => 3,

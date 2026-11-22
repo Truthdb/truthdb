@@ -31,7 +31,8 @@ impl StorageClass {
             StorageClass::DeepArchive => 19,
             StorageClass::Standard
             | StorageClass::ReducedRedundancy
-            | StorageClass::IntelligentTiering => 0,
+            | StorageClass::IntelligentTiering
+            | StorageClass::ExpressOnezone => 0,
         }
     }
 }
