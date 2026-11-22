@@ -230,6 +230,7 @@ pub async fn receive_body(
     auth: Authenticated,
     key: Option<&crate::ssec::ProvidedKey>,
     class: StorageClass,
+    algorithm: Option<&str>,
 ) -> Result<(SealedBody, StoredChecksum), S3Error> {
     let headers = request.headers().clone();
     // A checksum of an algorithm this server does not compute is refused,
@@ -291,7 +292,12 @@ pub async fn receive_body(
     };
     let mut sink = BodySink::begin(state, key, class).await?;
     let mut decoder = PayloadDecoder::new(auth.framing, auth.checksum)?;
-    if let Some(algorithm) = header(&headers, "x-amz-sdk-checksum-algorithm") {
+    // A part's checksum is of its upload's algorithm; a PutObject's, of the
+    // one its SDK names (or CRC64NVME).
+    if let Some(algorithm) = algorithm
+        .map(str::to_string)
+        .or_else(|| header(&headers, "x-amz-sdk-checksum-algorithm"))
+    {
         decoder.computing(algorithm.trim())?;
     }
     let mut decoded = Vec::new();
@@ -309,6 +315,14 @@ pub async fn receive_body(
         sink.push(state, &decoded).await?;
     }
     let (_, checksum) = decoder.finish(declared)?;
+    if let Some(algorithm) = algorithm
+        && checksum.algorithm != algorithm
+    {
+        return Err(S3Error::invalid_request(format!(
+            "The upload's checksum algorithm is {algorithm}; this part's is {}",
+            checksum.algorithm
+        )));
+    }
     let (sealed, plain_md5) = sink.finish(state).await?;
     if content_md5.is_some_and(|expected| expected != plain_md5) {
         return Err(S3Error::bad_digest(
@@ -507,7 +521,8 @@ pub async fn put_object(
     }
     attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
     let headers = request.headers().clone();
-    let (sealed, checksum) = receive_body(state, request, auth, customer.as_ref(), class).await?;
+    let (sealed, checksum) =
+        receive_body(state, request, auth, customer.as_ref(), class, None).await?;
     attrs.checksum = Some(checksum);
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (stored, versioning, expiration) =

@@ -127,6 +127,9 @@ pub async fn create_upload(
         crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
     }
     attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
+    // The checksum it asks for, kept with it (its value made on completion).
+    attrs.checksum = crate::part_checksums::of_upload(request.headers())?;
+    let asked = attrs.checksum.clone();
     let customer_key = attrs.customer_key.clone();
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let upload = object(state, move |file| {
@@ -154,6 +157,19 @@ pub async fn create_upload(
     ));
     crate::sse::add_header(&mut response, encrypted_at_rest && customer_key.is_none());
     crate::ssec::add_echo(&mut response, customer_key.as_ref());
+    if let Some(asked) = asked {
+        add_header(&mut response, "x-amz-checksum-algorithm", asked.algorithm);
+        add_header(
+            &mut response,
+            "x-amz-checksum-type",
+            if asked.full_object {
+                "FULL_OBJECT"
+            } else {
+                "COMPOSITE"
+            }
+            .to_string(),
+        );
+    }
     Ok(response)
 }
 
@@ -173,9 +189,11 @@ pub async fn upload_part(
     // A part of an upload with a customer-provided key comes with that key;
     // one of an upload without, with none.
     let customer = crate::ssec::provided(request.headers(), false)?;
-    let customer_key = object(state, move |file| file.upload_attrs(upload))
-        .await?
-        .customer_key;
+    let upload_attrs = object(state, move |file| file.upload_attrs(upload)).await?;
+    let customer_key = upload_attrs.customer_key;
+    // The algorithm the upload asked for, if any: then every part's. One
+    // that asked for none takes any (CRC64NVME computed when a part has none).
+    let algorithm = upload_attrs.checksum.map(|asked| asked.algorithm);
     crate::ssec::check_read(customer_key.as_ref(), customer.as_ref())?;
     // A bucket blocking SSE-C refuses every request that names a key, a
     // part of an upload begun before the block included (as S3).
@@ -184,19 +202,34 @@ pub async fn upload_part(
         let blocked = object(state, move |file| crate::sse::sse_c_blocked(file, &name)).await?;
         crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
     }
-    // Its checksum is verified; parts keep none yet.
-    let (sealed, _) = receive_body(state, request, auth, customer.as_ref(), class).await?;
+    // Its checksum, of its upload's algorithm when it asked for one,
+    // verified (or computed) and kept.
+    let (sealed, checksum) = receive_body(
+        state,
+        request,
+        auth,
+        customer.as_ref(),
+        class,
+        algorithm.as_deref(),
+    )
+    .await?;
+    let kept = checksum.clone();
     let info = object(state, move |file| {
-        file.transaction(|tx| tx.upload_part(upload, number, &sealed, now_ms(), DROP_GRACE_MS))
+        file.transaction(|tx| {
+            tx.upload_part(upload, number, &sealed, Some(kept), now_ms(), DROP_GRACE_MS)
+        })
     })
     .await?
     .map_err(|err| upload_error(err, &bucket, &key))?;
     let etag: String = info.md5.iter().map(|b| format!("{b:02x}")).collect();
     Ok(crate::ssec::with_echo(
         crate::sse::with_header(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("etag", format!("\"{etag}\"")),
+            crate::objects::with_checksum(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("etag", format!("\"{etag}\"")),
+                &checksum,
+            ),
             state.storage.is_encrypted() && customer_key.is_none(),
         ),
         customer_key.as_ref(),
@@ -221,7 +254,11 @@ pub async fn list_parts(
         .and_then(|n| n.parse().ok())
         .unwrap_or(MAX_LISTED)
         .min(MAX_LISTED);
-    let (parts, truncated) = object(state, move |file| file.list_parts(upload, after, max)).await?;
+    let (parts, truncated, asked) = object(state, move |file| {
+        let (parts, truncated) = file.list_parts(upload, after, max)?;
+        Ok((parts, truncated, file.upload_attrs(upload)?.checksum))
+    })
+    .await?;
     let mut body = format!(
         "<ListPartsResult xmlns=\"{XMLNS}\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload}</UploadId><PartNumberMarker>{after}</PartNumberMarker><MaxParts>{max}</MaxParts><IsTruncated>{truncated}</IsTruncated>",
         escape(&bucket),
@@ -233,9 +270,32 @@ pub async fn list_parts(
             last.number
         ));
     }
-    for part in &parts {
+    // The upload's checksum algorithm and type, when it asked for one.
+    if let Some(asked) = &asked {
         body.push_str(&format!(
-            "<Part><PartNumber>{}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Part>",
+            "<ChecksumAlgorithm>{}</ChecksumAlgorithm><ChecksumType>{}</ChecksumType>",
+            asked.algorithm,
+            if asked.full_object {
+                "FULL_OBJECT"
+            } else {
+                "COMPOSITE"
+            }
+        ));
+    }
+    for part in &parts {
+        let checksum = part
+            .checksum
+            .as_ref()
+            .map(|checksum| {
+                format!(
+                    "<Checksum{0}>{1}</Checksum{0}>",
+                    checksum.algorithm,
+                    escape(&checksum.value)
+                )
+            })
+            .unwrap_or_default();
+        body.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size>{checksum}</Part>",
             part.number,
             crate::time::iso8601(part.mtime_ms),
             escape(&part.etag()),
@@ -253,7 +313,12 @@ pub async fn list_parts(
 /// `<CompleteMultipartUpload>` of `<Part>`s, each with one `<PartNumber>` and
 /// one `<ETag>` (the 32 hex digits of its MD5, quoted or not), and optionally
 /// the part's checksum, which the part itself was verified against.
-fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
+/// The `(PartNumber, ETag)` list, and the checksums the parts are listed
+/// with (`(PartNumber, algorithm, value)`).
+#[allow(clippy::type_complexity)]
+fn parse_complete(
+    body: &[u8],
+) -> Result<(Vec<(u32, [u8; 16])>, Vec<(u32, String, String)>), S3Error> {
     let malformed = || {
         S3Error::new(
             400,
@@ -265,7 +330,9 @@ fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
     let mut path: Vec<Vec<u8>> = Vec::new();
     let mut seen_root = false;
     let (mut number, mut etag): (Option<String>, Option<String>) = (None, None);
+    let mut checksum: Option<(String, String)> = None;
     let mut parts = Vec::new();
+    let mut sums = Vec::new();
     let mut buf = Vec::new();
     loop {
         let event = reader.read_event_into(&mut buf).map_err(|_| malformed())?;
@@ -283,7 +350,7 @@ fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
             let allowed = match (path.last().map(Vec::as_slice), name.as_slice()) {
                 (None, b"CompleteMultipartUpload") => !std::mem::replace(&mut seen_root, true),
                 (Some(b"CompleteMultipartUpload"), b"Part") => {
-                    (number, etag) = (None, None);
+                    (number, etag, checksum) = (None, None, None);
                     true
                 }
                 (Some(b"Part"), b"PartNumber") => number.replace(String::new()).is_none(),
@@ -292,7 +359,10 @@ fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
                     Some(b"Part"),
                     b"ChecksumCRC32" | b"ChecksumCRC32C" | b"ChecksumCRC64NVME" | b"ChecksumSHA1"
                     | b"ChecksumSHA256",
-                ) => true,
+                ) => {
+                    let algorithm = String::from_utf8_lossy(&name["Checksum".len()..]).into_owned();
+                    checksum.replace((algorithm, String::new())).is_none()
+                }
                 _ => false,
             };
             if !allowed {
@@ -318,6 +388,9 @@ fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
                 let md5 =
                     md5.ok_or_else(|| upload_error(UploadError::InvalidPart(number), "", ""))?;
                 parts.push((number, md5));
+                if let Some((algorithm, value)) = checksum.take() {
+                    sums.push((number, algorithm, value.trim().to_string()));
+                }
             }
             path.pop();
         }
@@ -337,7 +410,11 @@ fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
                 Some(
                     b"ChecksumCRC32" | b"ChecksumCRC32C" | b"ChecksumCRC64NVME" | b"ChecksumSHA1"
                     | b"ChecksumSHA256",
-                ) => {}
+                ) => {
+                    if let Some((_, value)) = &mut checksum {
+                        value.push_str(&text);
+                    }
+                }
                 _ if text.trim().is_empty() => {}
                 _ => return Err(malformed()),
             }
@@ -353,7 +430,7 @@ fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
     if parts.is_empty() {
         return Err(malformed());
     }
-    Ok(parts)
+    Ok((parts, sums))
 }
 
 pub async fn complete_upload(
@@ -367,13 +444,81 @@ pub async fn complete_upload(
     let upload = upload_id(&params)?;
     check_upload(state, upload, &bucket, &key).await?;
     let condition = crate::conditional::Condition::of_write(request.headers())?;
+    // A checksum header is of the whole object (or, sent as S3's SDKs send
+    // it, of nothing to check here), not of this request's XML; the type, of
+    // the upload.
+    let whole = auth.checksum.clone().and_then(|(name, value)| {
+        value.map(|value| {
+            (
+                name.trim_start_matches("x-amz-checksum-")
+                    .to_ascii_uppercase(),
+                value,
+            )
+        })
+    });
+    let asked_type = crate::objects::header(request.headers(), "x-amz-checksum-type");
+    let auth = Authenticated {
+        checksum: None,
+        ..auth
+    };
     let body = read_body(request, auth, MAX_COMPLETE_BODY).await?;
-    let listed = parse_complete(&body)?;
+    let (listed, sums) = parse_complete(&body)?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (completed, versioning) =
         crate::scope::object_as(state, "CompleteMultipartUpload", move |file| {
             let now = now_ms();
+            let versioning = versioning_of(file, &bucket_name)?;
             let (_, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
+            // The object's checksum, of the listed parts as they were kept, in
+            // the completion's lock hold.
+            let asked = file.upload_attrs(upload)?.checksum;
+            let mut parts = Vec::with_capacity(listed.len());
+            for (number, _) in &listed {
+                parts.extend(file.upload_part_info(upload, *number)?);
+            }
+            for (number, algorithm, value) in &sums {
+                let kept = parts
+                    .iter()
+                    .find(|part| part.number == *number)
+                    .and_then(|part| part.checksum.as_ref());
+                if kept.is_some_and(|kept| kept.algorithm != *algorithm || kept.value != *value) {
+                    return Ok((
+                        Err(upload_error(UploadError::InvalidPart(*number), &bucket_name, &key_name)),
+                        versioning,
+                    ));
+                }
+            }
+            let full_object = asked.as_ref().is_none_or(|asked| asked.full_object);
+            if asked_type.as_deref().is_some_and(|asked_type| {
+                (asked_type == "FULL_OBJECT") != full_object
+            }) {
+                return Ok((
+                    Err(S3Error::bad_digest(
+                        "The checksum type does not match the one the upload was created with",
+                    )),
+                    versioning,
+                ));
+            }
+            let checksum = (parts.len() == listed.len())
+                .then(|| crate::part_checksums::of_object(asked.as_ref(), &parts))
+                .flatten();
+            // A whole-object checksum sent with it is checked (one for an
+            // upload that asked for none is not, as S3 neither checks nor
+            // keeps it).
+            if let (Some(asked), Some((algorithm, value))) = (&asked, &whole)
+                && asked.full_object
+                && checksum
+                    .as_ref()
+                    .is_none_or(|checksum| checksum.algorithm != *algorithm || checksum.value != *value)
+            {
+                return Ok((
+                    Err(S3Error::bad_digest(format!(
+                        "The x-amz-checksum-{} you specified did not match the calculated checksum.",
+                        algorithm.to_ascii_lowercase()
+                    ))),
+                    versioning,
+                ));
+            }
             let completed = file.transaction(|tx| {
                 // In the completion's own transaction: an upload in progress
                 // is no version, so what was written meanwhile counts. One
@@ -387,7 +532,8 @@ pub async fn complete_upload(
                         return Ok(Err(err));
                     }
                 }
-                let completed = tx.complete_upload(upload, &listed, now, DROP_GRACE_MS)?;
+                let completed =
+                    tx.complete_upload(upload, &listed, checksum.clone(), now, DROP_GRACE_MS)?;
                 // The object has the lock its upload asked for; without a
                 // retention, the bucket's default one, from now.
                 if let (Ok(info), Some(default)) = (&completed, default) {
@@ -399,12 +545,29 @@ pub async fn complete_upload(
                 }
                 Ok(Ok(completed))
             })?;
-            Ok((completed, versioning_of(file, &bucket_name)?))
+            Ok((completed, versioning))
         })
         .await?;
     let info = completed?.map_err(|err| upload_error(err, &bucket, &key))?;
+    let checksum = info
+        .attrs
+        .checksum
+        .as_ref()
+        .map(|checksum| {
+            format!(
+                "<Checksum{0}>{1}</Checksum{0}><ChecksumType>{2}</ChecksumType>",
+                checksum.algorithm,
+                escape(&checksum.value),
+                if checksum.full_object {
+                    "FULL_OBJECT"
+                } else {
+                    "COMPOSITE"
+                }
+            )
+        })
+        .unwrap_or_default();
     let mut response = xml(format!(
-        "<CompleteMultipartUploadResult xmlns=\"{XMLNS}\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+        "<CompleteMultipartUploadResult xmlns=\"{XMLNS}\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>{checksum}</CompleteMultipartUploadResult>",
         escape(&bucket),
         escape(&key),
         escape(&bucket),
@@ -512,7 +675,7 @@ mod tests {
 
     #[test]
     fn complete_requests_parse_part_numbers_and_etags() {
-        let parts = parse_complete(
+        let (parts, _) = parse_complete(
             br#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"0123456789abcdef0123456789abcdef"</ETag></Part><Part><ETag>&quot;fedcba9876543210fedcba9876543210&quot;</ETag><PartNumber>2</PartNumber></Part></CompleteMultipartUpload>"#,
         )
         .unwrap();
@@ -526,12 +689,13 @@ mod tests {
             parse_complete(b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"xyz\"</ETag></Part></CompleteMultipartUpload>").is_err(),
             "an ETag that is not an MD5"
         );
-        // A part's checksum may be listed; CDATA is read.
-        let parts = parse_complete(
+        // A part's checksum may be listed, and is kept; CDATA is read.
+        let (parts, sums) = parse_complete(
             b"<CompleteMultipartUpload><Part><PartNumber>3</PartNumber><ChecksumCRC32>AAAAAA==</ChecksumCRC32><ETag><![CDATA[0123456789abcdef0123456789abcdef]]></ETag></Part></CompleteMultipartUpload>",
         )
         .unwrap();
         assert_eq!(parts[0].0, 3);
+        assert_eq!(sums, [(3, "CRC32".to_string(), "AAAAAA==".to_string())]);
         const PART: &str =
             "<Part><PartNumber>1</PartNumber><ETag>0123456789abcdef0123456789abcdef</ETag></Part>";
         for bad in [

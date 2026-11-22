@@ -13,7 +13,7 @@ use truthdb_core::storage::StorageError;
 
 use crate::body::{BodyInfo, SealedBody};
 use crate::codec::BodyState;
-use crate::objects::{NewVersion, StorageClass, validate_key};
+use crate::objects::{NewVersion, StorageClass, StoredChecksum, validate_key};
 use crate::{
     NEXT_UPLOAD_KEY, ObjFile, ObjTxn, ObjectAttrs, ObjectError, ObjectInfo, PARTS_TREE,
     UPLOAD_INDEX_TREE, UPLOADS_TREE, next_counter,
@@ -65,6 +65,8 @@ pub struct PartInfo {
     pub size: u64,
     pub md5: [u8; 16],
     pub mtime_ms: u64,
+    /// Its checksum, as the part's upload verified or computed it.
+    pub checksum: Option<StoredChecksum>,
 }
 
 impl PartInfo {
@@ -134,26 +136,46 @@ pub(crate) fn decode_upload(upload: u64, row: &[u8]) -> Result<UploadInfo, Stora
     })
 }
 
+/// A part's row: its body, size, MD5 and time, then (from this build on,
+/// when it has one) its checksum as `<algorithm> <value>`.
 fn encode_part(part: &PartInfo) -> Vec<u8> {
     let mut out = Vec::with_capacity(40);
     out.extend_from_slice(&part.body.to_le_bytes());
     out.extend_from_slice(&part.size.to_le_bytes());
     out.extend_from_slice(&part.md5);
     out.extend_from_slice(&part.mtime_ms.to_le_bytes());
+    if let Some(checksum) = &part.checksum {
+        out.extend_from_slice(format!("{} {}", checksum.algorithm, checksum.value).as_bytes());
+    }
     out
 }
 
 pub(crate) fn decode_part(number: u32, row: &[u8]) -> Result<PartInfo, StorageError> {
-    if row.len() != 40 {
+    if row.len() < 40 {
         return Err(corrupt("part row"));
     }
     let u64_at = |at: usize| u64::from_le_bytes(row[at..at + 8].try_into().unwrap());
+    let checksum = match &row[40..] {
+        [] => None,
+        rest => {
+            let text = std::str::from_utf8(rest).map_err(|_| corrupt("part checksum"))?;
+            let (algorithm, value) = text
+                .split_once(' ')
+                .ok_or_else(|| corrupt("part checksum"))?;
+            Some(StoredChecksum {
+                algorithm: algorithm.to_string(),
+                full_object: true,
+                value: value.to_string(),
+            })
+        }
+    };
     Ok(PartInfo {
         number,
         body: u64_at(0),
         size: u64_at(8),
         md5: row[16..32].try_into().unwrap(),
         mtime_ms: u64_at(32),
+        checksum,
     })
 }
 
@@ -254,12 +276,14 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Stores `body` as part `number` of `upload` (sealing it: the part holds
-    /// its one reference), replacing an earlier part with that number.
+    /// its one reference), with its `checksum`, replacing an earlier part with
+    /// that number.
     pub fn upload_part(
         &mut self,
         upload: u64,
         number: u32,
         body: &SealedBody,
+        checksum: Option<StoredChecksum>,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<Result<BodyInfo, UploadError>, StorageError> {
@@ -271,7 +295,7 @@ impl ObjTxn<'_, '_> {
         }
         let sealed = body.seal_in(self)?;
         let size = body.size.unwrap_or(sealed.len);
-        self.store_part(upload, number, sealed, size, now_ms, grace_ms)?;
+        self.store_part(upload, number, sealed, size, checksum, now_ms, grace_ms)?;
         Ok(Ok(sealed))
     }
 
@@ -305,18 +329,20 @@ impl ObjTxn<'_, '_> {
             len: row.len,
             md5: row.md5,
         };
-        self.store_part(upload, number, shared, row.len, now_ms, grace_ms)?;
+        self.store_part(upload, number, shared, row.len, None, now_ms, grace_ms)?;
         Ok(Ok(shared))
     }
 
     /// Records `sealed` (holding a reference for the part) as part `number`
     /// of `size` bytes, releasing the body of a part it replaces.
+    #[allow(clippy::too_many_arguments)]
     fn store_part(
         &mut self,
         upload: u64,
         number: u32,
         sealed: BodyInfo,
         size: u64,
+        checksum: Option<StoredChecksum>,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<(), StorageError> {
@@ -326,6 +352,7 @@ impl ObjTxn<'_, '_> {
             size,
             md5: sealed.md5,
             mtime_ms: now_ms,
+            checksum,
         };
         let info = self
             .upload_row(upload)?
@@ -431,12 +458,14 @@ impl ObjTxn<'_, '_> {
 
     /// Completes the upload from `listed` parts (`(number, MD5)`, ascending)
     /// into the newest version of its key, whose body is a composite of the
-    /// parts and whose ETag is the MD5 of their MD5s with the part count.
+    /// parts and whose ETag is the MD5 of their MD5s with the part count, and
+    /// whose checksum is `checksum` (made of these parts' by the caller).
     /// Uploaded parts that are not listed are released.
     pub fn complete_upload(
         &mut self,
         upload: u64,
         listed: &[(u32, [u8; 16])],
+        checksum: Option<StoredChecksum>,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<Result<ObjectInfo, UploadError>, StorageError> {
@@ -470,7 +499,9 @@ impl ObjTxn<'_, '_> {
         if chosen.iter().map(|part| part.size).sum::<u64>() > MAX_OBJECT_BYTES {
             return Ok(Err(UploadError::EntityTooLarge));
         }
-        let attrs = self.upload_attrs(upload)?;
+        let mut attrs = self.upload_attrs(upload)?;
+        // The upload's kept its algorithm only; the object's is its value.
+        attrs.checksum = checksum;
         let lock = self.take_upload_lock(upload)?;
         let all = self.remove_upload(&info)?;
         for part in &all {
@@ -570,6 +601,21 @@ impl ObjFile<'_> {
 
     /// Up to `max` parts of `upload` numbered after `after`, and whether more
     /// follow.
+    /// Part `number` of `upload`, if it was uploaded.
+    pub fn upload_part_info(
+        &mut self,
+        upload: u64,
+        number: u32,
+    ) -> Result<Option<PartInfo>, StorageError> {
+        let Some(parts) = self.existing_tree(PARTS_TREE)? else {
+            return Ok(None);
+        };
+        parts
+            .get(&mut self.core.page_ctx(0), &part_key(upload, number))?
+            .map(|row| decode_part(number, &row))
+            .transpose()
+    }
+
     pub fn list_parts(
         &mut self,
         upload: u64,

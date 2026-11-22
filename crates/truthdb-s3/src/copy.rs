@@ -689,7 +689,8 @@ async fn copy_part(
             let sealed = copied?;
             object(state, move |file| {
                 file.transaction(|tx| {
-                    tx.upload_part(upload, number, &sealed, now_ms(), DROP_GRACE_MS)
+                    // A copied part keeps no checksum yet.
+                    tx.upload_part(upload, number, &sealed, None, now_ms(), DROP_GRACE_MS)
                 })
             })
             .await?
