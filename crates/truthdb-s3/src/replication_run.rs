@@ -543,7 +543,8 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
         secret: remote.secret.clone(),
         ca_pem: remote.ca_pem.clone(),
     })
-    .map_err(service)?;
+    // Not an answer: the client cannot be made (its CA, say).
+    .map_err(|err| Fail::Lasting(err.to_string()))?;
     if job.body.is_none() {
         // Only into a bucket with versioning enabled, where a DELETE makes
         // a marker: in another, it would remove the replica for good.

@@ -14660,6 +14660,7 @@ fn replication_events_are_sent_for_the_rules_that_measure_them() {
             event["userIdentity"]["principalId"], "s3.amazonaws.com",
             "{event}"
         );
+        assert_eq!(event["eventVersion"], "2.2", "replication events' version");
     }
     assert_eq!(failed["s3"]["object"]["key"], "doc");
     assert_eq!(failed["s3"]["object"]["versionId"], version.as_str());
