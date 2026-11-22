@@ -67,7 +67,15 @@ impl Checksum {
         }
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    /// The checksum of an algorithm as S3 names it (`CRC32`, ...).
+    pub(crate) fn of_algorithm(algorithm: &str) -> Result<Self, S3Error> {
+        Self::for_header(&format!(
+            "x-amz-checksum-{}",
+            algorithm.to_ascii_lowercase()
+        ))
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         match self {
             Checksum::Crc32(hasher) => hasher.update(bytes),
             Checksum::Crc32c(digest) => digest.update(bytes),
@@ -77,7 +85,7 @@ impl Checksum {
     }
 
     /// The checksum, base64 as S3 sends it.
-    fn finish(self) -> String {
+    pub(crate) fn finish(self) -> String {
         let bytes = match self {
             Checksum::Crc32(hasher) => hasher.finalize().to_be_bytes().to_vec(),
             Checksum::Crc32c(digest) => digest.finalize().to_be_bytes().to_vec(),

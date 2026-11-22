@@ -43,8 +43,7 @@ fn crc(algorithm: &str) -> Option<Crc> {
 /// names none: the parts' CRC64NVME then make the object's, as S3 gives an
 /// upload without one.
 pub(crate) fn of_upload(headers: &HeaderMap) -> Result<Option<StoredChecksum>, S3Error> {
-    let algorithm = crate::objects::header(headers, "x-amz-checksum-algorithm")
-        .map(|algorithm| algorithm.trim().to_ascii_uppercase());
+    let algorithm = asked(headers, "x-amz-checksum-algorithm")?;
     let kind = crate::objects::header(headers, "x-amz-checksum-type");
     let Some(algorithm) = algorithm else {
         return match kind {
@@ -54,16 +53,6 @@ pub(crate) fn of_upload(headers: &HeaderMap) -> Result<Option<StoredChecksum>, S
             )),
         };
     };
-    if !NAMED.contains(&algorithm.as_str()) {
-        return Err(S3Error::invalid_request(format!(
-            "Checksum algorithm provided is unsupported: {algorithm}"
-        )));
-    }
-    if !COMPUTED.contains(&algorithm.as_str()) {
-        return Err(S3Error::not_implemented(format!(
-            "the checksum algorithm {algorithm} is not implemented"
-        )));
-    }
     // A CRC64NVME is of the whole object; the others are composite unless
     // asked otherwise.
     let full_object = match kind.as_deref().map(str::trim) {
@@ -91,6 +80,27 @@ pub(crate) fn of_upload(headers: &HeaderMap) -> Result<Option<StoredChecksum>, S
         full_object,
         value: String::new(),
     }))
+}
+
+/// The algorithm `name` (`x-amz-checksum-algorithm`'s) asks for, if any: 400
+/// for one S3 does not name, 501 for one it names that is not computed here.
+pub(crate) fn asked(headers: &HeaderMap, name: &str) -> Result<Option<String>, S3Error> {
+    let Some(algorithm) = crate::objects::header(headers, name)
+        .map(|algorithm| algorithm.trim().to_ascii_uppercase())
+    else {
+        return Ok(None);
+    };
+    if !NAMED.contains(&algorithm.as_str()) {
+        return Err(S3Error::invalid_request(format!(
+            "Checksum algorithm provided is unsupported: {algorithm}"
+        )));
+    }
+    if !COMPUTED.contains(&algorithm.as_str()) {
+        return Err(S3Error::not_implemented(format!(
+            "the checksum algorithm {algorithm} is not implemented"
+        )));
+    }
+    Ok(Some(algorithm))
 }
 
 /// The algorithm an upload's parts are checksummed with.

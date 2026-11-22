@@ -1328,7 +1328,7 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
         .unwrap();
     storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
     let part2 = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.upload_part_shared(upload, 2, copied.body, now(), 0))
+        .transaction(|tx| tx.upload_part_shared(upload, 2, copied.body, None, now(), 0))
         .unwrap()
         .unwrap();
     assert_eq!((part2.body, part2.md5), (copied.body, copied.md5));
@@ -1352,7 +1352,7 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
         .unwrap();
     assert!(
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.upload_part_shared(other, 1, joined.body, now(), 0))
+            .transaction(|tx| tx.upload_part_shared(other, 1, joined.body, None, now(), 0))
             .is_err()
     );
     ObjFile::new(&mut storage.lock())

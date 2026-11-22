@@ -13,7 +13,9 @@ use hyper::header::HeaderMap;
 use hyper::{Request, Response};
 use tokio::sync::mpsc;
 use truthdb_core::storage::StorageError;
-use truthdb_object::{BodyInfo, ObjFile, ObjectInfo, SealedBody, StorageClass, VersionSel};
+use truthdb_object::{
+    BodyInfo, ObjFile, ObjectInfo, SealedBody, StorageClass, StoredChecksum, VersionSel,
+};
 
 use crate::error::{S3Error, escape};
 use crate::listing::query_params;
@@ -132,10 +134,12 @@ async fn copy_keys(
 /// stream (leased) into a new body.
 enum CopyStep {
     Shared(ObjectInfo, Vec<(&'static str, String)>),
+    /// Its bytes copied, with a checksum of `algorithm` computed as they are.
     Stream {
         source: ObjectInfo,
         attrs: Box<truthdb_object::ObjectAttrs>,
         source_version: Option<String>,
+        algorithm: String,
     },
 }
 
@@ -215,8 +219,10 @@ async fn copy_whole(
     } else {
         Vec::new()
     };
-    // The destination's conditions (`If-Match`, `If-None-Match`).
+    // The destination's conditions (`If-Match`, `If-None-Match`), and the
+    // checksum algorithm it asks for.
     let condition = crate::conditional::Condition::of_write(&headers)?;
+    let wanted = crate::part_checksums::asked(&headers, "x-amz-checksum-algorithm")?;
     let write_condition = condition.clone();
     let (dst_bucket, dst_key) = (bucket.clone(), key.clone());
     let lookup_source_key = source_key.clone();
@@ -239,6 +245,7 @@ async fn copy_whole(
         // storage class, its redirect location, or its encryption.
         if !replace
             && website_redirect.is_none()
+            && wanted.is_none()
             && shared
             && class == source.storage_class
             && (src_bucket.as_str(), src_key.as_str()) == (&dst_bucket, &dst_key)
@@ -288,7 +295,22 @@ async fn copy_whole(
                 &dst_key,
             )));
         }
-        if !shared {
+        // The copy keeps its source's checksum, a whole one of the algorithm
+        // asked for (if any); else one is computed as its bytes are copied:
+        // of the algorithm asked for, or the source's for a composite one
+        // (its value changes, as S3's does for a multipart source), or
+        // CRC64NVME for a source with none, as S3 gives one.
+        let recompute = match (&wanted, &source.attrs.checksum) {
+            (Some(wanted), Some(kept)) if kept.full_object && kept.algorithm == *wanted => None,
+            (Some(wanted), _) => Some(wanted.clone()),
+            (None, Some(kept)) if kept.full_object => None,
+            (None, Some(kept)) => Some(kept.algorithm.clone()),
+            (None, None) => Some("CRC64NVME".to_string()),
+        };
+        if !shared || recompute.is_some() {
+            let algorithm = recompute.unwrap_or_else(|| {
+                crate::part_checksums::part_algorithm(source.attrs.checksum.as_ref()).to_string()
+            });
             // Checked before the copy is streamed, and again at its write.
             if let Some(condition) = &condition {
                 let current = match file.head_object(&dst_bucket, &dst_key, VersionSel::Latest)? {
@@ -313,6 +335,7 @@ async fn copy_whole(
                 source,
                 attrs: Box::new(attrs),
                 source_version,
+                algorithm,
             }));
         }
         attrs.customer_key = source.attrs.customer_key.clone();
@@ -363,8 +386,9 @@ async fn copy_whole(
         CopyStep::Shared(info, versions) => (info, versions),
         CopyStep::Stream {
             source,
-            attrs,
+            mut attrs,
             source_version,
+            algorithm,
         } => {
             let body = source.body;
             let copied = copy_into(
@@ -374,6 +398,7 @@ async fn copy_whole(
                 source_key,
                 target_key.as_deref(),
                 class,
+                &algorithm,
             )
             .await;
             // Unchecked: the lease goes even when the request's scope no
@@ -385,7 +410,8 @@ async fn copy_whole(
                     Ok(())
                 })
                 .await;
-            let sealed = copied?;
+            let (sealed, checksum) = copied?;
+            attrs.checksum = Some(checksum);
             let (dst_bucket, dst_key) = (bucket.clone(), key.clone());
             let (stored, versioning) = crate::scope::object_as(state, "CopyObject", move |file| {
                 let now = now_ms();
@@ -510,8 +536,14 @@ fn copy_range(value: &str, size: u64) -> Result<(u64, u64), S3Error> {
 enum PartSource {
     /// The part shares the source's body: done.
     Shared(BodyInfo),
-    /// The source body is leased; copy `len` bytes from `first`.
-    Leased { body: u64, first: u64, len: u64 },
+    /// The source body is leased; copy `len` bytes from `first`, with a
+    /// checksum of `algorithm`.
+    Leased {
+        body: u64,
+        first: u64,
+        len: u64,
+        algorithm: String,
+    },
 }
 
 pub async fn upload_part_copy(
@@ -609,8 +641,12 @@ async fn copy_part(
     let (lookup_source_key, lookup_target_key) = (source_key.clone(), target_key.clone());
     let (step, source_version, customer_key) = object(state, move |file| {
         // The part is encrypted with the upload's key, which the request
-        // names (or none for an upload without).
-        let customer_key = file.upload_attrs(upload)?.customer_key;
+        // names (or none for an upload without); its checksum is of the
+        // upload's algorithm (CRC64NVME for one that asked for none).
+        let upload_attrs = file.upload_attrs(upload)?;
+        let customer_key = upload_attrs.customer_key;
+        let algorithm =
+            crate::part_checksums::part_algorithm(upload_attrs.checksum.as_ref()).to_string();
         if let Err(err) =
             crate::ssec::check_read(customer_key.as_ref(), lookup_target_key.as_deref())
         {
@@ -640,10 +676,25 @@ async fn copy_part(
             None => None,
         };
         let plain = source.attrs.customer_key.is_none() && customer_key.is_none();
-        if span.is_none() && source.parts == 0 && plain {
+        // Shared only when the source's own checksum is the part's: of the
+        // whole of it, in the upload's algorithm (else it is copied, and the
+        // part's computed as it is).
+        let kept = source
+            .attrs
+            .checksum
+            .clone()
+            .filter(|checksum| checksum.full_object && checksum.algorithm == algorithm);
+        if span.is_none() && source.parts == 0 && plain && kept.is_some() {
             return Ok(file
                 .transaction(|tx| {
-                    tx.upload_part_shared(upload, number, source.body, now_ms(), DROP_GRACE_MS)
+                    tx.upload_part_shared(
+                        upload,
+                        number,
+                        source.body,
+                        kept,
+                        now_ms(),
+                        DROP_GRACE_MS,
+                    )
                 })?
                 .map(|part| (PartSource::Shared(part), source_version, customer_key))
                 .map_err(|err| upload_error(err, &part_bucket, &part_key)));
@@ -659,6 +710,7 @@ async fn copy_part(
                 body: source.body,
                 first,
                 len,
+                algorithm,
             },
             source_version,
             customer_key,
@@ -667,7 +719,12 @@ async fn copy_part(
     .await??;
     let part = match step {
         PartSource::Shared(part) => part,
-        PartSource::Leased { body, first, len } => {
+        PartSource::Leased {
+            body,
+            first,
+            len,
+            algorithm,
+        } => {
             let copied = copy_into(
                 state,
                 body,
@@ -675,6 +732,7 @@ async fn copy_part(
                 source_key,
                 target_key.as_deref(),
                 class,
+                &algorithm,
             )
             .await;
             // Unchecked: the lease goes even when the request's scope no
@@ -686,11 +744,17 @@ async fn copy_part(
                     Ok(())
                 })
                 .await;
-            let sealed = copied?;
+            let (sealed, checksum) = copied?;
             object(state, move |file| {
                 file.transaction(|tx| {
-                    // A copied part keeps no checksum yet.
-                    tx.upload_part(upload, number, &sealed, None, now_ms(), DROP_GRACE_MS)
+                    tx.upload_part(
+                        upload,
+                        number,
+                        &sealed,
+                        Some(checksum),
+                        now_ms(),
+                        DROP_GRACE_MS,
+                    )
                 })
             })
             .await?
@@ -712,7 +776,9 @@ async fn copy_into(
     source_key: Option<Arc<ProvidedKey>>,
     target_key: Option<&ProvidedKey>,
     class: StorageClass,
-) -> Result<SealedBody, S3Error> {
+    algorithm: &str,
+) -> Result<(SealedBody, StoredChecksum), S3Error> {
+    let mut checksum = crate::payload::Checksum::of_algorithm(algorithm)?;
     let layout = object(state, move |file| file.body_layout(body)).await?;
     let (tx, mut rx) = mpsc::channel(4);
     let engine = state.engine.clone();
@@ -722,6 +788,7 @@ async fn copy_into(
     });
     let mut sink = BodySink::begin(state, target_key, class).await?;
     while let Some(chunk) = rx.recv().await {
+        checksum.update(&chunk);
         sink.push(state, &chunk).await?;
     }
     let complete = reader
@@ -732,7 +799,14 @@ async fn copy_into(
             "the copy source (body {body}) could not be read whole"
         )));
     }
-    Ok(sink.finish(state).await?.0)
+    Ok((
+        sink.finish(state).await?.0,
+        StoredChecksum {
+            algorithm: algorithm.to_string(),
+            full_object: true,
+            value: checksum.finish(),
+        },
+    ))
 }
 
 #[cfg(test)]
