@@ -218,6 +218,9 @@ const REPLICATION_BACKLOG_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 47;
 /// queued replication was queued: a rule's queue in order (see
 /// `replication`).
 const REPLICATION_BY_RULE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 48;
+/// (bucket, 0, key, 0, !version, part) -> a multipart version's part's
+/// checksum, by its place in the object (see `uploads`).
+const PART_CHECKSUMS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 49;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -342,7 +345,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 49;
+const TREE_COUNT: usize = 50;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -504,6 +507,9 @@ impl Trees {
     }
     pub fn replication_by_rule(&self) -> BTree {
         self.tree(REPLICATION_BY_RULE_TREE)
+    }
+    pub fn part_checksums(&self) -> BTree {
+        self.tree(PART_CHECKSUMS_TREE)
     }
 }
 

@@ -13,11 +13,32 @@ use truthdb_core::storage::StorageError;
 
 use crate::body::{BodyInfo, SealedBody};
 use crate::codec::BodyState;
+use crate::objects::version_key;
 use crate::objects::{NewVersion, StorageClass, StoredChecksum, validate_key};
 use crate::{
-    NEXT_UPLOAD_KEY, ObjFile, ObjTxn, ObjectAttrs, ObjectError, ObjectInfo, PARTS_TREE,
-    UPLOAD_INDEX_TREE, UPLOADS_TREE, next_counter,
+    NEXT_UPLOAD_KEY, ObjFile, ObjTxn, ObjectAttrs, ObjectError, ObjectInfo, PART_CHECKSUMS_TREE,
+    PARTS_TREE, UPLOAD_INDEX_TREE, UPLOADS_TREE, next_counter,
 };
+
+/// The key of part `part` (its place, from 1) of version `version` of
+/// `bucket`'s `key` in the part checksums tree.
+fn part_checksum_key(bucket: &str, key: &str, version: u64, part: u16) -> Vec<u8> {
+    let mut out = version_key(bucket, key, version);
+    out.extend_from_slice(&part.to_be_bytes());
+    out
+}
+
+fn decode_part_checksum(row: &[u8]) -> Result<StoredChecksum, StorageError> {
+    let text = std::str::from_utf8(row).map_err(|_| corrupt("part checksum"))?;
+    let (algorithm, value) = text
+        .split_once(' ')
+        .ok_or_else(|| corrupt("part checksum"))?;
+    Ok(StoredChecksum {
+        algorithm: algorithm.to_string(),
+        full_object: true,
+        value: value.to_string(),
+    })
+}
 
 /// Largest object a multipart upload completes into (S3's limit).
 pub const MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
@@ -542,7 +563,100 @@ impl ObjTxn<'_, '_> {
             grace_ms,
         )?;
         self.set_lock(&info.bucket, &info.key, object.version, &lock)?;
+        // Each part's checksum, by its place in the object (as a GET names a
+        // part), kept with it.
+        for (place, part) in chosen.iter().enumerate() {
+            if let Some(checksum) = &part.checksum {
+                self.trees.part_checksums().insert_unique(
+                    self.ctx,
+                    &mut OpMode::Txn(self.txn),
+                    &part_checksum_key(&info.bucket, &info.key, object.version, place as u16 + 1),
+                    format!("{} {}", checksum.algorithm, checksum.value).as_bytes(),
+                )?;
+            }
+        }
         Ok(Ok(object))
+    }
+
+    /// Forgets the part checksums of a version being removed.
+    pub(crate) fn forget_part_checksums(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<(), StorageError> {
+        let tree = self.trees.part_checksums();
+        let lower = part_checksum_key(bucket, key, version, 0);
+        let upper = part_checksum_key(bucket, key, version, u16::MAX);
+        for (row_key, _) in tree.scan_range(self.ctx, Some(&lower), Some(&upper))? {
+            tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+        }
+        Ok(())
+    }
+
+    /// The part checksums of `source` (a version of `from`'s `from_key`),
+    /// by place, as kept: read before a copy that shares its parts, which
+    /// can remove `source` (a copy onto itself replacing a null version).
+    pub fn part_checksums_of(
+        &mut self,
+        (from, from_key, source): (&str, &str, u64),
+    ) -> Result<Vec<(u16, Vec<u8>)>, StorageError> {
+        let tree = self.trees.part_checksums();
+        let lower = part_checksum_key(from, from_key, source, 0);
+        let upper = part_checksum_key(from, from_key, source, u16::MAX);
+        tree.scan_range(self.ctx, Some(&lower), Some(&upper))?
+            .into_iter()
+            .map(|(row_key, row)| {
+                let place = u16::from_be_bytes(
+                    row_key[row_key.len() - 2..]
+                        .try_into()
+                        .map_err(|_| corrupt("part checksum key"))?,
+                );
+                Ok((place, row))
+            })
+            .collect()
+    }
+
+    /// Gives version `to` of `bucket`'s `key` the part checksums `sums`
+    /// (from [`Self::part_checksums_of`] of the version whose parts it
+    /// shares: a copy or a replica of it).
+    pub fn put_part_checksums(
+        &mut self,
+        (bucket, key, to): (&str, &str, u64),
+        sums: &[(u16, Vec<u8>)],
+    ) -> Result<(), StorageError> {
+        let tree = self.trees.part_checksums();
+        for (place, row) in sums {
+            tree.insert_unique(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                &part_checksum_key(bucket, key, to, *place),
+                row,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl ObjFile<'_> {
+    /// The checksum of part `place` (from 1) of version `version` of
+    /// `bucket`'s `key`, if it kept one.
+    pub fn part_checksum(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        place: u16,
+    ) -> Result<Option<StoredChecksum>, StorageError> {
+        let Some(tree) = self.existing_tree(PART_CHECKSUMS_TREE)? else {
+            return Ok(None);
+        };
+        tree.get(
+            &mut self.core.page_ctx(0),
+            &part_checksum_key(bucket, key, version, place),
+        )?
+        .map(|row| decode_part_checksum(&row))
+        .transpose()
     }
 }
 

@@ -1232,6 +1232,11 @@ fn replicate(
     let made = match queued.work {
         ReplicationWork::Create => file.transaction(|tx| {
             let class = rule_class.unwrap_or(source.storage_class);
+            // A replica shares its source's parts, and their checksums.
+            let sums = match source.parts > 0 {
+                true => tx.part_checksums_of((&queued.bucket, &key, source.version))?,
+                false => Vec::new(),
+            };
             match tx.insert_replica(
                 &destination,
                 &key,
@@ -1246,7 +1251,10 @@ fn replicate(
                 Err(err) => Err(StorageError::InvalidFile(format!(
                     "the destination of a replication is gone: {err:?}"
                 ))),
-                Ok(_) => {
+                Ok(made) => {
+                    if made {
+                        tx.put_part_checksums((&destination, &key, source.version), &sums)?;
+                    }
                     tx.finish_replication(queued, Some(ReplicationStatus::Completed), None, now)
                 }
             }
@@ -1672,6 +1680,104 @@ mod tests {
                 "DstPutObjectNotPermitted"
             );
         }
+    }
+
+    #[test]
+    fn a_replica_of_a_multipart_version_has_its_part_checksums() {
+        use truthdb_object::{
+            BodyWriter, ObjectAttrs, ReplicationDestination, ReplicationRule, StorageClass,
+            StoredChecksum,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-s3-replica-parts-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let storage = create(&path);
+        let me = "111111111111";
+        let upload = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_account(me, "me", 1)?.unwrap();
+                for bucket in ["src", "dst"] {
+                    tx.create_bucket(bucket, me, 1)?.unwrap();
+                    tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+                }
+                tx.put_replication(
+                    "src",
+                    &ReplicationConfig {
+                        role: "role".into(),
+                        rules: vec![ReplicationRule {
+                            id: "all".into(),
+                            priority: 1,
+                            enabled: true,
+                            filter: truthdb_object::ReplicationFilter::All,
+                            replica_modifications: false,
+                            delete_markers: false,
+                            destination: ReplicationDestination {
+                                bucket: "dst".into(),
+                                account: None,
+                                storage_class: None,
+                                owner_override: false,
+                                owner: None,
+                                metrics: None,
+                                event_threshold: false,
+                                replication_time: None,
+                            },
+                        }],
+                        account: me.into(),
+                        user: None,
+                    },
+                )?;
+                Ok(tx
+                    .create_upload(
+                        "src",
+                        "k",
+                        &ObjectAttrs::default(),
+                        StorageClass::Standard,
+                        1,
+                    )?
+                    .unwrap())
+            })
+            .unwrap();
+        let mut writer = BodyWriter::begin(&storage, 1).unwrap();
+        writer.write(&storage, b"one part", 1).unwrap();
+        let sealed = writer.finish(&storage, 1).unwrap();
+        let sum = StoredChecksum {
+            algorithm: "CRC32".into(),
+            full_object: true,
+            value: "AAAAAQ==".into(),
+        };
+        let version = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                let part = tx
+                    .upload_part(upload, 1, &sealed, Some(sum.clone()), 1, 0)?
+                    .unwrap();
+                Ok(tx
+                    .complete_upload(upload, &[(1, part.md5)], None, 1, 0)?
+                    .unwrap()
+                    .version)
+            })
+            .unwrap();
+        let queued = ObjFile::new(&mut storage.lock())
+            .replication_queue(None, 10)
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        {
+            let mut lock = storage.lock();
+            assert!(
+                replicate(&mut ObjFile::new(&mut lock), &queued[0], now_ms())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .part_checksum("dst", "k", version, 1)
+                .unwrap(),
+            Some(sum)
+        );
+        drop(storage);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

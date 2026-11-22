@@ -1054,6 +1054,7 @@ impl ObjTxn<'_, '_> {
             self.set_lock(bucket, key, version, &crate::ObjectLock::default())?;
             self.forget_restore(bucket, key, version)?;
             self.forget_replication_status(bucket, key, version)?;
+            self.forget_part_checksums(bucket, key, version)?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
                 let state = self.version_state_key(bucket, key, version)?;
                 self.remove_attrs(&state)?;
