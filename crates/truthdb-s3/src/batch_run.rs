@@ -1540,6 +1540,10 @@ async fn run_checksums(
             }
             Next::Items(items) => {
                 let mut planned = Vec::new();
+                // The bodies leased so far, given back if a later task
+                // cannot be planned.
+                let mut leased = Vec::new();
+                let mut failed = None;
                 for item in items {
                     let task = match item.object {
                         None => None,
@@ -1553,7 +1557,7 @@ async fn run_checksums(
                             message: cut(&why, MAX_RESULT_TEXT),
                         })),
                         Some(Ok((bucket, key, version))) => {
-                            let found = plan(
+                            let found = match plan(
                                 file,
                                 delays,
                                 &who,
@@ -1562,12 +1566,28 @@ async fn run_checksums(
                                 &key,
                                 version.as_deref(),
                                 now,
-                            )?;
+                            ) {
+                                Ok(found) => found,
+                                Err(err) => {
+                                    failed = Some(err);
+                                    break;
+                                }
+                            };
                             let found = match found {
                                 Ok(Planned::Checksum(info)) => {
-                                    let layout = file.body_layout(info.body)?;
-                                    file.take_lease(info.body)?;
-                                    Ok((info, layout))
+                                    let taken = file.body_layout(info.body).and_then(|layout| {
+                                        Ok((file.take_lease(info.body)?, layout))
+                                    });
+                                    match taken {
+                                        Ok(((), layout)) => {
+                                            leased.push(info.body);
+                                            Ok((info, layout))
+                                        }
+                                        Err(err) => {
+                                            failed = Some(err);
+                                            break;
+                                        }
+                                    }
                                 }
                                 Ok(_) => Err(S3Error::internal("not a checksum task")),
                                 Err(err) => Err(err),
@@ -1576,6 +1596,12 @@ async fn run_checksums(
                         }
                     };
                     planned.push((item.start, item.end, task));
+                }
+                if let Some(err) = failed {
+                    for body in leased {
+                        file.release_lease(body);
+                    }
+                    return Err(err);
                 }
                 Ok(Some(planned))
             }
@@ -1588,6 +1614,8 @@ async fn run_checksums(
     let mut results = Vec::new();
     let began = std::time::Instant::now();
     let mut stopped = false;
+    // Every lease is given back, even past a failure to give one back.
+    let mut release_failed = None;
     for (start, end, task) in planned {
         // Past the budget none starts (the first always does); the leases
         // taken for the rest are given back.
@@ -1599,13 +1627,17 @@ async fn run_checksums(
                 let outcome = match found {
                     Err(err) => Err(err),
                     Ok((info, _)) if stopped => {
-                        release(state, info.body).await?;
+                        if let Err(err) = release(state, info.body).await {
+                            release_failed.get_or_insert(err);
+                        }
                         continue;
                     }
                     Ok((info, layout)) => {
                         let computed =
                             compute_checksum(state, &info, layout, &algorithm, full_object).await;
-                        release(state, info.body).await?;
+                        if let Err(err) = release(state, info.body).await {
+                            release_failed.get_or_insert(err);
+                        }
                         computed.map(|checksum| checksum_message(&checksum, &info.etag()))
                     }
                 };
@@ -1634,6 +1666,9 @@ async fn run_checksums(
             continue;
         }
         results.push((start, end, result));
+    }
+    if let Some(err) = release_failed {
+        return Err(err);
     }
     object(state, move |file| {
         for (start, end, result) in results {
@@ -1740,7 +1775,9 @@ async fn compute_checksum(
             &mut parts,
         );
     }
-    if sizes.len() == 1 {
+    // A multipart object's composite checksum is of its parts', even of
+    // one part (`-1`), as its completion made it.
+    if full_object || info.parts == 0 {
         return Ok(parts.remove(0).checksum.expect("a part's checksum"));
     }
     let asked = StoredChecksum {

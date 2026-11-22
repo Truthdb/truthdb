@@ -67,6 +67,9 @@ pub async fn get_object_attributes(
         .unwrap_or(0);
     let max: u32 = header(&headers, "x-amz-max-parts")
         .and_then(|n| n.parse().ok())
+        // None asked for is taken as not asked (AWS states nothing for
+        // 0; a page of none would never end).
+        .filter(|&n| n > 0)
         .unwrap_or(MAX_PARTS)
         .min(MAX_PARTS);
     let list_parts = asked.parts;

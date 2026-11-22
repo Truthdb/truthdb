@@ -9824,6 +9824,30 @@ fn batch_checksum_jobs_report_each_objects_checksum() {
     );
     let big_etag = response_header(&head, "etag").unwrap();
     let big_crc = response_header(&head, "x-amz-checksum-crc64nvme").expect("its CRC64NVME");
+    // A composite SHA256 upload of one part: its checksum is `-1`.
+    let sha = [("x-amz-checksum-algorithm", "SHA256")];
+    let (_, (_, made)) = call("POST", "/src/single", "uploads", &sha, b"");
+    let upload = xml_value(&made, "UploadId");
+    let query = format!("partNumber=1&uploadId={upload}");
+    let (head, (status, _)) = call("PUT", "/src/single", &query, &[], b"one part");
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").unwrap();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let query = format!("uploadId={upload}");
+    let (_, (status, done)) = call("POST", "/src/single", &query, &[], complete.as_bytes());
+    assert_eq!(status, 200, "{done}");
+    let (head, _) = call(
+        "HEAD",
+        "/src/single",
+        "",
+        &[("x-amz-checksum-mode", "ENABLED")],
+        b"",
+    );
+    let single_etag = response_header(&head, "etag").unwrap();
+    let single_sum = response_header(&head, "x-amz-checksum-sha256").expect("its SHA256");
+    assert!(single_sum.ends_with("-1"), "{single_sum}");
     let customer = customer_headers("x-amz-", [7u8; 32]);
     assert_eq!(
         call("PUT", "/src/sealed", "", &header_refs(&customer), b"s")
@@ -9906,7 +9930,7 @@ fn batch_checksum_jobs_report_each_objects_checksum() {
     let rows = run(
         "sums-1",
         composite,
-        "src,small\nsrc,big\nsrc,sealed\nsrc,missing\nsrc,gone\nsrc,denied\n",
+        "src,small\nsrc,big\nsrc,single\nsrc,sealed\nsrc,missing\nsrc,gone\nsrc,denied\n",
         false,
     );
     let small = sha256(b"hello");
@@ -9927,6 +9951,19 @@ fn batch_checksum_jobs_report_each_objects_checksum() {
                 "COMPOSITE"
             )
         ),
+        // The one the object keeps.
+        format!("src,single,,succeeded,200,,{}", {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(single_sum.trim_end_matches("-1"))
+                .unwrap();
+            record(
+                &single_sum,
+                &format!("{}-1", hex(&raw)),
+                &single_etag,
+                "SHA256",
+                "COMPOSITE",
+            )
+        }),
         "src,sealed,,failed,400,InvalidRequest,SSE-C encryption type is not supported for this operation".to_string(),
         "src,missing,,failed,404,NoSuchKey,".to_string(),
         "src,gone,,failed,404,NoSuchKey,".to_string(),
@@ -12498,6 +12535,10 @@ assert [part["PartNumber"] for part in first["Parts"]] == [1, 2], first
 rest = attributes("big", ["ObjectParts"], MaxParts=2, PartNumberMarker=2)["ObjectParts"]
 assert rest["IsTruncated"] is False and [part["PartNumber"] for part in rest["Parts"]] == [3], rest
 assert attributes("big", ["ObjectSize"])["ObjectSize"] == sum(map(len, datas))
+# MaxParts 0 is taken as none asked: a page of up to 1,000.
+unbounded = attributes("big", ["ObjectParts"], MaxParts=0)["ObjectParts"]
+assert unbounded["MaxParts"] == 1000 and unbounded["IsTruncated"] is False, unbounded
+assert len(unbounded["Parts"]) == 3, unbounded
 whole_page = attributes("big", ["ObjectParts"], MaxParts=3)["ObjectParts"]
 assert whole_page["IsTruncated"] is False and len(whole_page["Parts"]) == 3, whole_page
 # A multipart object with no checksum of its own (its upload asked for
