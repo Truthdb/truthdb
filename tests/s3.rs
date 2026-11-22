@@ -14509,6 +14509,179 @@ print("ok")
 "#;
 
 #[test]
+fn replication_events_are_sent_for_the_rules_that_measure_them() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "eventful");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+        .1
+    };
+    let versioning = |bucket: &str, status: &str| {
+        let body =
+            format!("<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>");
+        assert_eq!(
+            call("PUT", bucket, "versioning", &[], body.as_bytes()).0,
+            200
+        );
+    };
+    for bucket in ["/src", "/dst-off", "/dst-quiet"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").0, 200);
+        versioning(bucket, "Enabled");
+    }
+    native(
+        server.native_port,
+        &format!("stream create topic replicated partitions 2 retention 0 account {account}"),
+    );
+    let made = native(
+        server.native_port,
+        &format!("s3 create remote bucket gone-far {account} http://127.0.0.1:1 us-east-1 k s"),
+    );
+    assert_eq!(made["remote_bucket"], "gone-far", "{made}");
+    let notification = format!(
+        "<NotificationConfiguration><TopicConfiguration><Id>repl</Id>\
+         <Topic>arn:aws:sns:us-east-1:{account}:replicated</Topic>\
+         <Event>s3:Replication:*</Event></TopicConfiguration></NotificationConfiguration>"
+    );
+    assert_eq!(
+        call("PUT", "/src", "notification", &[], notification.as_bytes()).0,
+        200
+    );
+    let rule = |id: &str, destination: &str, priority: u32, monitoring: &str| {
+        format!(
+            "<Rule><ID>{id}</ID><Priority>{priority}</Priority><Status>Enabled</Status><Filter/>\
+             <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+             <Destination><Bucket>arn:aws:s3:::{destination}</Bucket>{monitoring}</Destination></Rule>"
+        )
+    };
+    let put_config = |rules: &str| {
+        let body = format!(
+            "<ReplicationConfiguration><Role>arn:aws:iam::{account}:role/r</Role>{rules}\
+             </ReplicationConfiguration>"
+        );
+        let md5 = content_md5(body.as_bytes());
+        let (status, answer) = call(
+            "PUT",
+            "/src",
+            "replication",
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+        );
+        assert_eq!(status, 200, "{answer}");
+    };
+    let metrics = "<Metrics><Status>Enabled</Status></Metrics>";
+    put_config(&format!(
+        "{}{}{}",
+        rule("fails", "dst-off", 1, metrics),
+        rule("quiet", "dst-quiet", 2, ""),
+        rule("away", "gone-far", 3, metrics)
+    ));
+    // Both local destinations can no longer take replicas.
+    versioning("/dst-off", "Suspended");
+    versioning("/dst-quiet", "Suspended");
+    let (head, (status, _)) = send_with(
+        server.s3_port,
+        "PUT",
+        "/src/doc",
+        "",
+        &[],
+        b"body",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200);
+    let version = response_header(&head, "x-amz-version-id").unwrap();
+    let call_head = |path: &str| {
+        let (head, (status, _)) = send_with(
+            server.s3_port,
+            "HEAD",
+            path,
+            "",
+            &[],
+            b"",
+            &key,
+            Some(&secret),
+        );
+        (head, status)
+    };
+    // FAILED (for both local destinations) before anything changes.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let (head, _) = call_head("/src/doc");
+        if response_header(&head, "x-amz-replication-status").as_deref() == Some("FAILED") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never FAILED");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The waiting rule is removed (its destinations versioned again for
+    // the put): what it queued is no longer tracked.
+    versioning("/dst-off", "Enabled");
+    versioning("/dst-quiet", "Enabled");
+    put_config(&format!(
+        "{}{}",
+        rule("fails", "dst-off", 1, metrics),
+        rule("quiet", "dst-quiet", 2, "")
+    ));
+    let received = || -> Vec<serde_json::Value> {
+        stream_events(server.native_port, "replicated")
+            .into_iter()
+            .filter(|event| event.get("Records").is_some())
+            .map(|event| event["Records"][0].clone())
+            .collect()
+    };
+    let deadline = Instant::now() + DEADLINE;
+    while received().len() < 2 {
+        assert!(Instant::now() < deadline, "{:?}", received());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // And no more after a while.
+    std::thread::sleep(Duration::from_millis(1500));
+    let events = received();
+    assert_eq!(events.len(), 2, "none for the unmeasured rule: {events:?}");
+    let named = |name: &str| {
+        events
+            .iter()
+            .find(|event| event["eventName"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {events:?}"))
+    };
+    let failed = named("Replication:OperationFailedReplication");
+    // S3's own events, made by no request.
+    for event in &events {
+        assert_eq!(
+            event["userIdentity"]["principalId"], "s3.amazonaws.com",
+            "{event}"
+        );
+        assert_eq!(event["eventVersion"], "2.2", "replication events' version");
+    }
+    assert_eq!(failed["s3"]["object"]["key"], "doc");
+    assert_eq!(failed["s3"]["object"]["versionId"], version.as_str());
+    let data = &failed["replicationEventData"];
+    assert_eq!(data["replicationRuleId"], "fails");
+    assert_eq!(data["destinationBucket"], "arn:aws:s3:::dst-off");
+    assert_eq!(data["s3Operation"], "OBJECT_PUT");
+    assert_eq!(data["failureReason"], "DstBucketUnversioned");
+    let untracked = named("Replication:OperationNotTracked");
+    assert_eq!(
+        untracked["replicationEventData"]["replicationRuleId"],
+        "away"
+    );
+    assert!(
+        untracked["replicationEventData"]
+            .get("failureReason")
+            .is_none()
+    );
+}
+
+#[test]
 fn replication_backlogs_are_shown_and_measured_per_rule() {
     // A Python with boto3 installed (pip install boto3), for CloudWatch.
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

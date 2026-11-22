@@ -346,15 +346,18 @@ pub fn event_message(
         "sequencer".into(),
         json!(format!("{:016X}", record.sequence)),
     );
-    // 2.1 for creations, removals and restores; 2.3 for the event types
-    // added with it (lifecycle, tagging, a restored copy expiring); a
-    // retention change only exists in the unified schema (2.4 on), 2.6 now.
+    // 2.1 for creations, removals and restores; 2.2 for replication; 2.3
+    // for the event types added with it (lifecycle, tagging, a restored
+    // copy expiring); a retention change only exists in the unified schema
+    // (2.4 on), 2.6 now.
     let version = if event.starts_with("s3:ObjectCreated")
         || event.starts_with("s3:ObjectRemoved")
         || event == "s3:ObjectRestore:Post"
         || event == "s3:ObjectRestore:Completed"
     {
         "2.1"
+    } else if event.starts_with("s3:Replication:") {
+        "2.2"
     } else if event == "s3:ObjectRetention:Put" {
         "2.6"
     } else {

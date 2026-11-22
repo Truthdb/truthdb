@@ -203,8 +203,13 @@ impl Metrics {
     }
 }
 
+/// How many queued replications of a rule one sample looks at for the
+/// replication time threshold.
+const MISSED_BATCH: usize = 1024;
+
 /// The enabled rules that measure their replications, each with its
-/// backlog at `now`.
+/// backlog at `now` (and, for those with time control, the threshold
+/// events of what has waited past it).
 fn measured(file: &mut ObjFile<'_>, now: u64) -> Result<Vec<Sample>, StorageError> {
     let mut rules = Vec::new();
     for bucket in file.list_buckets()? {
@@ -217,9 +222,16 @@ fn measured(file: &mut ObjFile<'_>, now: u64) -> Result<Vec<Sample>, StorageErro
             }
         }
     }
-    // The backlogs, read only when a rule measures its own.
+    // The backlogs, read only when a rule measures its own; with time
+    // control, what waited past its threshold is told first.
     if rules.is_empty() {
         return Ok(Vec::new());
+    }
+    // Its own transaction: one that fails costs no metrics.
+    if rules.iter().any(|(_, rule)| rule.destination.timed())
+        && let Err(err) = file.transaction(|tx| tx.note_missed_thresholds(now, MISSED_BATCH))
+    {
+        eprintln!("replication: the missed thresholds were not told: {err}");
     }
     let backlog = file.replication_backlog()?;
     let mut samples = Vec::new();
@@ -534,7 +546,8 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
         secret: remote.secret.clone(),
         ca_pem: remote.ca_pem.clone(),
     })
-    .map_err(service)?;
+    // Not an answer: the client cannot be made (its CA, say).
+    .map_err(|err| Fail::Lasting(err.to_string()))?;
     if job.body.is_none() {
         // Only into a bucket with versioning enabled, where a DELETE makes
         // a marker: in another, it would remove the replica for good.
@@ -618,10 +631,13 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
     }
 }
 
+/// How a reason another service gave starts.
+const REMOTE_REFUSED: &str = "the remote service answered: ";
+
 /// A service's error, as a reason a replica was not sent.
 fn service(err: truthdb_s3client::Error) -> Fail {
     match err.permanent() {
-        true => Fail::Lasting(err.to_string()),
+        true => Fail::Lasting(format!("{REMOTE_REFUSED}{err}")),
         false => Fail::Passing(err.to_string()),
     }
 }
@@ -672,12 +688,17 @@ fn finish_remote(
         );
     }
     match outcome {
-        Ok(()) => {
-            file.transaction(|tx| tx.finish_replication(queued, Some(ReplicationStatus::Completed)))
-        }
-        Err(Fail::Lasting(_)) => {
-            file.transaction(|tx| tx.finish_replication(queued, Some(ReplicationStatus::Failed)))
-        }
+        Ok(()) => file.transaction(|tx| {
+            tx.finish_replication(queued, Some(ReplicationStatus::Completed), None, now_ms())
+        }),
+        Err(Fail::Lasting(why)) => file.transaction(|tx| {
+            tx.finish_replication(
+                queued,
+                Some(ReplicationStatus::Failed),
+                Some(failure_reason(&why)),
+                now_ms(),
+            )
+        }),
         Err(_) => Ok(()),
     }
 }
@@ -798,6 +819,27 @@ fn refused(
     })
 }
 
+/// The `failureReason` S3 names in a replication event for why a
+/// replication failed here (its log message).
+fn failure_reason(why: &str) -> &'static str {
+    // Another service's refusal: its own words are not read.
+    if why.starts_with(REMOTE_REFUSED) {
+        "DstPutObjectNotPermitted"
+    } else if why.contains("does not exist") {
+        "DstBucketNotFound"
+    } else if why.contains("versioning") {
+        "DstBucketUnversioned"
+    } else if why.contains("Object Lock") {
+        "DstBucketObjectLockConfigMissing"
+    } else if why.contains("GetObjectVersionForReplication") || why.contains("tried") {
+        "SrcGetObjectNotPermitted"
+    } else if why.contains("ReplicateDelete") {
+        "DstDelObjNotPermitted"
+    } else {
+        "DstPutObjectNotPermitted"
+    }
+}
+
 const MAY_NOT_READ: &str =
     "the configuration's creator may not s3:GetObjectVersionForReplication the source";
 
@@ -862,7 +904,7 @@ fn remote_job(
 ) -> Result<Option<RemoteJob>, StorageError> {
     if queued.work == ReplicationWork::Metadata {
         return file
-            .transaction(|tx| tx.finish_replication(queued, None))
+            .transaction(|tx| tx.finish_replication(queued, None, None, now))
             .map(|()| None);
     }
     let owner = file.bucket(&queued.bucket)?.map(|bucket| bucket.owner);
@@ -882,7 +924,14 @@ fn remote_job(
             queued.bucket, queued.key, queued.version, queued.destination
         );
         return file
-            .transaction(|tx| tx.finish_replication(queued, Some(ReplicationStatus::Failed)))
+            .transaction(|tx| {
+                tx.finish_replication(
+                    queued,
+                    Some(ReplicationStatus::Failed),
+                    Some(failure_reason(why)),
+                    now,
+                )
+            })
             .map(|()| None);
     }
     let lock = file.object_lock(&queued.bucket, &queued.key, queued.version)?;
@@ -953,7 +1002,7 @@ fn replicate_marker(
     };
     let (Some((bucket, marker)), Some(config)) = (found, config) else {
         return file
-            .transaction(|tx| tx.drop_replication(queued))
+            .transaction(|tx| tx.drop_replication(queued, now))
             .map(|()| None);
     };
     let refusal = if file.bucket(&queued.destination)?.is_none()
@@ -980,7 +1029,14 @@ fn replicate_marker(
         );
         // A failure of the rule's (a marker has no status to show it).
         return file
-            .transaction(|tx| tx.finish_replication(queued, Some(ReplicationStatus::Failed)))
+            .transaction(|tx| {
+                tx.finish_replication(
+                    queued,
+                    Some(ReplicationStatus::Failed),
+                    Some(failure_reason(why)),
+                    now,
+                )
+            })
             .map(|()| None);
     }
     let same_owner = file
@@ -1005,7 +1061,7 @@ fn replicate_marker(
             Err(err) => Err(StorageError::InvalidFile(format!(
                 "the destination of a replication is gone: {err:?}"
             ))),
-            Ok(_) => tx.finish_replication(queued, None),
+            Ok(_) => tx.finish_replication(queued, None, None, now),
         }
     })
     .map(|()| None)
@@ -1062,7 +1118,7 @@ fn replicate(
     // The version is gone: nothing to replicate.
     let Some((bucket, source)) = found else {
         return file
-            .transaction(|tx| tx.finish_replication(queued, None))
+            .transaction(|tx| tx.finish_replication(queued, None, None, now))
             .map(|()| None);
     };
     // A rule must still send the version there; its class is the one it
@@ -1072,7 +1128,7 @@ fn replicate(
         .filter(|config| rule_naming(config, queued, &source.attrs.tags).is_some());
     let Some(config) = config else {
         return file
-            .transaction(|tx| tx.drop_replication(queued))
+            .transaction(|tx| tx.drop_replication(queued, now))
             .map(|()| None);
     };
     // The class of the rule its tags name now, or (sent as written, by
@@ -1097,7 +1153,7 @@ fn replicate(
             ReplicationWork::Metadata | ReplicationWork::DeleteMarker => None,
         };
         return file
-            .transaction(|tx| tx.finish_replication(queued, status))
+            .transaction(|tx| tx.finish_replication(queued, status, Some(failure_reason(why)), now))
             .map(|()| None);
     }
     let source_lock = file.object_lock(&queued.bucket, &queued.key, queued.version)?;
@@ -1150,7 +1206,9 @@ fn replicate(
                 Err(err) => Err(StorageError::InvalidFile(format!(
                     "the destination of a replication is gone: {err:?}"
                 ))),
-                Ok(_) => tx.finish_replication(queued, Some(ReplicationStatus::Completed)),
+                Ok(_) => {
+                    tx.finish_replication(queued, Some(ReplicationStatus::Completed), None, now)
+                }
             }
         }),
         ReplicationWork::DeleteMarker => {
@@ -1200,7 +1258,7 @@ fn replicate(
                         StorageError::InvalidFile(format!("a replica cannot be tagged: {err:?}"))
                     })?;
                 }
-                tx.finish_replication(queued, None)
+                tx.finish_replication(queued, None, None, now)
             })
         }
     };
@@ -1520,6 +1578,63 @@ mod tests {
     }
 
     #[test]
+    fn each_refusal_has_the_failure_reason_s3_names() {
+        for (why, reason) in [
+            ("the destination bucket does not exist", "DstBucketNotFound"),
+            (
+                "the destination bucket's owner is not the one it had when replication was set",
+                "DstPutObjectNotPermitted",
+            ),
+            (
+                "the destination bucket blocks objects under customer-provided keys",
+                "DstPutObjectNotPermitted",
+            ),
+            (
+                "the destination bucket does not have versioning enabled",
+                "DstBucketUnversioned",
+            ),
+            (
+                "the remote bucket does not have versioning enabled",
+                "DstBucketUnversioned",
+            ),
+            (
+                "the destination bucket does not have Object Lock",
+                "DstBucketObjectLockConfigMissing",
+            ),
+            (MAY_NOT_READ, "SrcGetObjectNotPermitted"),
+            (
+                "the body cannot be read (tried 10 times)",
+                "SrcGetObjectNotPermitted",
+            ),
+            (
+                "the configuration's creator may not s3:ReplicateObject there",
+                "DstPutObjectNotPermitted",
+            ),
+            (
+                "the configuration's creator may not s3:ReplicateDelete there",
+                "DstDelObjNotPermitted",
+            ),
+            (
+                "the remote bucket is recorded for another account",
+                "DstPutObjectNotPermitted",
+            ),
+        ] {
+            assert_eq!(failure_reason(why), reason, "{why}");
+        }
+        // Another service's words are not read for a reason.
+        for why in [
+            "versioning is not enabled",
+            "the bucket does not exist",
+            "tried",
+        ] {
+            assert_eq!(
+                failure_reason(&format!("{REMOTE_REFUSED}{why}")),
+                "DstPutObjectNotPermitted"
+            );
+        }
+    }
+
+    #[test]
     fn a_delete_marker_is_made_sent_or_dropped_as_its_rule_and_destination_allow() {
         use truthdb_object::{ReplicationDestination, ReplicationRule, VersionSel};
         let path = std::env::temp_dir().join(format!(
@@ -1808,7 +1923,7 @@ mod tests {
             let mut file = ObjFile::new(&mut lock);
             file.release_lease(job.body.unwrap());
             file.transaction(|tx| {
-                tx.finish_replication(&job.queued, None)?;
+                tx.finish_replication(&job.queued, None, None, 1)?;
                 tx.drop_remote_bucket("far")?;
                 tx.create_remote_bucket(&RemoteBucket {
                     name: "far".into(),
