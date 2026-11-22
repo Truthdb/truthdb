@@ -86,6 +86,9 @@ pub(crate) struct Call {
     sub: Option<&'static str>,
     /// A copy's source object (its bucket and key).
     source: Option<(String, String)>,
+    /// Signed for S3 Express (a directory bucket's): its event source is
+    /// `s3express.amazonaws.com`, as AWS's directory bucket events show.
+    express: bool,
     host: Option<String>,
     user_agent: Option<String>,
     source_ip: Option<String>,
@@ -99,7 +102,8 @@ impl Call {
             .extensions()
             .get::<crate::website::WebsiteHost>()
             .is_some()
-            || crate::server::request_service(request).is_some_and(|service| service != "s3")
+            || crate::server::request_service(request)
+                .is_some_and(|service| service != "s3" && service != "s3express")
             || crate::api::subresource_count(request) > 1
         {
             return None;
@@ -119,7 +123,16 @@ impl Call {
             return None;
         } else {
             match crate::api::target(request).ok()? {
-                Target::Service if *method == Method::GET => ("ListBuckets", None),
+                Target::Service if *method == Method::GET => {
+                    let express =
+                        crate::server::request_service(request).as_deref() == Some("s3express");
+                    let name = if express {
+                        "ListDirectoryBuckets"
+                    } else {
+                        "ListBuckets"
+                    };
+                    (name, None)
+                }
                 Target::Bucket(bucket) => (bucket_event(request, method)?, Some(bucket)),
                 _ => return None,
             }
@@ -134,7 +147,8 @@ impl Call {
             .extensions()
             .get::<crate::website::WebsiteHost>()
             .is_some()
-            || crate::server::request_service(request).is_some_and(|service| service != "s3")
+            || crate::server::request_service(request)
+                .is_some_and(|service| service != "s3" && service != "s3express")
             || crate::api::subresource_count(request) > 1
             || crate::api::control_route(request).is_some()
         {
@@ -175,6 +189,7 @@ impl Call {
             data,
             sub: subresource(request),
             source: None,
+            express: crate::server::request_service(request).as_deref() == Some("s3express"),
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
@@ -425,7 +440,11 @@ fn record(
         "eventVersion": "1.11",
         "userIdentity": identity,
         "eventTime": format!("{}Z", &iso[..19]),
-        "eventSource": "s3.amazonaws.com",
+        "eventSource": if call.express {
+            "s3express.amazonaws.com"
+        } else {
+            "s3.amazonaws.com"
+        },
         "eventName": call.name,
         "awsRegion": state.region,
         "sourceIPAddress": call.source_ip.as_deref().unwrap_or("-"),

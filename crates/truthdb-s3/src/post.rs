@@ -586,6 +586,13 @@ pub async fn post_object(
             }),
         );
     }
+    // AWS lists no PostObject for directory buckets (and a form carries
+    // what one does not support: tags, a customer key).
+    if authz.zone(&bucket).is_some() {
+        return Err(S3Error::not_implemented(
+            "PostObject is not supported for directory buckets",
+        ));
+    }
     // It makes an object, with no condition (a form has none): a policy
     // requiring conditional writes denies it, as for a PutObject.
     authz

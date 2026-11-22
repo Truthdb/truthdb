@@ -111,10 +111,10 @@ pub(crate) fn check_create(request: &Request<Incoming>) -> Result<(), S3Error> {
 
 /// Refuses a request on a directory bucket that S3 does not support for
 /// one: an operation, a header, a version id but `null`, a listing's
-/// delimiter but `/`, a prefix not ending in it, or a start-after. Its
-/// storage class may only be EXPRESS_ONEZONE, which every version and
-/// upload of the bucket is (the header is then dropped: the object layer
-/// gives the class).
+/// delimiter but `/`, a prefix not ending in it, a start-after, or an
+/// upload-id-marker. Its storage class may only be EXPRESS_ONEZONE, which
+/// every version and upload of the bucket is (the header is then dropped:
+/// the object layer gives the class).
 pub(crate) fn check(request: &mut Request<Incoming>, target: &Target) -> Result<(), S3Error> {
     let method = request.method().clone();
     let params = crate::listing::query_params(request.uri().query().unwrap_or(""));
@@ -153,7 +153,9 @@ pub(crate) fn check(request: &mut Request<Incoming>, target: &Target) -> Result<
     if param("versionId").is_some_and(|version| version != "null") {
         return Err(invalid("A directory bucket's only version id is null"));
     }
-    if matches!(target, Target::Bucket(_)) && method == Method::GET && sub.is_none() {
+    // ListObjectsV2's and ListMultipartUploads'.
+    let listing = matches!(sub, None | Some("uploads"));
+    if matches!(target, Target::Bucket(_)) && method == Method::GET && listing {
         if param("delimiter").is_some_and(|delimiter| delimiter != "/") {
             return Err(invalid("A directory bucket's only delimiter is /"));
         }
@@ -162,6 +164,9 @@ pub(crate) fn check(request: &mut Request<Incoming>, target: &Target) -> Result<
         }
         if param("start-after").is_some() {
             return Err(not_supported("start-after"));
+        }
+        if param("upload-id-marker").is_some() {
+            return Err(not_supported("upload-id-marker"));
         }
     }
     let class = crate::objects::header(request.headers(), crate::objects::STORAGE_CLASS_HEADER);

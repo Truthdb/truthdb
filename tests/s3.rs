@@ -17782,7 +17782,7 @@ fn directory_buckets_are_made_listed_and_limited_as_s3_express_has_them() {
 }
 
 const DIRECTORY_BUCKETS_SCRIPT: &str = r#"
-import sys, json
+import sys, json, time, urllib.request, urllib.error
 import boto3, botocore.config, botocore.exceptions
 port, account, key, secret, reader_key, reader_secret = sys.argv[1:7]
 def client(access, secret_key, express):
@@ -17853,6 +17853,10 @@ refused(lambda: d.list_objects_v2(Bucket=B, Delimiter="-"), "InvalidArgument")
 refused(lambda: d.list_objects_v2(Bucket=B, Prefix="di"), "InvalidArgument")
 refused(lambda: d.list_objects_v2(Bucket=B, StartAfter="dir/a"), "NotImplemented")
 refused(lambda: d.list_objects(Bucket=B), "NotImplemented")
+refused(lambda: d.list_multipart_uploads(Bucket=B, Delimiter="-"), "InvalidArgument")
+refused(lambda: d.list_multipart_uploads(Bucket=B, Prefix="di"), "InvalidArgument")
+refused(lambda: d.list_multipart_uploads(Bucket=B, KeyMarker="dir/a", UploadIdMarker="1"), "NotImplemented")
+assert d.list_multipart_uploads(Bucket=B, Prefix="dir/", Delimiter="/").get("Uploads", []) == []
 refused(lambda: d.list_object_versions(Bucket=B), "NotImplemented")
 refused(lambda: d.put_bucket_versioning(Bucket=B, VersioningConfiguration={"Status": "Enabled"}), "NotImplemented")
 refused(lambda: d.get_bucket_acl(Bucket=B), "NotImplemented")
@@ -17863,6 +17867,18 @@ refused(lambda: d.put_bucket_lifecycle_configuration(Bucket=B, LifecycleConfigur
 d.put_bucket_lifecycle_configuration(Bucket=B, LifecycleConfiguration={"Rules": [
     {"ID": "e", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 1}}]})
 assert d.get_object_attributes(Bucket=B, Key="dir/a", ObjectAttributes=["StorageClass"])["StorageClass"] == "EXPRESS_ONEZONE"
+# No form uploads (PostObject).
+form = d.generate_presigned_post(B, "dir/form")
+boundary = "boundary"
+parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+    for name, value in form["fields"].items()]
+parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="f"\r\n\r\nform\r\n--{boundary}--\r\n')
+try:
+    urllib.request.urlopen(urllib.request.Request(form["url"], data="".join(parts).encode(),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+    raise SystemExit("a form upload was taken")
+except urllib.error.HTTPError as error:
+    assert error.code == 501 and b"NotImplemented" in error.read(), error.code
 # Multipart: its parts numbered 1, 2, ... only.
 part = b"p" * (5 * 1024 * 1024)
 def upload(numbers):
@@ -17880,6 +17896,13 @@ assert d.head_object(Bucket=B, Key="dir/big")["StorageClass"] == "EXPRESS_ONEZON
 # Copies both ways: into it EXPRESS_ONEZONE, out of it the request's class.
 s3.put_object(Bucket="general", Key="g", Body=b"general")
 d.copy_object(Bucket=B, Key="dir/copied", CopySource={"Bucket": "general", "Key": "g"})
+# A copy that would give it tags (the source's, by default) is refused.
+s3.put_object(Bucket="general", Key="tagged", Body=b"t", Tagging="a=b")
+refused(lambda: d.copy_object(Bucket=B, Key="dir/t", CopySource={"Bucket": "general", "Key": "tagged"}),
+    "NotImplemented")
+d.copy_object(Bucket=B, Key="dir/t", CopySource={"Bucket": "general", "Key": "tagged"},
+    TaggingDirective="REPLACE")
+d.delete_object(Bucket=B, Key="dir/t")
 assert d.head_object(Bucket=B, Key="dir/copied")["StorageClass"] == "EXPRESS_ONEZONE"
 s3.copy_object(Bucket="general", Key="back", CopySource={"Bucket": B, "Key": "dir/a"})
 assert "StorageClass" not in s3.head_object(Bucket="general", Key="back")
@@ -17905,5 +17928,22 @@ for k in ["dir/a", "dir/big"]:
     d.delete_object(Bucket=B, Key=k)
 d.delete_bucket(Bucket=B)
 assert [b["Name"] for b in d.list_directory_buckets()["Buckets"]] == ["more--use1-az4--x-s3"]
+# Recorded in CloudTrail, as S3 Express's (signed for it), whatever the
+# bucket: no signing service keeps a request out of the trail.
+trail = boto3.client("cloudtrail", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret)
+deadline = time.time() + 30
+while True:
+    events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateBucket"}])["Events"]
+    made = [e for e in events if json.loads(e["CloudTrailEvent"])["requestParameters"].get("bucketName") == B]
+    listed = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "ListDirectoryBuckets"}])["Events"]
+    if made and listed:
+        break
+    assert time.time() < deadline, events
+    time.sleep(0.5)
+assert json.loads(made[0]["CloudTrailEvent"])["eventSource"] == "s3express.amazonaws.com", made
+assert made[0]["EventSource"] == "s3express.amazonaws.com", made
+general = [e for e in events if json.loads(e["CloudTrailEvent"])["requestParameters"].get("bucketName") == "general"]
+assert general and general[0]["EventSource"] == "s3.amazonaws.com", events
 print("ok")
 "#;
