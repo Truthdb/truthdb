@@ -18153,6 +18153,10 @@ refused(lambda: ro.delete_bucket_policy(Bucket=B), "AccessDenied")
 refused(lambda: ro.delete_bucket(Bucket=B), "AccessDenied")
 # Nor does a ReadWrite one make a session.
 refused(lambda: with_session(rw, rw["SessionToken"]).create_session(Bucket=B), "AccessDenied")
+# Nor does any session make a bucket (CreateBucket is Regional).
+refused(lambda: with_session(rw, rw["SessionToken"]).create_bucket(Bucket=B, CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}}), "AccessDenied")
 # A session is its bucket's, not its name's: deleted, and made again by
 # another account, the bucket is not the session's.
 GONE = "gone--use1-az4--x-s3"

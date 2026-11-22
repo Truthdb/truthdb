@@ -857,6 +857,13 @@ async fn route(
         {
             crate::directory::check_create(&request)?;
             let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
+            // A Regional operation, signed with an access key: no session
+            // makes a bucket (nor one again after its own was deleted).
+            if auth.session.is_some() {
+                return Err(S3Error::access_denied(
+                    "CreateBucket is signed with an access key, not a session",
+                ));
+            }
             let arn = crate::directory::arn(&state.region, &principal.account, &bucket);
             authz.check_arn("s3express:CreateBucket", &arn, &principal.account)?;
             create_bucket(state, request, auth, bucket, false).await

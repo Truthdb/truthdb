@@ -55,9 +55,8 @@ pub struct Authz {
 }
 
 /// The changes of a bucket (not its objects') a ReadOnly session may not
-/// make.
-const BUCKET_WRITES: [&str; 8] = [
-    "s3:CreateBucket",
+/// make (CreateBucket no session makes).
+const BUCKET_WRITES: [&str; 7] = [
     "s3:DeleteBucket",
     "s3:PutBucketPolicy",
     "s3:DeleteBucketPolicy",
@@ -559,13 +558,15 @@ impl Authz {
             return self.decide(action, &arn, Some(owner), policy, context);
         }
         // A session of this bucket allows what its mode does: S3 Express
-        // authorizes its requests at CreateSession.
-        // The very bucket it was made for: of its name, owner and creation.
+        // authorizes its requests at CreateSession. Only the very bucket it
+        // was made for (its name, owner and creation): one made again since
+        // is refused it outright.
         if let Some(scope) = &self.session
             && scope.bucket == bucket
-            && scope.owner == owner
-            && grant.created_ms == Some(scope.created_ms)
         {
+            if scope.owner != owner || grant.created_ms != Some(scope.created_ms) {
+                return Err(S3Error::access_denied("Access Denied"));
+            }
             return match !scope.read_only || READS.contains(&action) {
                 true => Ok(()),
                 false => Err(S3Error::access_denied("Access Denied")),

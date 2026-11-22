@@ -25,9 +25,11 @@ pub const TOKEN_HEADER: &str = "x-amz-s3session-token";
 /// are scoped to the bucket and expire after 5 minutes."
 pub const LIFETIME_MS: u64 = 5 * 60 * 1000;
 
-/// The sessions kept at most: past it, and with none expired to drop,
-/// CreateSession is refused (503 SlowDown) until some expire.
+/// The sessions kept at most, in all and of one account: past either, and
+/// with none expired to drop, CreateSession is refused (503 SlowDown) until
+/// some expire. One account cannot take every other's.
 const MAX_SESSIONS: usize = 100_000;
+const MAX_PER_ACCOUNT: usize = 10_000;
 
 /// What a session is good for: its bucket (by name, owner and creation, so
 /// a bucket of its name made since is not it), and whether only reads.
@@ -51,7 +53,33 @@ pub struct Session {
 
 /// The sessions not yet expired, by access key id.
 #[derive(Default)]
-pub struct Sessions(Mutex<HashMap<String, Session>>);
+pub struct Sessions(Mutex<Kept>);
+
+/// The sessions, and how many each account has.
+#[derive(Default)]
+struct Kept {
+    by_id: HashMap<String, Session>,
+    of_account: HashMap<String, usize>,
+}
+
+impl Kept {
+    /// Keeps the sessions `keep` takes, and counts them again.
+    fn retain(&mut self, keep: impl Fn(&Session) -> bool) {
+        self.by_id.retain(|_, session| keep(session));
+        self.of_account.clear();
+        for session in self.by_id.values() {
+            *self
+                .of_account
+                .entry(session.principal.account.clone())
+                .or_default() += 1;
+        }
+    }
+
+    fn full(&self, account: &str) -> bool {
+        self.by_id.len() >= MAX_SESSIONS
+            || self.of_account.get(account).copied().unwrap_or(0) >= MAX_PER_ACCOUNT
+    }
+}
 
 fn random(bytes: usize) -> Vec<u8> {
     let mut out = vec![0; bytes];
@@ -71,8 +99,8 @@ pub enum Refused {
 
 impl Sessions {
     /// A new session of `scope` for `principal`, until five minutes after
-    /// `now_ms`; none while [`MAX_SESSIONS`] are kept (the expired ones are
-    /// dropped first).
+    /// `now_ms`; none while [`MAX_SESSIONS`] are kept, or [`MAX_PER_ACCOUNT`]
+    /// of its account's (the expired ones are dropped first).
     pub fn create(
         &self,
         scope: Scope,
@@ -92,15 +120,17 @@ impl Sessions {
             principal: principal.clone(),
             expires_ms: now_ms + LIFETIME_MS,
         };
-        let mut sessions = self.0.lock().expect("sessions poisoned");
-        if sessions.len() >= MAX_SESSIONS {
-            sessions.retain(|_, kept| kept.expires_ms > now_ms);
-            if sessions.len() >= MAX_SESSIONS {
+        let account = principal.account.clone();
+        let mut kept = self.0.lock().expect("sessions poisoned");
+        if kept.full(&account) {
+            kept.retain(|session| session.expires_ms > now_ms);
+            if kept.full(&account) {
                 return None;
             }
         }
         let id = format!("TDBS{id}");
-        sessions.insert(id.clone(), session.clone());
+        kept.by_id.insert(id.clone(), session.clone());
+        *kept.of_account.entry(account).or_default() += 1;
         Some((id, session))
     }
 
@@ -110,14 +140,14 @@ impl Sessions {
         self.0
             .lock()
             .expect("sessions poisoned")
-            .retain(|_, kept| kept.scope.bucket != bucket);
+            .retain(|session| session.scope.bucket != bucket);
     }
 
     /// The session of access key `id`, if `token` is its token and it has
     /// not expired at `now_ms`.
     pub fn verify(&self, id: &str, token: &str, now_ms: u64) -> Result<Session, Refused> {
-        let sessions = self.0.lock().expect("sessions poisoned");
-        let session = sessions.get(id).ok_or(Refused::Unknown)?;
+        let kept = self.0.lock().expect("sessions poisoned");
+        let session = kept.by_id.get(id).ok_or(Refused::Unknown)?;
         // Compared in constant time (as tags of one key).
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, id.as_bytes());
         let kept = ring::hmac::sign(&key, session.token.as_bytes());
@@ -265,17 +295,40 @@ mod tests {
                 .unwrap_err(),
             Refused::Expired
         );
-        // At most MAX_SESSIONS: the expired ones go to make room, and while
-        // none has expired no more are made.
-        while sessions.0.lock().unwrap().len() < MAX_SESSIONS {
+        // At most MAX_PER_ACCOUNT of an account's: the expired ones go to
+        // make room, and while none has expired no more are made; another
+        // account's are made still.
+        let count = |sessions: &Sessions| sessions.0.lock().unwrap().by_id.len();
+        while count(&sessions) < MAX_PER_ACCOUNT {
             sessions.create(scope.clone(), &principal, 1_000).unwrap();
         }
         let later = 1_000 + LIFETIME_MS;
         assert!(sessions.create(scope.clone(), &principal, later).is_some());
-        assert_eq!(sessions.0.lock().unwrap().len(), 1);
-        while sessions.0.lock().unwrap().len() < MAX_SESSIONS {
+        assert_eq!(count(&sessions), 1);
+        while count(&sessions) < MAX_PER_ACCOUNT {
             sessions.create(scope.clone(), &principal, later).unwrap();
         }
-        assert!(sessions.create(scope, &principal, later).is_none());
+        assert!(sessions.create(scope.clone(), &principal, later).is_none());
+        // At most MAX_SESSIONS in all.
+        let mut accounts = 0;
+        while count(&sessions) < MAX_SESSIONS {
+            let other = Principal {
+                account: format!("{accounts:012}"),
+                ..principal.clone()
+            };
+            for _ in 0..MAX_PER_ACCOUNT.min(MAX_SESSIONS - count(&sessions)) {
+                sessions.create(scope.clone(), &other, later).unwrap();
+            }
+            accounts += 1;
+        }
+        let newcomer = Principal {
+            account: "999999999999".into(),
+            ..principal.clone()
+        };
+        assert!(sessions.create(scope.clone(), &newcomer, later).is_none());
+        // A deleted bucket's sessions go, and their counts with them.
+        sessions.forget_bucket("b--use1-az4--x-s3");
+        assert_eq!(count(&sessions), 0);
+        assert!(sessions.create(scope, &principal, later).is_some());
     }
 }
