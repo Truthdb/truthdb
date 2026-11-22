@@ -79,9 +79,9 @@ fn kind_of(row: &VersionRow, head: bool) -> (UsageKind, u8) {
     if row.flags & FLAG_DELETE_MARKER != 0 {
         (UsageKind::DeleteMarkers, 0)
     } else if head {
-        (UsageKind::Current, row.flags >> CLASS_SHIFT & 7)
+        (UsageKind::Current, row.flags >> CLASS_SHIFT & 15)
     } else {
-        (UsageKind::Noncurrent, row.flags >> CLASS_SHIFT & 7)
+        (UsageKind::Noncurrent, row.flags >> CLASS_SHIFT & 15)
     }
 }
 

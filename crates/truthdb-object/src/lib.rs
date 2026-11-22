@@ -57,7 +57,7 @@ use truthdb_core::wal::records::RelRecord;
 pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_account_id};
 pub use activity::{ACTIVITY_KEEP_MS, ActivityEvent, MAX_ACTIVITY_RECORD};
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
-pub use buckets::{BucketError, BucketInfo, Versioning};
+pub use buckets::{BucketError, BucketInfo, Versioning, validate_directory_bucket_name};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
 pub use credentials::AccessKey;
 pub use documents::{

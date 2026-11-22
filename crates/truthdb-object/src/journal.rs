@@ -110,7 +110,7 @@ const FLAG_NULL_VERSION: u8 = 1;
 const FLAG_MARKER: u8 = 2;
 /// A version removed for good: no marker flag, no object columns.
 const FLAG_PERMANENT: u8 = 4;
-/// Bits 3-5: the version's storage class (STANDARD, 0, in rows from before).
+/// Bits 3-6: the version's storage class (STANDARD, 0, in rows from before).
 const CLASS_SHIFT: u8 = 3;
 
 fn corrupt() -> StorageError {

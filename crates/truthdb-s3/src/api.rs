@@ -519,7 +519,7 @@ fn versioned(
 #[allow(clippy::too_many_arguments)]
 async fn route(
     state: &S3State,
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     auth: Authenticated,
     authz: &Authz,
     principal: Option<&Principal>,
@@ -563,6 +563,13 @@ async fn route(
         .get::<crate::server::Connection>()
         .is_some_and(|connection| connection.tls);
     crate::ssec::check_transport(crate::ssec::any_in(request.headers()), tls)?;
+    // A directory bucket supports only some operations, headers and
+    // parameters.
+    if let Target::Bucket(bucket) | Target::Object(bucket, _) = &target
+        && authz.zone(bucket).is_some()
+    {
+        crate::directory::check(&mut request, &target)?;
+    }
     match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
             Err(S3Error::not_implemented(format!(
@@ -575,6 +582,13 @@ async fn route(
         (Target::Bucket(_), _) if has_param(&request, "tagging") => Err(S3Error::not_implemented(
             "bucket tagging is not implemented",
         )),
+        // ListDirectoryBuckets is the same request, signed for S3 Express.
+        (Target::Service, Method::GET) if auth.express => {
+            let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
+            authz.check_arn("s3express:ListAllMyDirectoryBuckets", "*", &principal.account)?;
+            let query = request.uri().query().unwrap_or("").to_string();
+            crate::directory::list_directory_buckets(state, principal, &query).await
+        }
         (Target::Service, Method::GET) => {
             authz.check("s3:ListAllMyBuckets", Service)?;
             // An anonymous caller is denied before this.
@@ -797,6 +811,16 @@ async fn route(
                 .and_then(|grant| grant.owner.clone())
                 .unwrap_or_default();
             crate::listing::list_versions(state, bucket, &owner, &query).await
+        }
+        // Only a directory bucket's name has its suffix.
+        (Target::Bucket(bucket), Method::PUT)
+            if plain_write(&request, &[]) && bucket.ends_with(crate::directory::SUFFIX) =>
+        {
+            crate::directory::check_create(&request)?;
+            let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
+            let arn = crate::directory::arn(&state.region, &principal.account, &bucket);
+            authz.check_arn("s3express:CreateBucket", &arn, &principal.account)?;
+            create_bucket(state, request, auth, bucket, false).await
         }
         (Target::Bucket(bucket), Method::PUT) if plain_write(&request, &[]) => {
             authz.check("s3:CreateBucket", Bucket(&bucket))?;
@@ -1103,7 +1127,8 @@ async fn list_buckets(state: &S3State, principal: &Principal) -> Result<Response
     let buckets = object(state, |file| file.list_buckets()).await?;
     let entries: String = buckets
         .iter()
-        .filter(|bucket| bucket.owner == principal.account)
+        // General purpose buckets only: ListDirectoryBuckets lists the others.
+        .filter(|bucket| bucket.owner == principal.account && bucket.zone.is_none())
         .map(
             |BucketInfo {
                  name, created_ms, ..
@@ -1139,7 +1164,44 @@ async fn create_bucket(
         .map(|principal| principal.account.clone())
         .ok_or_else(|| S3Error::access_denied("Access Denied"))?;
     let body = read_body(request, auth, 64 * 1024).await?;
-    if let Some(constraint) = location_constraint(&body)?
+    // A directory bucket: a name of its form and a configuration of its
+    // type, in the zone its name names.
+    let directory = bucket.ends_with(crate::directory::SUFFIX);
+    // A general purpose bucket's body is read as before (only a well-formed
+    // directory configuration counts).
+    let asked = match crate::directory::zone_asked(&body) {
+        Ok(asked) => asked,
+        Err(err) if directory => return Err(err),
+        Err(_) => None,
+    };
+    match (asked, directory) {
+        (Some(asked), true) => {
+            if let Ok(named) = truthdb_object::validate_directory_bucket_name(&bucket)
+                && named != asked
+            {
+                return Err(S3Error::invalid_request(
+                    "The Location Name is the zone id the bucket's name ends with",
+                ));
+            }
+        }
+        (None, true) => {
+            return Err(bucket_error(
+                BucketError::InvalidName(
+                    "the --x-s3 suffix is a directory bucket's, made with its configuration",
+                ),
+                &bucket,
+            ));
+        }
+        (Some(_), false) => {
+            return Err(bucket_error(
+                BucketError::InvalidName("a directory bucket's name ends with --<zone-id>--x-s3"),
+                &bucket,
+            ));
+        }
+        (None, false) => {}
+    }
+    if !directory
+        && let Some(constraint) = location_constraint(&body)?
         && !constraint.is_empty()
         && constraint != state.region
     {
@@ -1153,6 +1215,7 @@ async fn create_bucket(
         ));
     }
     let name = bucket.clone();
+    let owner_of_bucket = owner.clone();
     let now = now_ms();
     match object(state, move |file| {
         // A name recorded as a bucket of another S3 service (`s3 create
@@ -1162,7 +1225,10 @@ async fn create_bucket(
         }
         // A new bucket blocks public access, until its owner says otherwise.
         file.transaction(|tx| {
-            let created = tx.create_bucket(&name, &owner, now)?;
+            let created = match directory {
+                true => tx.create_directory_bucket(&name, &owner, now)?,
+                false => tx.create_bucket(&name, &owner, now)?,
+            };
             if created.is_ok() {
                 tx.put_bucket_config(
                     &name,
@@ -1190,11 +1256,16 @@ async fn create_bucket(
         Err(BucketError::AlreadyOwnedByYou) if state.region == "us-east-1" => {}
         Err(err) => return Err(bucket_error(err, &bucket)),
     }
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header("location", format!("/{bucket}"))
-        .body(full(Bytes::new()))
-        .expect("a valid response"))
+        .header("location", format!("/{bucket}"));
+    if directory {
+        builder = builder.header(
+            "x-amz-bucket-arn",
+            crate::directory::arn(&state.region, &owner_of_bucket, &bucket),
+        );
+    }
+    Ok(builder.body(full(Bytes::new())).expect("a valid response"))
 }
 
 async fn delete_bucket(state: &S3State, bucket: String) -> Result<Response<Body>, S3Error> {
@@ -1213,11 +1284,21 @@ async fn delete_bucket(state: &S3State, bucket: String) -> Result<Response<Body>
 async fn head_bucket(state: &S3State, bucket: String) -> Result<Response<Body>, S3Error> {
     let name = bucket.clone();
     match object(state, move |file| file.bucket(&name)).await? {
-        Some(_) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("x-amz-bucket-region", &state.region)
-            .body(full(Bytes::new()))
-            .expect("a valid response")),
+        Some(info) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("x-amz-bucket-region", &state.region);
+            if let Some(zone) = &info.zone {
+                builder = crate::directory::head_headers(
+                    builder,
+                    &state.region,
+                    &info.owner,
+                    &bucket,
+                    zone,
+                );
+            }
+            Ok(builder.body(full(Bytes::new())).expect("a valid response"))
+        }
         // HEAD carries no body: just the status.
         None => Ok(empty(StatusCode::NOT_FOUND)),
     }

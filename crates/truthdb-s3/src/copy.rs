@@ -290,6 +290,17 @@ async fn copy_whole(
         } else {
             source.attrs.tags.clone()
         };
+        // A directory bucket keeps no tags: a copy that would give it some
+        // (the source's, by default) is not implemented, as at S3.
+        if !attrs.tags.is_empty()
+            && file
+                .bucket(&dst_bucket)?
+                .is_some_and(|info| info.zone.is_some())
+        {
+            return Ok(Err(S3Error::not_implemented(
+                "Tags are not supported for directory buckets",
+            )));
+        }
         let source_version = version_header(
             versioning_of(file, &src_bucket)?,
             source.version,

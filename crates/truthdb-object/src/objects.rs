@@ -201,8 +201,8 @@ pub fn version_id(version: u64, null_version: bool) -> String {
     }
 }
 
-/// An object version's S3 storage class (those of general-purpose buckets).
-/// It is kept with the version; a cold class's body is stored compressed
+/// An object version's S3 storage class: those of general-purpose buckets,
+/// and EXPRESS_ONEZONE, a directory bucket's. It is kept with the version; a cold class's body is stored compressed
 /// (see [`StorageClass::pack_level`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StorageClass {
@@ -215,10 +215,12 @@ pub enum StorageClass {
     Glacier,
     DeepArchive,
     GlacierIr,
+    /// A directory bucket's (and only its).
+    ExpressOnezone,
 }
 
 impl StorageClass {
-    const ALL: [StorageClass; 8] = [
+    const ALL: [StorageClass; 9] = [
         StorageClass::Standard,
         StorageClass::ReducedRedundancy,
         StorageClass::StandardIa,
@@ -227,6 +229,7 @@ impl StorageClass {
         StorageClass::Glacier,
         StorageClass::DeepArchive,
         StorageClass::GlacierIr,
+        StorageClass::ExpressOnezone,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -239,22 +242,31 @@ impl StorageClass {
             StorageClass::Glacier => "GLACIER",
             StorageClass::DeepArchive => "DEEP_ARCHIVE",
             StorageClass::GlacierIr => "GLACIER_IR",
+            StorageClass::ExpressOnezone => "EXPRESS_ONEZONE",
         }
     }
 
-    /// The class S3 names `name`, if it is one of these.
+    /// The general purpose bucket class S3 names `name`, if it is one of
+    /// these (not EXPRESS_ONEZONE, a directory bucket's).
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|class| class.as_str() == name)
+        Self::ALL
+            .into_iter()
+            .filter(|class| *class != StorageClass::ExpressOnezone)
+            .find(|class| class.as_str() == name)
     }
 
-    /// Its three bits in a row's flags (STANDARD is 0, so rows written before
-    /// classes read as STANDARD).
+    /// Its four bits in a row's flags (STANDARD is 0, so rows written before
+    /// classes read as STANDARD; EXPRESS_ONEZONE, 8, is the only one with
+    /// the fourth).
     pub(crate) fn code(self) -> u8 {
         Self::ALL.iter().position(|class| *class == self).unwrap() as u8
     }
 
     pub(crate) fn from_code(code: u8) -> Self {
-        Self::ALL[(code & 7) as usize]
+        Self::ALL
+            .get((code & 15) as usize)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -372,7 +384,7 @@ pub(crate) fn version_from_key(row_key: &[u8]) -> Result<u64, StorageError> {
 pub(crate) const FLAG_DELETE_MARKER: u8 = 1;
 const FLAG_NULL_VERSION: u8 = 2;
 const FLAG_HAS_ATTRS: u8 = 4;
-/// Bits 3-5: the version's storage class (see [`StorageClass::code`]).
+/// Bits 3-6: the version's storage class (see [`StorageClass::code`]).
 pub(crate) const CLASS_SHIFT: u8 = 3;
 
 fn class_of(flags: u8) -> StorageClass {
@@ -686,12 +698,19 @@ impl ObjTxn<'_, '_> {
         bucket: &str,
         key: &str,
         versioning: Versioning,
-        new: NewVersion,
+        mut new: NewVersion,
         attrs: &ObjectAttrs,
         given: Option<(u64, u64)>,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<ObjectInfo, StorageError> {
+        // A directory bucket's objects are EXPRESS_ONEZONE, however written.
+        if self
+            .bucket_row(bucket)?
+            .is_some_and(|row| row.zone.is_some())
+        {
+            new.storage_class = StorageClass::ExpressOnezone;
+        }
         let null_version = versioning != Versioning::Enabled;
         if null_version {
             // Replaced in place: the journal records the new version only.
@@ -896,7 +915,7 @@ impl ObjTxn<'_, '_> {
             return Ok(Err(ObjectError::NoSuchVersion));
         }
         let from = class_of(row.flags);
-        row.flags = row.flags & !(7 << CLASS_SHIFT) | class.code() << CLASS_SHIFT;
+        row.flags = row.flags & !(15 << CLASS_SHIFT) | class.code() << CLASS_SHIFT;
         objects.update(
             self.ctx,
             &mut OpMode::Txn(self.txn),

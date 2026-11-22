@@ -1707,6 +1707,7 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
                 journal_from: 0,
                 owner: DEFAULT_ACCOUNT.to_string(),
                 object_lock: false,
+                zone: None,
             };
             tx.trees
                 .buckets()
@@ -1778,6 +1779,7 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
                 journal_from: 0,
                 owner: DEFAULT_ACCOUNT.to_string(),
                 object_lock: false,
+                zone: None,
             };
             tx.trees
                 .buckets()
@@ -3113,6 +3115,7 @@ fn a_bucket_row_has_its_object_lock_byte_only_when_enabled() {
         journal_from: 2,
         owner: DEFAULT_ACCOUNT.to_string(),
         object_lock: false,
+        zone: None,
     };
     assert_eq!(row.encode().len(), 29, "readable by earlier releases");
     assert!(!BucketRow::decode(&row.encode()).unwrap().object_lock);
@@ -3121,6 +3124,20 @@ fn a_bucket_row_has_its_object_lock_byte_only_when_enabled() {
     assert!(BucketRow::decode(&row.encode()).unwrap().object_lock);
     let mut bad = row.encode();
     bad[29] = 2;
+    assert!(BucketRow::decode(&bad).is_err());
+    // A directory bucket's: 2, then its zone (and never Object Lock).
+    row.object_lock = false;
+    row.zone = Some("use1-az4".to_string());
+    let bytes = row.encode();
+    assert_eq!((bytes.len(), bytes[29]), (38, 2));
+    assert_eq!(
+        BucketRow::decode(&bytes).unwrap().zone.as_deref(),
+        Some("use1-az4")
+    );
+    let mut bad = bytes.clone();
+    bad[29] = 1;
+    assert!(BucketRow::decode(&bad).is_err());
+    bad[29] = 3;
     assert!(BucketRow::decode(&bad).is_err());
 }
 
@@ -8035,6 +8052,93 @@ fn a_version_replicated_to_several_destinations_is_completed_once_all_are_made()
         })
         .unwrap();
     assert_eq!(status("old", 999), Some(ReplicationStatus::Completed));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_directory_bucket_keeps_its_zone_and_its_objects_their_express_class() {
+    use crate::{BucketError, StorageClass, VersionSel, Versioning};
+    let path = temp_path("directory");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_directory_bucket("data--use1-az4--x-s3", DEFAULT_ACCOUNT, now())
+        })
+        .unwrap()
+        .unwrap();
+    let info = ObjFile::new(&mut storage.lock())
+        .bucket("data--use1-az4--x-s3")
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.zone.as_deref(), Some("use1-az4"));
+    // Neither versioning nor (as it needs versioning) Object Lock: its row
+    // holds neither.
+    let refused = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            Ok((
+                tx.set_versioning("data--use1-az4--x-s3", Versioning::Enabled)?,
+                tx.enable_object_lock("data--use1-az4--x-s3")?,
+            ))
+        })
+        .unwrap();
+    assert!(matches!(
+        refused,
+        (
+            Err(BucketError::InvalidBucketState(_)),
+            Err(BucketError::InvalidBucketState(_))
+        )
+    ));
+    // A general purpose bucket's name rules refuse it.
+    let general = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("other--use1-az4--x-s3", DEFAULT_ACCOUNT, now()))
+        .unwrap();
+    assert!(matches!(general, Err(BucketError::InvalidName(_))));
+    // An object of the fourth class bit: kept, journaled and counted as it.
+    let put = put_classed(
+        &storage,
+        "data--use1-az4--x-s3",
+        "dir/k",
+        b"express",
+        StorageClass::ExpressOnezone,
+    );
+    let read = ObjFile::new(&mut storage.lock())
+        .head_object("data--use1-az4--x-s3", "dir/k", VersionSel::Latest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.storage_class, StorageClass::ExpressOnezone);
+    let journaled = ObjFile::new(&mut storage.lock()).journal(0, 100).unwrap();
+    assert_eq!(
+        journaled
+            .last()
+            .and_then(|record| record.object.as_ref())
+            .map(|object| object.storage_class),
+        Some(StorageClass::ExpressOnezone)
+    );
+    let usage = |storage: &Storage| {
+        ObjFile::new(&mut storage.lock())
+            .bucket_usage()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.bucket == "data--use1-az4--x-s3" && row.objects > 0)
+            .map(|row| (row.storage_class, row.objects, row.bytes))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(usage(&storage), [(StorageClass::ExpressOnezone, 1, 7)]);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.delete_object(
+                "data--use1-az4--x-s3",
+                "dir/k",
+                Some(VersionSel::Seq(put.version)),
+                false,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(usage(&storage), []);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

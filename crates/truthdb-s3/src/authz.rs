@@ -29,6 +29,8 @@ pub struct BucketGrant {
     pub policy_public: bool,
     /// The Block Public Access settings that apply (see `public_access`).
     pub public_block: u8,
+    /// A directory bucket's zone (none: a general purpose bucket's).
+    pub zone: Option<String>,
 }
 
 /// What a request is authorized against.
@@ -41,6 +43,10 @@ pub struct Authz {
     /// them), by bucket and key: `s3:ExistingObjectTag/...` of each.
     existing_tags: HashMap<(String, String), Vec<(String, String)>>,
     context: Context,
+    /// The server's region, for a directory bucket's ARN; none outside a
+    /// request (a batch job's or replication's work, which acts on no
+    /// directory bucket).
+    region: Option<String>,
 }
 
 /// The resource an operation acts on.
@@ -126,7 +132,9 @@ fn load(
     };
     let mut grants = HashMap::new();
     for bucket in buckets {
-        let owner = file.bucket(bucket)?.map(|info| info.owner);
+        let info = file.bucket(bucket)?;
+        let zone = info.as_ref().and_then(|info| info.zone.clone());
+        let owner = info.map(|info| info.owner);
         let policy = match owner {
             Some(_) => file
                 .bucket_config(bucket, BUCKET_POLICY, "")?
@@ -151,6 +159,7 @@ fn load(
                 owner,
                 policy,
                 public_block,
+                zone,
             },
         );
     }
@@ -302,6 +311,7 @@ impl Authz {
             buckets: loaded.buckets,
             existing_tags: loaded.existing_tags,
             context,
+            region: Some(state.region.clone()),
         })
     }
 
@@ -322,6 +332,7 @@ impl Authz {
             buckets: loaded.buckets,
             existing_tags: loaded.existing_tags,
             context: context(&HeaderMap::new(), "", &[], None, None, now_ms),
+            region: None,
         })
     }
 
@@ -461,7 +472,79 @@ impl Authz {
             }
             policy => policy,
         };
+        if let (Some(grant), Some(owner), Some(bucket)) = (grant, owner, bucket)
+            && grant.zone.is_some()
+        {
+            return self.check_directory(action, bucket, owner, policy, context);
+        }
         self.decide(action, &arn, owner, policy, context)
+    }
+
+    /// A directory bucket's check: its bucket operations are S3 Express's
+    /// actions on `arn:aws:s3express:<region>:<owner>:bucket/<name>`, and
+    /// its object operations are what a session allows, so
+    /// `s3express:CreateSession` of a mode that allows them (`ReadOnly`
+    /// allows the reads; `ReadWrite`, everything).
+    fn check_directory(
+        &self,
+        action: &str,
+        bucket: &str,
+        owner: &str,
+        policy: Option<&Policy>,
+        context: &Context,
+    ) -> Result<(), S3Error> {
+        let Some(region) = &self.region else {
+            return Err(S3Error::access_denied("Access Denied"));
+        };
+        let arn = format!("arn:aws:s3express:{region}:{owner}:bucket/{bucket}");
+        const BUCKET_ACTIONS: [&str; 11] = [
+            "s3:CreateBucket",
+            "s3:DeleteBucket",
+            "s3:PutBucketPolicy",
+            "s3:GetBucketPolicy",
+            "s3:DeleteBucketPolicy",
+            "s3:PutEncryptionConfiguration",
+            "s3:GetEncryptionConfiguration",
+            "s3:PutInventoryConfiguration",
+            "s3:GetInventoryConfiguration",
+            "s3:PutLifecycleConfiguration",
+            "s3:GetLifecycleConfiguration",
+        ];
+        const READS: [&str; 7] = [
+            "s3:GetObject",
+            "s3:GetObjectVersion",
+            "s3:GetObjectAttributes",
+            "s3:GetObjectVersionAttributes",
+            "s3:ListBucket",
+            "s3:ListBucketMultipartUploads",
+            "s3:ListMultipartUploadParts",
+        ];
+        if BUCKET_ACTIONS.contains(&action) {
+            let express = action.replacen("s3:", "s3express:", 1);
+            return self.decide(&express, &arn, Some(owner), policy, context);
+        }
+        let modes: &[&str] = if READS.contains(&action) {
+            &["ReadWrite", "ReadOnly"]
+        } else {
+            &["ReadWrite"]
+        };
+        let mut denied = Err(S3Error::access_denied("Access Denied"));
+        for mode in modes {
+            let mut with = context.clone();
+            with.set("s3express:SessionMode", vec![mode.to_string()]);
+            denied = self.decide("s3express:CreateSession", &arn, Some(owner), policy, &with);
+            if denied.is_ok() {
+                break;
+            }
+        }
+        denied
+    }
+
+    /// The zone of `bucket` if it is a directory bucket the request names.
+    pub fn zone(&self, bucket: &str) -> Option<&str> {
+        self.buckets
+            .get(bucket)
+            .and_then(|grant| grant.zone.as_deref())
     }
 
     /// Checks `action` on the resource `arn` of a bucket `owner` owns, which

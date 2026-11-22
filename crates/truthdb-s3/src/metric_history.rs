@@ -87,6 +87,7 @@ pub fn storage_type(class: StorageClass) -> &'static str {
         StorageClass::GlacierIr => "GlacierInstantRetrievalStorage",
         StorageClass::DeepArchive => "DeepArchiveStorage",
         StorageClass::IntelligentTiering => "IntelligentTieringFAStorage",
+        StorageClass::ExpressOnezone => "ExpressOneZoneStorage",
     }
 }
 
