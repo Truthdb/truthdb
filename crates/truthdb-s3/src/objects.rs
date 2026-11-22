@@ -508,7 +508,10 @@ pub async fn put_object(
             let stored = file.transaction(|tx| {
                 // Held again at the write, in its own transaction.
                 if let Some(condition) = &condition {
-                    let current = tx.current_etag(&bucket_name, &key_name)?.flatten();
+                    let current = match tx.current_etag(&bucket_name, &key_name)? {
+                        Ok(current) => current.flatten(),
+                        Err(err) => return Ok(Err(object_error(err, &bucket_name, &key_name))),
+                    };
                     if let Err(err) = condition.recheck(current.as_deref()) {
                         return Ok(Err(err));
                     }

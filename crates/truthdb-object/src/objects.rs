@@ -460,12 +460,20 @@ impl ObjTxn<'_, '_> {
 
     /// `key`'s current version as a conditional write or delete reads it, in
     /// this transaction: none, a delete marker (`Some(None)`), or a version
-    /// with its quoted ETag.
+    /// with its quoted ETag. A key that is not valid, or a bucket that is
+    /// not there, is said first, as every object operation says it.
+    #[allow(clippy::type_complexity)]
     pub fn current_etag(
         &mut self,
         bucket: &str,
         key: &str,
-    ) -> Result<Option<Option<String>>, StorageError> {
+    ) -> Result<Result<Option<Option<String>>, ObjectError>, StorageError> {
+        if let Err(err) = validate_key(key) {
+            return Ok(Err(err));
+        }
+        if self.bucket_row(bucket)?.is_none() {
+            return Ok(Err(ObjectError::NoSuchBucket));
+        }
         let found = find_version(
             self.ctx,
             &self.trees.objects(),
@@ -473,7 +481,7 @@ impl ObjTxn<'_, '_> {
             key,
             VersionSel::Latest,
         )?;
-        Ok(found.map(|(_, version, row)| {
+        Ok(Ok(found.map(|(_, version, row)| {
             (row.flags & FLAG_DELETE_MARKER == 0).then(|| {
                 ObjectInfo {
                     version,
@@ -489,7 +497,7 @@ impl ObjTxn<'_, '_> {
                 }
                 .etag()
             })
-        }))
+        })))
     }
 
     /// The version `which` picks, unless it is missing or a delete marker:

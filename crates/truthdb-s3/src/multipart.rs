@@ -378,7 +378,10 @@ pub async fn complete_upload(
                 // is no version, so what was written meanwhile counts. One
                 // that fails leaves the upload as it was.
                 if let Some(condition) = &condition {
-                    let current = tx.current_etag(&bucket_name, &key_name)?.flatten();
+                    let current = match tx.current_etag(&bucket_name, &key_name)? {
+                        Ok(current) => current.flatten(),
+                        Err(err) => return Ok(Err(object_error(err, &bucket_name, &key_name))),
+                    };
                     if let Err(err) = condition.check(current.as_deref()) {
                         return Ok(Err(err));
                     }

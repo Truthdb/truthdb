@@ -898,13 +898,15 @@ async fn write_generated(
         let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
             .ok()
             .flatten();
+        // It makes an object, with no condition (as a batch copy does).
         let authz = Authz::load_now(
             file,
             &creator(&job),
             vec![output.bucket.clone()],
             Vec::new(),
             now,
-        )?;
+        )?
+        .with_keys(&[("s3:ObjectCreationOperation", "true".to_string())]);
         if authz
             .check_storing(
                 "s3:PutObject",
@@ -2160,7 +2162,8 @@ async fn finish(state: &S3State, job: Job) -> Result<(), String> {
                 vec![files.bucket.clone()],
                 Vec::new(),
                 now,
-            )?;
+            )?
+            .with_keys(&[("s3:ObjectCreationOperation", "true".to_string())]);
             if files.objects.iter().any(|(key, _, _)| {
                 authz
                     .check_storing(

@@ -44,7 +44,10 @@ async fn delete_one(
     crate::scope::object_as(state, operation, move |file| {
         file.transaction(|tx| {
             if let Some(condition) = &condition {
-                let current = tx.current_etag(&bucket_name, &key_name)?;
+                let current = match tx.current_etag(&bucket_name, &key_name)? {
+                    Ok(current) => current,
+                    Err(err) => return Ok(Err(object_error(err, &bucket_name, &key_name))),
+                };
                 if let Err(err) = condition.check_delete(current.as_ref().map(Option::as_deref)) {
                     return Ok(Err(err));
                 }

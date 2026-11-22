@@ -12121,9 +12121,14 @@ assert [e["Code"] for e in result["Errors"]] == ["AccessDenied"], result
 e_tag = s3.head_object(Bucket="delenforced", Key="e")["ETag"]
 result = user.delete_objects(Bucket="delenforced", Delete={"Objects": [{"Key": "e", "ETag": e_tag}]})
 assert [d["Key"] for d in result.get("Deleted", [])] == ["e"], result
-# A conditional copy into a bucket that is not there: that is what is said.
+# A conditional copy or delete with no bucket, or an invalid key, is told
+# so, as an unconditional one is.
 refused(lambda: s3.copy_object(Bucket="nowhere", Key="k", CopySource={"Bucket": "cond", "Key": "k"},
     IfMatch=second), "NoSuchBucket", 404)
+refused(lambda: s3.copy_object(Bucket="cond", Key="x" * 1100, CopySource={"Bucket": "cond", "Key": "k"},
+    IfMatch=second), "InvalidArgument", 400)
+refused(lambda: s3.delete_object(Bucket="nowhere", Key="k", IfMatch="*"), "NoSuchBucket", 404)
+refused(lambda: s3.delete_object(Bucket="cond", Key="x" * 1100, IfMatch="*"), "InvalidArgument", 400)
 print("ok")
 "#;
 

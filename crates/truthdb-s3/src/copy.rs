@@ -309,7 +309,10 @@ async fn copy_whole(
         attrs.customer_key = source.attrs.customer_key.clone();
         let copied = file.transaction(|tx| {
             if let Some(condition) = &condition {
-                let current = tx.current_etag(&dst_bucket, &dst_key)?.flatten();
+                let current = match tx.current_etag(&dst_bucket, &dst_key)? {
+                    Ok(current) => current.flatten(),
+                    Err(err) => return Ok(Err(object_error(err, &dst_bucket, &dst_key))),
+                };
                 if let Err(err) = condition.check(current.as_deref()) {
                     return Ok(Err(err));
                 }
@@ -386,7 +389,10 @@ async fn copy_whole(
                     };
                 let stored = file.transaction(|tx| {
                     if let Some(condition) = &write_condition {
-                        let current = tx.current_etag(&dst_bucket, &dst_key)?.flatten();
+                        let current = match tx.current_etag(&dst_bucket, &dst_key)? {
+                            Ok(current) => current.flatten(),
+                            Err(err) => return Ok(Err(object_error(err, &dst_bucket, &dst_key))),
+                        };
                         if let Err(err) = condition.recheck(current.as_deref()) {
                             return Ok(Err(err));
                         }
