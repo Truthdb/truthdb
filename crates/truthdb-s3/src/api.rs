@@ -344,8 +344,8 @@ pub async fn dispatch(
         None => {}
     }
     let target = target(&request)?;
-    if let Some((session_bucket, _)) = &auth.session
-        && !matches!(&target, Target::Bucket(bucket) | Target::Object(bucket, _) if bucket == session_bucket)
+    if let Some(scope) = &auth.session
+        && !matches!(&target, Target::Bucket(bucket) | Target::Object(bucket, _) if *bucket == scope.bucket)
     {
         return Err(session_denied());
     }
@@ -406,7 +406,7 @@ pub async fn dispatch(
     )
     .await?;
     let authz = match &auth.session {
-        Some((bucket, read_only)) => authz.with_session(bucket.clone(), *read_only),
+        Some(scope) => authz.with_session(scope.clone()),
         None => authz,
     };
     // The request's bucket exists: it counts in the request metrics.
@@ -600,6 +600,13 @@ async fn route(
         // CreateSession: a directory bucket's only.
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "session") => {
             let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
+            // A session makes no session: none could outlive it, or exceed
+            // its mode.
+            if auth.session.is_some() {
+                return Err(S3Error::access_denied(
+                    "CreateSession is signed with an access key, not a session",
+                ));
+            }
             if authz.zone(&bucket).is_none() {
                 let exists = authz
                     .owners()
@@ -1307,8 +1314,9 @@ async fn delete_bucket(state: &S3State, bucket: String) -> Result<Response<Body>
     })
     .await?
     .map_err(|err| bucket_error(err, &bucket))?;
-    // Its metrics configurations went with it.
+    // Its metrics configurations went with it, and its sessions.
     state.metric_recorder.forget_bucket(&bucket);
+    state.sessions.forget_bucket(&bucket);
     state.access_logger.forget(&bucket);
     Ok(empty(StatusCode::NO_CONTENT))
 }

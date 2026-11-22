@@ -25,15 +25,27 @@ pub const TOKEN_HEADER: &str = "x-amz-s3session-token";
 /// are scoped to the bucket and expire after 5 minutes."
 pub const LIFETIME_MS: u64 = 5 * 60 * 1000;
 
-/// A session: whose it is, of which bucket, whether ReadOnly, and until
-/// when.
+/// The sessions kept at most: past it, and with none expired to drop,
+/// CreateSession is refused (503 SlowDown) until some expire.
+const MAX_SESSIONS: usize = 100_000;
+
+/// What a session is good for: its bucket (by name, owner and creation, so
+/// a bucket of its name made since is not it), and whether only reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub bucket: String,
+    pub owner: String,
+    pub created_ms: u64,
+    pub read_only: bool,
+}
+
+/// A session: whose it is, what it is good for, and until when.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub secret: String,
     pub token: String,
-    pub bucket: String,
+    pub scope: Scope,
     pub principal: Principal,
-    pub read_only: bool,
     pub expires_ms: u64,
 }
 
@@ -58,15 +70,15 @@ pub enum Refused {
 }
 
 impl Sessions {
-    /// A new session of `bucket` for `principal`, until five minutes after
-    /// `now_ms` (the expired ones are dropped).
+    /// A new session of `scope` for `principal`, until five minutes after
+    /// `now_ms`; none while [`MAX_SESSIONS`] are kept (the expired ones are
+    /// dropped first).
     pub fn create(
         &self,
-        bucket: &str,
+        scope: Scope,
         principal: &Principal,
-        read_only: bool,
         now_ms: u64,
-    ) -> (String, Session) {
+    ) -> Option<(String, Session)> {
         let base64 = base64::engine::general_purpose::STANDARD;
         // As an access key id: upper case letters and digits.
         let id: String = random(16)
@@ -76,16 +88,29 @@ impl Sessions {
         let session = Session {
             secret: base64.encode(random(30)),
             token: base64.encode(random(48)),
-            bucket: bucket.to_string(),
+            scope,
             principal: principal.clone(),
-            read_only,
             expires_ms: now_ms + LIFETIME_MS,
         };
         let mut sessions = self.0.lock().expect("sessions poisoned");
-        sessions.retain(|_, kept| kept.expires_ms > now_ms);
+        if sessions.len() >= MAX_SESSIONS {
+            sessions.retain(|_, kept| kept.expires_ms > now_ms);
+            if sessions.len() >= MAX_SESSIONS {
+                return None;
+            }
+        }
         let id = format!("TDBS{id}");
         sessions.insert(id.clone(), session.clone());
-        (id, session)
+        Some((id, session))
+    }
+
+    /// Drops the sessions of `bucket`, deleted: a bucket made again with its
+    /// name (possibly within the same millisecond) is another.
+    pub fn forget_bucket(&self, bucket: &str) {
+        self.0
+            .lock()
+            .expect("sessions poisoned")
+            .retain(|_, kept| kept.scope.bucket != bucket);
     }
 
     /// The session of access key `id`, if `token` is its token and it has
@@ -166,10 +191,19 @@ pub async fn create_session(
         }
     }
     let read_only = allowed?;
-    let (id, session) =
-        state
-            .sessions
-            .create(bucket, principal, read_only, crate::objects::now_ms());
+    let (owner, created_ms) = authz
+        .incarnation(bucket)
+        .ok_or_else(|| S3Error::internal("the bucket's owner is not known"))?;
+    let scope = Scope {
+        bucket: bucket.to_string(),
+        owner,
+        created_ms,
+        read_only,
+    };
+    let (id, session) = state
+        .sessions
+        .create(scope, principal, crate::objects::now_ms())
+        .ok_or_else(|| S3Error::new(503, "SlowDown", "Too many sessions: try again shortly"))?;
     let body = format!(
         "<CreateSessionResult xmlns=\"{XMLNS}\"><Credentials><SessionToken>{}</SessionToken><SecretAccessKey>{}</SecretAccessKey><AccessKeyId>{}</AccessKeyId><Expiration>{}</Expiration></Credentials></CreateSessionResult>",
         escape(&session.token),
@@ -198,12 +232,17 @@ mod tests {
             account: "111122223333".into(),
             user: None,
         };
-        let (id, session) = sessions.create("b--use1-az4--x-s3", &principal, true, 1_000);
+        let scope = Scope {
+            bucket: "b--use1-az4--x-s3".into(),
+            owner: "111122223333".into(),
+            created_ms: 7,
+            read_only: true,
+        };
+        let (id, session) = sessions.create(scope.clone(), &principal, 1_000).unwrap();
         assert!(id.starts_with("TDBS") && id.len() == 20, "{id}");
-        let kept = sessions.verify(&id, &session.token, 1_000).unwrap();
         assert_eq!(
-            (kept.bucket.as_str(), kept.read_only),
-            ("b--use1-az4--x-s3", true)
+            sessions.verify(&id, &session.token, 1_000).unwrap().scope,
+            scope
         );
         assert_eq!(
             sessions.verify(&id, "other", 1_000).unwrap_err(),
@@ -226,11 +265,17 @@ mod tests {
                 .unwrap_err(),
             Refused::Expired
         );
-        // Expired ones are dropped when another is made.
-        sessions.create("b--use1-az4--x-s3", &principal, false, 1_000 + LIFETIME_MS);
-        assert_eq!(
-            sessions.verify(&id, &session.token, 0).unwrap_err(),
-            Refused::Unknown
-        );
+        // At most MAX_SESSIONS: the expired ones go to make room, and while
+        // none has expired no more are made.
+        while sessions.0.lock().unwrap().len() < MAX_SESSIONS {
+            sessions.create(scope.clone(), &principal, 1_000).unwrap();
+        }
+        let later = 1_000 + LIFETIME_MS;
+        assert!(sessions.create(scope.clone(), &principal, later).is_some());
+        assert_eq!(sessions.0.lock().unwrap().len(), 1);
+        while sessions.0.lock().unwrap().len() < MAX_SESSIONS {
+            sessions.create(scope.clone(), &principal, later).unwrap();
+        }
+        assert!(sessions.create(scope, &principal, later).is_none());
     }
 }

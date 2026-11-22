@@ -31,6 +31,9 @@ pub struct BucketGrant {
     pub public_block: u8,
     /// A directory bucket's zone (none: a general purpose bucket's).
     pub zone: Option<String>,
+    /// When the bucket was created: with its owner, which bucket of its
+    /// name it is (one deleted and made again is another).
+    pub created_ms: Option<u64>,
 }
 
 /// What a request is authorized against.
@@ -47,10 +50,22 @@ pub struct Authz {
     /// request (a batch job's or replication's work, which acts on no
     /// directory bucket).
     region: Option<String>,
-    /// The session the request was signed with: its directory bucket, and
-    /// whether it is ReadOnly.
-    session: Option<(String, bool)>,
+    /// The session the request was signed with.
+    session: Option<crate::session::Scope>,
 }
+
+/// The changes of a bucket (not its objects') a ReadOnly session may not
+/// make.
+const BUCKET_WRITES: [&str; 8] = [
+    "s3:CreateBucket",
+    "s3:DeleteBucket",
+    "s3:PutBucketPolicy",
+    "s3:DeleteBucketPolicy",
+    "s3:PutEncryptionConfiguration",
+    "s3:PutInventoryConfiguration",
+    "s3:PutLifecycleConfiguration",
+    "s3express:CreateSession",
+];
 
 /// The resource an operation acts on.
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +152,7 @@ fn load(
     for bucket in buckets {
         let info = file.bucket(bucket)?;
         let zone = info.as_ref().and_then(|info| info.zone.clone());
+        let created_ms = info.as_ref().map(|info| info.created_ms);
         let owner = info.map(|info| info.owner);
         let policy = match owner {
             Some(_) => file
@@ -163,6 +179,7 @@ fn load(
                 policy,
                 public_block,
                 zone,
+                created_ms,
             },
         );
     }
@@ -414,6 +431,15 @@ impl Authz {
         resource: Resource<'_>,
         context: &Context,
     ) -> Result<(), S3Error> {
+        // A ReadOnly session changes nothing of its bucket's, whoever made
+        // it (not even its policy, which its owner's root otherwise may).
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|scope| scope.read_only && BUCKET_WRITES.contains(&action))
+        {
+            return Err(S3Error::access_denied("Access Denied"));
+        }
         let (arn, bucket) = match resource {
             Resource::Service => ("arn:aws:s3:::*".to_string(), None),
             Resource::Bucket(bucket) => (format!("arn:aws:s3:::{bucket}"), Some(bucket)),
@@ -480,7 +506,7 @@ impl Authz {
         if let (Some(grant), Some(owner), Some(bucket)) = (grant, owner, bucket)
             && grant.zone.is_some()
         {
-            return self.check_directory(action, bucket, owner, policy, context);
+            return self.check_directory(action, (bucket, grant), owner, policy, context);
         }
         self.decide(action, &arn, owner, policy, context)
     }
@@ -493,7 +519,7 @@ impl Authz {
     fn check_directory(
         &self,
         action: &str,
-        bucket: &str,
+        (bucket, grant): (&str, &BucketGrant),
         owner: &str,
         policy: Option<&Policy>,
         context: &Context,
@@ -534,10 +560,13 @@ impl Authz {
         }
         // A session of this bucket allows what its mode does: S3 Express
         // authorizes its requests at CreateSession.
-        if let Some((of, read_only)) = &self.session
-            && of == bucket
+        // The very bucket it was made for: of its name, owner and creation.
+        if let Some(scope) = &self.session
+            && scope.bucket == bucket
+            && scope.owner == owner
+            && grant.created_ms == Some(scope.created_ms)
         {
-            return match !read_only || READS.contains(&action) {
+            return match !scope.read_only || READS.contains(&action) {
                 true => Ok(()),
                 false => Err(S3Error::access_denied("Access Denied")),
             };
@@ -573,11 +602,16 @@ impl Authz {
         )
     }
 
-    /// This authorization for a request signed with a session of directory
-    /// bucket `bucket` (ReadOnly or not).
-    pub fn with_session(mut self, bucket: String, read_only: bool) -> Authz {
-        self.session = Some((bucket, read_only));
+    /// This authorization for a request signed with session `scope`.
+    pub fn with_session(mut self, scope: crate::session::Scope) -> Authz {
+        self.session = Some(scope);
         self
+    }
+
+    /// The owner and creation time of `bucket`, if it exists.
+    pub fn incarnation(&self, bucket: &str) -> Option<(String, u64)> {
+        let grant = self.buckets.get(bucket)?;
+        Some((grant.owner.clone()?, grant.created_ms?))
     }
 
     /// The zone of `bucket` if it is a directory bucket the request names.

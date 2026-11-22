@@ -115,9 +115,8 @@ pub struct Authenticated {
     /// bucket's requests (and ListDirectoryBuckets, which only that tells
     /// from ListBuckets), rather than `s3`.
     pub express: bool,
-    /// Signed with a session's credentials: its directory bucket, and
-    /// whether it is ReadOnly.
-    pub session: Option<(String, bool)>,
+    /// Signed with a session's credentials: what it is good for.
+    pub session: Option<crate::session::Scope>,
 }
 
 /// Serves S3 requests on `listener` (over TLS when `tls` is set) until
@@ -888,7 +887,7 @@ pub async fn authenticate(
         framing,
         checksum: checksum_of(request),
         express,
-        session: session.map(|session| (session.bucket, session.read_only)),
+        session: session.map(|session| session.scope),
     })
 }
 

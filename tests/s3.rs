@@ -18018,6 +18018,7 @@ fn directory_bucket_sessions_sign_requests_in_their_bucket_and_mode() {
         r#"{{"Version": "2012-10-17", "Statement": {{"Effect": "Allow", "Action": "s3express:CreateSession", "Resource": "arn:aws:s3express:us-east-1:{account}:bucket/data--use1-az4--x-s3"}}}}"#
     );
     let (one_key, one_secret) = user_with_key(&server, &account, "one", Some(&one));
+    let (_, other_key, other_secret) = account_with_key(&server, "others");
     let script = server.dir.join("sessions.py");
     std::fs::write(&script, SESSIONS_SCRIPT).expect("script");
     let output = Command::new(&python)
@@ -18033,6 +18034,8 @@ fn directory_bucket_sessions_sign_requests_in_their_bucket_and_mode() {
             &one_key,
             &one_secret,
             &account,
+            &other_key,
+            &other_secret,
         ])
         .output()
         .expect("run python");
@@ -18047,7 +18050,8 @@ fn directory_bucket_sessions_sign_requests_in_their_bucket_and_mode() {
 const SESSIONS_SCRIPT: &str = r#"
 import sys
 import boto3, botocore.config, botocore.exceptions
-port, key, secret, reader_key, reader_secret, none_key, none_secret, one_key, one_secret, account = sys.argv[1:11]
+(port, key, secret, reader_key, reader_secret, none_key, none_secret, one_key, one_secret, account,
+    other_key, other_secret) = sys.argv[1:13]
 def client(access, secret_key, sessions=True):
     s3 = {"addressing_style": "path"}
     if not sessions:
@@ -18140,6 +18144,41 @@ mine = with_session(own, own["SessionToken"])
 mine.put_object(Bucket=B, Key="dir/own", Body=b"o")
 refused(lambda: mine.copy_object(Bucket=B, Key="dir/copy", CopySource={"Bucket": OTHER, "Key": "src"}),
     "AccessDenied")
+# A ReadOnly session makes no session (of any mode), and changes nothing of
+# its bucket's: not its lifecycle, its policy or the bucket itself.
+refused(lambda: ro.create_session(Bucket=B, SessionMode="ReadWrite"), "AccessDenied")
+refused(lambda: ro.put_bucket_lifecycle_configuration(Bucket=B, LifecycleConfiguration={"Rules": [
+    {"ID": "e", "Status": "Enabled", "Filter": {"Prefix": ""}, "Expiration": {"Days": 1}}]}), "AccessDenied")
+refused(lambda: ro.delete_bucket_policy(Bucket=B), "AccessDenied")
+refused(lambda: ro.delete_bucket(Bucket=B), "AccessDenied")
+# Nor does a ReadWrite one make a session.
+refused(lambda: with_session(rw, rw["SessionToken"]).create_session(Bucket=B), "AccessDenied")
+# A session is its bucket's, not its name's: deleted, and made again by
+# another account, the bucket is not the session's.
+GONE = "gone--use1-az4--x-s3"
+configuration = {"Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}}
+plain.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+old = plain.create_session(Bucket=GONE, SessionMode="ReadWrite")["Credentials"]
+stale = with_session(old, old["SessionToken"])
+stale.put_object(Bucket=GONE, Key="mine", Body=b"m")
+stale.delete_object(Bucket=GONE, Key="mine")
+plain.delete_bucket(Bucket=GONE)
+theirs = client(other_key, other_secret, sessions=False)
+theirs.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+theirs.put_object(Bucket=GONE, Key="secret", Body=b"theirs")
+# (DeleteBucket ends its sessions.)
+refused(lambda: stale.get_object(Bucket=GONE, Key="secret"), "InvalidAccessKeyId")
+refused(lambda: stale.put_object(Bucket=GONE, Key="planted", Body=b"x"), "InvalidAccessKeyId")
+# Nor when its own account makes it again.
+theirs.delete_object(Bucket=GONE, Key="secret")
+theirs.delete_bucket(Bucket=GONE)
+plain.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+again = plain.create_session(Bucket=GONE, SessionMode="ReadWrite")["Credentials"]
+plain.delete_bucket(Bucket=GONE)
+plain.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+refused(lambda: with_session(again, again["SessionToken"]).put_object(Bucket=GONE, Key="k", Body=b"x"),
+    "InvalidAccessKeyId")
 # Refused: a general purpose bucket's session, a missing bucket's, a mode
 # S3 does not name.
 refused(lambda: plain.create_session(Bucket="general"), "NotImplemented")
