@@ -9649,6 +9649,105 @@ fn create_job_body(
 }
 
 #[test]
+fn a_batch_copy_of_a_multipart_object_onto_itself_keeps_its_part_checksums() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "selfcopy");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        let mut headers = vec![("x-amz-account-id", account.as_str())];
+        headers.extend_from_slice(extra);
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &headers,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    // Unversioned: the copy replaces the source, its null version.
+    for bucket in ["/src", "/reports"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+    }
+    let (_, (status, made)) = call("POST", "/src/big", "uploads", &[], b"");
+    assert_eq!(status, 200, "{made}");
+    let upload = xml_value(&made, "UploadId");
+    // Sent with no checksum, each part is given its CRC64NVME.
+    let parts = [vec![7u8; 5 << 20], b"the last part".to_vec()];
+    let mut listed = String::new();
+    for (number, data) in parts.iter().enumerate() {
+        let number = number + 1;
+        let (head, (status, _)) = call(
+            "PUT",
+            "/src/big",
+            &format!("partNumber={number}&uploadId={upload}"),
+            &[],
+            data,
+        );
+        assert_eq!(status, 200);
+        let etag = response_header(&head, "etag").expect("an ETag");
+        listed.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    let complete = format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>");
+    let (_, (status, done)) = call(
+        "POST",
+        "/src/big",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{done}");
+    let part_sum = || {
+        let (head, (status, _)) = call(
+            "HEAD",
+            "/src/big",
+            "partNumber=1",
+            &[("x-amz-checksum-mode", "ENABLED")],
+            b"",
+        );
+        assert_eq!(status, 206);
+        response_header(&head, "x-amz-checksum-crc64nvme")
+    };
+    let before = part_sum().expect("part 1's checksum");
+    let (head, (status, _)) = call("PUT", "/src/lists/self.csv", "", &[], b"src,big\n");
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").expect("an ETag");
+    // A change of class in place, as a batch copy is used for.
+    let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::src</TargetResource>\
+                <StorageClass>STANDARD_IA</StorageClass></S3PutObjectCopy>";
+    let body = create_job_body("self-1", copy, "lists/self.csv", &etag, "");
+    let (_, (status, answer)) = call("POST", "/v20180820/jobs", "", &[], body.as_bytes());
+    assert_eq!(status, 200, "{answer}");
+    let job = xml_value(&answer, "JobId");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let (_, (_, described)) = call("GET", &format!("/v20180820/jobs/{job}"), "", &[], b"");
+        if xml_value(&described, "Status") == "Complete" {
+            assert_eq!(
+                xml_value(&described, "NumberOfTasksSucceeded"),
+                "1",
+                "{described}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the job never ended: {described}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (head, _) = call("HEAD", "/src/big", "", &[], b"");
+    assert_eq!(
+        response_header(&head, "x-amz-storage-class").as_deref(),
+        Some("STANDARD_IA")
+    );
+    assert_eq!(part_sum(), Some(before));
+}
+
+#[test]
 fn batch_replication_replicates_again_what_a_manifest_or_its_filters_name_across_a_crash() {
     let mut server = start_server();
     let (account, key, secret) = account_with_key(&server, "rebatch");
@@ -12045,6 +12144,11 @@ assert s3.head_object(Bucket="mpsums", Key="sha", PartNumber=2,
 # their checksums too.
 s3.copy_object(Bucket="mpsums", Key="crc-copy", CopySource={"Bucket": "mpsums", "Key": "crc"})
 assert s3.head_object(Bucket="mpsums", Key="crc-copy", PartNumber=1,
+    ChecksumMode="ENABLED")["ChecksumCRC32"] == b64(zlib.crc32(first).to_bytes(4, "big"))
+# Onto itself (a class change), replacing its null version: kept.
+s3.copy_object(Bucket="mpsums", Key="crc", CopySource={"Bucket": "mpsums", "Key": "crc"},
+    StorageClass="STANDARD_IA")
+assert s3.head_object(Bucket="mpsums", Key="crc", PartNumber=1,
     ChecksumMode="ENABLED")["ChecksumCRC32"] == b64(zlib.crc32(first).to_bytes(4, "big"))
 # None asked for: the parts' CRC64NVME make the object's, of the whole.
 made, listed = upload(bare, "plain", [first, last])

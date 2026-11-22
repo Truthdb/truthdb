@@ -594,28 +594,44 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
-    /// Gives version `to` of `bucket`'s `key` the part checksums of
-    /// `source` (a version of `from`'s `from_key`), whose parts it shares (a
-    /// copy or a replica of it).
-    pub fn copy_part_checksums(
+    /// The part checksums of `source` (a version of `from`'s `from_key`),
+    /// by place, as kept: read before a copy that shares its parts, which
+    /// can remove `source` (a copy onto itself replacing a null version).
+    pub fn part_checksums_of(
         &mut self,
         (from, from_key, source): (&str, &str, u64),
-        (bucket, key, to): (&str, &str, u64),
-    ) -> Result<(), StorageError> {
+    ) -> Result<Vec<(u16, Vec<u8>)>, StorageError> {
         let tree = self.trees.part_checksums();
         let lower = part_checksum_key(from, from_key, source, 0);
         let upper = part_checksum_key(from, from_key, source, u16::MAX);
-        for (row_key, row) in tree.scan_range(self.ctx, Some(&lower), Some(&upper))? {
-            let place = u16::from_be_bytes(
-                row_key[row_key.len() - 2..]
-                    .try_into()
-                    .map_err(|_| corrupt("part checksum key"))?,
-            );
+        tree.scan_range(self.ctx, Some(&lower), Some(&upper))?
+            .into_iter()
+            .map(|(row_key, row)| {
+                let place = u16::from_be_bytes(
+                    row_key[row_key.len() - 2..]
+                        .try_into()
+                        .map_err(|_| corrupt("part checksum key"))?,
+                );
+                Ok((place, row))
+            })
+            .collect()
+    }
+
+    /// Gives version `to` of `bucket`'s `key` the part checksums `sums`
+    /// (from [`Self::part_checksums_of`] of the version whose parts it
+    /// shares: a copy or a replica of it).
+    pub fn put_part_checksums(
+        &mut self,
+        (bucket, key, to): (&str, &str, u64),
+        sums: &[(u16, Vec<u8>)],
+    ) -> Result<(), StorageError> {
+        let tree = self.trees.part_checksums();
+        for (place, row) in sums {
             tree.insert_unique(
                 self.ctx,
                 &mut OpMode::Txn(self.txn),
-                &part_checksum_key(bucket, key, to, place),
-                &row,
+                &part_checksum_key(bucket, key, to, *place),
+                row,
             )?;
         }
         Ok(())

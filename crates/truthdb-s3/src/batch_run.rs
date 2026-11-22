@@ -2018,23 +2018,24 @@ fn run_one(
                 attrs,
                 class,
                 lock,
-            }) => match tx.copy_object(&to, &target, &source, &attrs, class, now, DROP_GRACE_MS)? {
-                Ok(copied) => {
-                    if let Some(lock) = &lock {
-                        tx.set_lock(&to, &target, copied.version, lock)?;
+            }) => {
+                // It shares a multipart source's parts, and their checksums,
+                // read first: a copy onto itself can remove the source.
+                let sums = match source.parts > 0 {
+                    true => tx.part_checksums_of((&bucket, &key, source.version))?,
+                    false => Vec::new(),
+                };
+                match tx.copy_object(&to, &target, &source, &attrs, class, now, DROP_GRACE_MS)? {
+                    Ok(copied) => {
+                        if let Some(lock) = &lock {
+                            tx.set_lock(&to, &target, copied.version, lock)?;
+                        }
+                        tx.put_part_checksums((&to, &target, copied.version), &sums)?;
+                        Ok(())
                     }
-                    // It shares a multipart source's parts, and their
-                    // checksums.
-                    if source.parts > 0 {
-                        tx.copy_part_checksums(
-                            (&bucket, &key, source.version),
-                            (&to, &target, copied.version),
-                        )?;
-                    }
-                    Ok(())
+                    Err(err) => Err(object_error(err, &to, &target)),
                 }
-                Err(err) => Err(object_error(err, &to, &target)),
-            },
+            }
         };
         let result = JobResult {
             bucket: cut(&bucket, MAX_RESULT_TEXT),

@@ -354,6 +354,12 @@ async fn copy_whole(
                     return Ok(Err(err));
                 }
             }
+            // A copy sharing a multipart source's parts has their checksums,
+            // read first: a copy onto itself can remove the source.
+            let sums = match source.parts > 0 {
+                true => tx.part_checksums_of((&src_bucket, &src_key, source.version))?,
+                false => Vec::new(),
+            };
             let copied = tx.copy_object(
                 &dst_bucket,
                 &dst_key,
@@ -366,14 +372,8 @@ async fn copy_whole(
             if let (Ok(copied), Some(lock)) = (&copied, &shared_lock) {
                 tx.set_lock(&dst_bucket, &dst_key, copied.version, lock)?;
             }
-            // A copy sharing a multipart source's parts has their checksums.
-            if let Ok(copied) = &copied
-                && source.parts > 0
-            {
-                tx.copy_part_checksums(
-                    (&src_bucket, &src_key, source.version),
-                    (&dst_bucket, &dst_key, copied.version),
-                )?;
+            if let Ok(copied) = &copied {
+                tx.put_part_checksums((&dst_bucket, &dst_key, copied.version), &sums)?;
             }
             Ok(Ok(copied))
         })?;

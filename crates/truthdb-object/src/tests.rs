@@ -1042,10 +1042,11 @@ fn a_multipart_versions_part_checksums_are_kept_by_place_copied_and_removed_with
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
+            // "other" is unversioned: its copies are null versions.
             for bucket in ["bkt", "other"] {
                 tx.create_bucket(bucket, DEFAULT_ACCOUNT, now())?.unwrap();
-                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
             }
+            tx.set_versioning("bkt", Versioning::Enabled)?.unwrap();
             Ok(())
         })
         .unwrap();
@@ -1108,10 +1109,33 @@ fn a_multipart_versions_part_checksums_are_kept_by_place_copied_and_removed_with
                     0,
                 )?
                 .unwrap();
-            tx.copy_part_checksums(("bkt", "k", info.version), ("other", "k", copied.version))?;
+            let sums = tx.part_checksums_of(("bkt", "k", info.version))?;
+            tx.put_part_checksums(("other", "k", copied.version), &sums)?;
             Ok(copied)
         })
         .unwrap();
+    assert_eq!(part("other", copied.version, 2), Some(sum("AAAAAg==")));
+    // A copy onto itself (a class change) replaces that null version, and
+    // keeps its checksums: they are read before the copy removes it.
+    let copied = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let sums = tx.part_checksums_of(("other", "k", copied.version))?;
+            let again = tx
+                .copy_object(
+                    "other",
+                    "k",
+                    &copied,
+                    &copied.attrs,
+                    crate::StorageClass::StandardIa,
+                    now(),
+                    0,
+                )?
+                .unwrap();
+            tx.put_part_checksums(("other", "k", again.version), &sums)?;
+            Ok(again)
+        })
+        .unwrap();
+    assert_eq!(part("other", copied.version, 1), Some(sum("AAAAAQ==")));
     assert_eq!(part("other", copied.version, 2), Some(sum("AAAAAg==")));
     // Removed with its version; the copy's stay.
     ObjFile::new(&mut storage.lock())

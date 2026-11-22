@@ -1232,6 +1232,11 @@ fn replicate(
     let made = match queued.work {
         ReplicationWork::Create => file.transaction(|tx| {
             let class = rule_class.unwrap_or(source.storage_class);
+            // A replica shares its source's parts, and their checksums.
+            let sums = match source.parts > 0 {
+                true => tx.part_checksums_of((&queued.bucket, &key, source.version))?,
+                false => Vec::new(),
+            };
             match tx.insert_replica(
                 &destination,
                 &key,
@@ -1247,12 +1252,8 @@ fn replicate(
                     "the destination of a replication is gone: {err:?}"
                 ))),
                 Ok(made) => {
-                    // A replica shares its source's parts, and their checksums.
-                    if made && source.parts > 0 {
-                        tx.copy_part_checksums(
-                            (&queued.bucket, &key, source.version),
-                            (&destination, &key, source.version),
-                        )?;
+                    if made {
+                        tx.put_part_checksums((&destination, &key, source.version), &sums)?;
                     }
                     tx.finish_replication(queued, Some(ReplicationStatus::Completed), None, now)
                 }
