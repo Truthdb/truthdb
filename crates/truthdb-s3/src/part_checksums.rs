@@ -85,11 +85,15 @@ pub(crate) fn of_upload(headers: &HeaderMap) -> Result<Option<StoredChecksum>, S
 /// The algorithm `name` (`x-amz-checksum-algorithm`'s) asks for, if any: 400
 /// for one S3 does not name, 501 for one it names that is not computed here.
 pub(crate) fn asked(headers: &HeaderMap, name: &str) -> Result<Option<String>, S3Error> {
-    let Some(algorithm) = crate::objects::header(headers, name)
-        .map(|algorithm| algorithm.trim().to_ascii_uppercase())
-    else {
-        return Ok(None);
-    };
+    crate::objects::header(headers, name)
+        .map(|algorithm| computed(algorithm.trim()))
+        .transpose()
+}
+
+/// Algorithm `name` (any case), as S3 names it: 400 for one S3 does not
+/// name, 501 for one it names that is not computed here.
+pub(crate) fn computed(name: &str) -> Result<String, S3Error> {
+    let algorithm = name.to_ascii_uppercase();
     if !NAMED.contains(&algorithm.as_str()) {
         return Err(S3Error::invalid_request(format!(
             "Checksum algorithm provided is unsupported: {algorithm}"
@@ -100,7 +104,7 @@ pub(crate) fn asked(headers: &HeaderMap, name: &str) -> Result<Option<String>, S
             "the checksum algorithm {algorithm} is not implemented"
         )));
     }
-    Ok(Some(algorithm))
+    Ok(algorithm)
 }
 
 /// The algorithm an upload's parts are checksummed with.

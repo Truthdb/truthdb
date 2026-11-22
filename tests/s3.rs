@@ -5058,6 +5058,19 @@ fn customer_provided_keys_encrypt_objects_only_their_key_reads() {
     let (_, (status, reply)) = call("GET", "/vault/o", "", &[], b"");
     assert_eq!(status, 400, "{reply}");
     assert!(reply.contains("InvalidRequest"), "{reply}");
+    // Its attributes too: its size, the plaintext's.
+    let size = [("x-amz-object-attributes", "ObjectSize")];
+    let (_, (status, reply)) = call("GET", "/vault/o", "attributes", &size, b"");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("InvalidRequest"), "{reply}");
+    let mut with_key = header_refs(&key_a);
+    with_key.extend_from_slice(&size);
+    let (_, (status, reply)) = call("GET", "/vault/o", "attributes", &with_key, b"");
+    assert_eq!(status, 200, "{reply}");
+    assert!(
+        reply.contains(&format!("<ObjectSize>{}</ObjectSize>", body.len())),
+        "{reply}"
+    );
     assert_eq!(
         call("GET", "/vault/o", "", &header_refs(&key_b), b"").1.0,
         403
@@ -9748,6 +9761,238 @@ fn a_batch_copy_of_a_multipart_object_onto_itself_keeps_its_part_checksums() {
 }
 
 #[test]
+fn batch_checksum_jobs_report_each_objects_checksum() {
+    use base64::Engine as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let sha256 = |data: &[u8]| {
+        ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .to_vec()
+    };
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02X}")).collect() };
+    // TLS: one object is under a customer-provided key.
+    let server = start_server_tls(false, true);
+    let (account, key, secret) = account_with_key(&server, "summer");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        let mut headers = vec![("x-amz-account-id", account.as_str())];
+        headers.extend_from_slice(extra);
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            &headers,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/src", "/reports"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+    }
+    let enabled = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(call("PUT", "/src", "versioning", &[], enabled).1.0, 200);
+    let (head, (status, _)) = call("PUT", "/src/small", "", &[], b"hello");
+    assert_eq!(status, 200);
+    let small_etag = response_header(&head, "etag").unwrap();
+    // A multipart object, its parts sent with no checksum (each is given
+    // its CRC64NVME, the object its whole one).
+    let (_, (_, made)) = call("POST", "/src/big", "uploads", &[], b"");
+    let upload = xml_value(&made, "UploadId");
+    let parts = [vec![3u8; 5 << 20], b"the last part".to_vec()];
+    let mut listed = String::new();
+    for (number, data) in parts.iter().enumerate() {
+        let number = number + 1;
+        let query = format!("partNumber={number}&uploadId={upload}");
+        let (head, (status, _)) = call("PUT", "/src/big", &query, &[], data);
+        assert_eq!(status, 200);
+        let etag = response_header(&head, "etag").unwrap();
+        listed.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    let complete = format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>");
+    let query = format!("uploadId={upload}");
+    let (_, (status, done)) = call("POST", "/src/big", &query, &[], complete.as_bytes());
+    assert_eq!(status, 200, "{done}");
+    let (head, _) = call(
+        "HEAD",
+        "/src/big",
+        "",
+        &[("x-amz-checksum-mode", "ENABLED")],
+        b"",
+    );
+    let big_etag = response_header(&head, "etag").unwrap();
+    let big_crc = response_header(&head, "x-amz-checksum-crc64nvme").expect("its CRC64NVME");
+    // A composite SHA256 upload of one part: its checksum is `-1`.
+    let sha = [("x-amz-checksum-algorithm", "SHA256")];
+    let (_, (_, made)) = call("POST", "/src/single", "uploads", &sha, b"");
+    let upload = xml_value(&made, "UploadId");
+    let query = format!("partNumber=1&uploadId={upload}");
+    let (head, (status, _)) = call("PUT", "/src/single", &query, &[], b"one part");
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").unwrap();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let query = format!("uploadId={upload}");
+    let (_, (status, done)) = call("POST", "/src/single", &query, &[], complete.as_bytes());
+    assert_eq!(status, 200, "{done}");
+    let (head, _) = call(
+        "HEAD",
+        "/src/single",
+        "",
+        &[("x-amz-checksum-mode", "ENABLED")],
+        b"",
+    );
+    let single_etag = response_header(&head, "etag").unwrap();
+    let single_sum = response_header(&head, "x-amz-checksum-sha256").expect("its SHA256");
+    assert!(single_sum.ends_with("-1"), "{single_sum}");
+    let customer = customer_headers("x-amz-", [7u8; 32]);
+    assert_eq!(
+        call("PUT", "/src/sealed", "", &header_refs(&customer), b"s")
+            .1
+            .0,
+        200
+    );
+    assert_eq!(call("PUT", "/src/gone", "", &[], b"g").1.0, 200);
+    let (head, _) = call("DELETE", "/src/gone", "", &[], b"");
+    let marker = response_header(&head, "x-amz-version-id").unwrap();
+    // One the job's creator may not read.
+    assert_eq!(call("PUT", "/src/denied", "", &[], b"d").1.0, 200);
+    let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\
+                  \"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::src/denied\"}]}";
+    assert_eq!(
+        call("PUT", "/src", "policy", &[], policy.as_bytes()).1.0,
+        204
+    );
+    let put_manifest = |name: &str, lines: &str| {
+        let (head, (status, _)) = call(
+            "PUT",
+            &format!("/src/lists/{name}"),
+            "",
+            &[],
+            lines.as_bytes(),
+        );
+        assert_eq!(status, 200);
+        response_header(&head, "etag").unwrap()
+    };
+    // Runs `operation` on the manifest's objects: the report's rows.
+    let run = |token: &str, operation: &str, manifest: &str, versions: bool| {
+        let etag = put_manifest(&format!("{token}.csv"), manifest);
+        let mut body = create_job_body(token, operation, &format!("lists/{token}.csv"), &etag, "");
+        if versions {
+            body = body.replace(
+                "<member>Key</member></Fields>",
+                "<member>Key</member><member>VersionId</member></Fields>",
+            );
+        }
+        let (_, (status, answer)) = call("POST", "/v20180820/jobs", "", &[], body.as_bytes());
+        assert_eq!(status, 200, "{answer}");
+        let job = xml_value(&answer, "JobId");
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let (_, (_, described)) = call("GET", &format!("/v20180820/jobs/{job}"), "", &[], b"");
+            if xml_value(&described, "Status") == "Complete" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the job never ended: {described}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (_, (_, listed)) = call(
+            "GET",
+            "/reports",
+            &format!("list-type=2&prefix=rep/job-{job}/results/"),
+            &[],
+            b"",
+        );
+        let mut rows = String::new();
+        for part in listed.split("<Key>").skip(1) {
+            let name = part.split("</Key>").next().unwrap();
+            rows.push_str(&call("GET", &format!("/reports/{name}"), "", &[], b"").1.1);
+        }
+        rows
+    };
+    // The record S3 reports, quoted as a CSV field.
+    let record = |value: &str, hex: &str, etag: &str, algorithm: &str, kind: &str| {
+        let json = format!(
+            "{{\"checksum_base64\":\"{value}\",\"etag\":\"{}\",\"checksumAlgorithm\":\"{algorithm}\",\"checksumType\":\"{kind}\",\"checksum_hex\":\"{hex}\"}}",
+            etag.trim_matches('"')
+        );
+        format!("\"{}\"", json.replace('"', "\"\""))
+    };
+    // Composite SHA256: of the parts' SHA256s; one part's is its whole.
+    let composite = "<S3ComputeObjectChecksum><ChecksumAlgorithm>SHA256</ChecksumAlgorithm>\
+                     <ChecksumType>COMPOSITE</ChecksumType></S3ComputeObjectChecksum>";
+    let rows = run(
+        "sums-1",
+        composite,
+        "src,small\nsrc,big\nsrc,single\nsrc,sealed\nsrc,missing\nsrc,gone\nsrc,denied\n",
+        false,
+    );
+    let small = sha256(b"hello");
+    let joined = [sha256(&parts[0]), sha256(&parts[1])].concat();
+    let whole = sha256(&joined);
+    for line in [
+        format!(
+            "src,small,,succeeded,200,,{}",
+            record(&b64(&small), &hex(&small), &small_etag, "SHA256", "FULL_OBJECT")
+        ),
+        format!(
+            "src,big,,succeeded,200,,{}",
+            record(
+                &format!("{}-2", b64(&whole)),
+                &format!("{}-2", hex(&whole)),
+                &big_etag,
+                "SHA256",
+                "COMPOSITE"
+            )
+        ),
+        // The one the object keeps.
+        format!("src,single,,succeeded,200,,{}", {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(single_sum.trim_end_matches("-1"))
+                .unwrap();
+            record(
+                &single_sum,
+                &format!("{}-1", hex(&raw)),
+                &single_etag,
+                "SHA256",
+                "COMPOSITE",
+            )
+        }),
+        "src,sealed,,failed,400,InvalidRequest,SSE-C encryption type is not supported for this operation".to_string(),
+        "src,missing,,failed,404,NoSuchKey,".to_string(),
+        "src,gone,,failed,404,NoSuchKey,".to_string(),
+        "src,denied,,failed,403,AccessDenied,".to_string(),
+    ] {
+        assert!(rows.contains(&line), "{line}\nnot in\n{rows}");
+    }
+    // None asked for: CRC64NVME of the whole object, the one it keeps.
+    let rows = run("sums-2", "<S3ComputeObjectChecksum/>", "src,big\n", false);
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&big_crc)
+        .unwrap();
+    let line = format!(
+        "src,big,,succeeded,200,,{}",
+        record(&big_crc, &hex(&raw), &big_etag, "CRC64NVME", "FULL_OBJECT")
+    );
+    assert!(rows.contains(&line), "{line}\nnot in\n{rows}");
+    // A delete marker named by its version id has no bytes.
+    let rows = run(
+        "sums-3",
+        "<S3ComputeObjectChecksum/>",
+        &format!("src,gone,{marker}\n"),
+        true,
+    );
+    let line = format!("src,gone,{marker},failed,405,MethodNotAllowed,");
+    assert!(rows.contains(&line), "{line}\nnot in\n{rows}");
+}
+
+#[test]
 fn batch_replication_replicates_again_what_a_manifest_or_its_filters_name_across_a_crash() {
     let mut server = start_server();
     let (account, key, secret) = account_with_key(&server, "rebatch");
@@ -12206,6 +12451,140 @@ refused(lambda: s3.create_multipart_upload(Bucket="mpsums", Key="x", ChecksumAlg
 made = s3.create_multipart_upload(Bucket="mpsums", Key="mixed", ChecksumAlgorithm="CRC32")
 refused(lambda: s3.upload_part(Bucket="mpsums", Key="mixed", UploadId=made["UploadId"], PartNumber=1,
     Body=last, ChecksumAlgorithm="SHA256"), "InvalidRequest")
+print("ok")
+"#;
+
+#[test]
+fn object_attributes_are_given_as_s3_gives_them() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    let script = server.dir.join("object_attributes.py");
+    std::fs::write(&script, OBJECT_ATTRIBUTES_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const OBJECT_ATTRIBUTES_SCRIPT: &str = r#"
+import sys, base64, hashlib, json, os, zlib
+import boto3, botocore.config, botocore.exceptions
+port, key, secret = sys.argv[1:4]
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+b64 = lambda raw: base64.b64encode(raw).decode()
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+s3.create_bucket(Bucket="attrs")
+s3.put_bucket_versioning(Bucket="attrs", VersioningConfiguration={"Status": "Enabled"})
+ALL = ["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"]
+attributes = lambda key, names=ALL, **extra: s3.get_object_attributes(
+    Bucket="attrs", Key=key, ObjectAttributes=names, **extra)
+# A plain object: its ETag unquoted, its checksum, its size; STANDARD and
+# its (no) parts unsaid.
+put = s3.put_object(Bucket="attrs", Key="small", Body=b"hello", ChecksumAlgorithm="SHA256")
+got = attributes("small")
+assert got["ETag"] == put["ETag"].strip('"'), got
+assert got["Checksum"] == {"ChecksumSHA256": b64(hashlib.sha256(b"hello").digest()),
+    "ChecksumType": "FULL_OBJECT"}, got
+assert got["ObjectSize"] == 5 and "StorageClass" not in got and "ObjectParts" not in got, got
+assert got["VersionId"] == put["VersionId"] and "LastModified" in got, got
+# Only what is asked for.
+got = attributes("small", ["ObjectSize"])
+assert "ETag" not in got and "Checksum" not in got and got["ObjectSize"] == 5, got
+s3.put_object(Bucket="attrs", Key="cold", Body=b"x", StorageClass="STANDARD_IA")
+assert attributes("cold", ["StorageClass"])["StorageClass"] == "STANDARD_IA"
+# An older version, by its id.
+s3.put_object(Bucket="attrs", Key="small", Body=b"hello again")
+assert attributes("small", ["ObjectSize"], VersionId=put["VersionId"])["ObjectSize"] == 5
+# A multipart object: its parts, paged, each with its checksum.
+datas = [os.urandom(5 * 1024 * 1024), os.urandom(5 * 1024 * 1024), b"the last part"]
+made = s3.create_multipart_upload(Bucket="attrs", Key="big", ChecksumAlgorithm="CRC32",
+    ChecksumType="FULL_OBJECT")
+listed = []
+for number, data in enumerate(datas, 1):
+    sent = s3.upload_part(Bucket="attrs", Key="big", UploadId=made["UploadId"], PartNumber=number,
+        Body=data, ChecksumAlgorithm="CRC32")
+    listed.append({"PartNumber": number, "ETag": sent["ETag"], "ChecksumCRC32": sent["ChecksumCRC32"]})
+s3.complete_multipart_upload(Bucket="attrs", Key="big", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed}, ChecksumType="FULL_OBJECT")
+crc = lambda data: b64(zlib.crc32(data).to_bytes(4, "big"))
+parts = attributes("big")["ObjectParts"]
+assert parts["TotalPartsCount"] == 3 and parts["IsTruncated"] is False, parts
+assert [(part["PartNumber"], part["Size"], part["ChecksumCRC32"]) for part in parts["Parts"]] == [
+    (n, len(data), crc(data)) for n, data in enumerate(datas, 1)], parts
+first = attributes("big", ["ObjectParts"], MaxParts=2)["ObjectParts"]
+assert first["IsTruncated"] is True and first["NextPartNumberMarker"] == 2, first
+assert [part["PartNumber"] for part in first["Parts"]] == [1, 2], first
+rest = attributes("big", ["ObjectParts"], MaxParts=2, PartNumberMarker=2)["ObjectParts"]
+assert rest["IsTruncated"] is False and [part["PartNumber"] for part in rest["Parts"]] == [3], rest
+assert attributes("big", ["ObjectSize"])["ObjectSize"] == sum(map(len, datas))
+# MaxParts 0 is taken as none asked: a page of up to 1,000.
+unbounded = attributes("big", ["ObjectParts"], MaxParts=0)["ObjectParts"]
+assert unbounded["MaxParts"] == 1000 and unbounded["IsTruncated"] is False, unbounded
+assert len(unbounded["Parts"]) == 3, unbounded
+whole_page = attributes("big", ["ObjectParts"], MaxParts=3)["ObjectParts"]
+assert whole_page["IsTruncated"] is False and len(whole_page["Parts"]) == 3, whole_page
+# A multipart object with no checksum of its own (its upload asked for
+# none; its parts have the SDK's CRC32s): its part count, no parts.
+made = s3.create_multipart_upload(Bucket="attrs", Key="unsummed")
+listed = []
+for number, data in enumerate(datas[1:], 1):
+    sent = s3.upload_part(Bucket="attrs", Key="unsummed", UploadId=made["UploadId"],
+        PartNumber=number, Body=data)
+    listed.append({"PartNumber": number, "ETag": sent["ETag"]})
+s3.complete_multipart_upload(Bucket="attrs", Key="unsummed", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed})
+got = attributes("unsummed")
+assert "Checksum" not in got and got["ObjectParts"]["TotalPartsCount"] == 2, got
+assert "Parts" not in got["ObjectParts"], got
+# Refused: an attribute S3 does not name; a key not there; a key whose
+# newest version is a delete marker.
+refused(lambda: attributes("small", ["Size"]), "InvalidArgument")
+refused(lambda: attributes("missing"), "NoSuchKey")
+s3.delete_object(Bucket="attrs", Key="cold")
+refused(lambda: attributes("cold"), "NoSuchKey")
+# Conditions, as on a GET (a client of its own sends each header).
+def sending(name, value):
+    client = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+    def add(request, **_):
+        request.headers[name] = value
+    client.meta.events.register("before-sign.s3.GetObjectAttributes", add)
+    return lambda: client.get_object_attributes(Bucket="attrs", Key="big", ObjectAttributes=["ETag"])
+big_etag = s3.head_object(Bucket="attrs", Key="big")["ETag"]
+refused(sending("If-Match", '"0000"'), "PreconditionFailed")
+refused(sending("If-None-Match", big_etag), "304")
+assert sending("If-Match", big_etag)()["ETag"] == big_etag.strip('"')
+# Both actions are needed: the object's read, and its attributes'.
+s3.put_object(Bucket="attrs", Key="no-attributes", Body=b"x")
+s3.put_object(Bucket="attrs", Key="no-read", Body=b"x")
+s3.put_bucket_policy(Bucket="attrs", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObjectAttributes",
+     "Resource": "arn:aws:s3:::attrs/no-attributes"},
+    {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject",
+     "Resource": "arn:aws:s3:::attrs/no-read"}]}))
+refused(lambda: attributes("no-attributes"), "AccessDenied")
+refused(lambda: attributes("no-read"), "AccessDenied")
+assert s3.get_object(Bucket="attrs", Key="no-attributes")["Body"].read() == b"x"
+assert attributes("small", ["ObjectSize"])["ObjectSize"] == 11
 print("ok")
 "#;
 
@@ -16153,7 +16532,7 @@ if phase == "reports":
     first = s3.put_object(Bucket="source", Key="docs/x", Body=b"one")["VersionId"]
     second = s3.put_object(Bucket="source", Key="docs/x", Body=b"second")["VersionId"]
     spaced = s3.put_object(Bucket="source", Key="docs/a b.txt", Body=b"spaced")["VersionId"]
-    s3.put_object(Bucket="source", Key="other/y", Body=b"y")
+    s3.put_object(Bucket="source", Key="other/y", Body=b"y", ChecksumAlgorithm="SHA256")
     gone = s3.put_object(Bucket="source", Key="docs/gone", Body=b"g")["VersionId"]
     marker = s3.delete_object(Bucket="source", Key="docs/gone")["VersionId"]
     def configuration(id, bucket, **extra):
@@ -16167,7 +16546,8 @@ if phase == "reports":
     current["Destination"]["S3BucketDestination"]["Prefix"] = "inv/"
     s3.put_bucket_inventory_configuration(Bucket="source", Id="current", InventoryConfiguration=current)
     s3.put_bucket_inventory_configuration(Bucket="source", Id="all", InventoryConfiguration=configuration(
-        "all", "kept", IncludedObjectVersions="All", OptionalFields=["Size", "ObjectLockLegalHoldStatus"]))
+        "all", "kept", IncludedObjectVersions="All",
+        OptionalFields=["Size", "ObjectLockLegalHoldStatus", "ChecksumAlgorithm"]))
     # More than a page (1,000) of each listing.
     s3.create_bucket(Bucket="big")
     s3.put_bucket_versioning(Bucket="big", VersioningConfiguration={"Status": "Enabled"})
@@ -16195,15 +16575,21 @@ if phase == "reports":
     ], rows
 
     manifest, rows, manifest_key = report("kept", "source/all/")
-    assert manifest["fileSchema"] == "Bucket, Key, VersionId, IsLatest, IsDeleteMarker, Size, ObjectLockLegalHoldStatus"
+    assert manifest["fileSchema"] == ("Bucket, Key, VersionId, IsLatest, IsDeleteMarker, Size, "
+        "ObjectLockLegalHoldStatus, ChecksumAlgorithm")
+    # The algorithm of each version's checksum: the SDK's, or the one asked
+    # for; a delete marker has none.
+    sdk = next(name[len("Checksum"):] for name in
+        s3.head_object(Bucket="source", Key="docs/x", ChecksumMode="ENABLED")
+        if name.startswith("Checksum") and name != "ChecksumType")
     assert rows == sorted([
-        ["source", "docs/a%20b.txt", spaced, "True", "False", "6", "OFF"],
-        ["source", "docs/gone", marker, "True", "True", "", "OFF"],
-        ["source", "docs/gone", gone, "False", "False", "1", "OFF"],
-        ["source", "docs/x", second, "True", "False", "6", "OFF"],
-        ["source", "docs/x", first, "False", "False", "3", "OFF"],
-        ["source", "early", "", "True", "False", "5", "OFF"],
-        ["source", "other/y", rows[-1][2], "True", "False", "1", "OFF"],
+        ["source", "docs/a%20b.txt", spaced, "True", "False", "6", "OFF", sdk],
+        ["source", "docs/gone", marker, "True", "True", "", "OFF", ""],
+        ["source", "docs/gone", gone, "False", "False", "1", "OFF", sdk],
+        ["source", "docs/x", second, "True", "False", "6", "OFF", sdk],
+        ["source", "docs/x", first, "False", "False", "3", "OFF", sdk],
+        ["source", "early", "", "True", "False", "5", "OFF", sdk],
+        ["source", "other/y", rows[-1][2], "True", "False", "1", "OFF", "SHA256"],
     ]), rows
     manifest, data, _ = report("lists", "source/pq/", "parquet")
     assert manifest["fileFormat"] == "Parquet" and data[:4] == data[-4:] == b"PAR1", manifest
