@@ -316,9 +316,8 @@ pub async fn list_parts(
 /// The `(PartNumber, ETag)` list of a CompleteMultipartUpload body: one
 /// `<CompleteMultipartUpload>` of `<Part>`s, each with one `<PartNumber>` and
 /// one `<ETag>` (the 32 hex digits of its MD5, quoted or not), and optionally
-/// the part's checksum, which the part itself was verified against.
-/// The `(PartNumber, ETag)` list, and the checksums the parts are listed
-/// with (`(PartNumber, algorithm, value)`).
+/// the part's checksum; and those checksums (`(PartNumber, algorithm,
+/// value)`), to be checked against the ones the parts kept.
 #[allow(clippy::type_complexity)]
 fn parse_complete(
     body: &[u8],

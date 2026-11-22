@@ -599,8 +599,6 @@ impl ObjFile<'_> {
         Ok(expired)
     }
 
-    /// Up to `max` parts of `upload` numbered after `after`, and whether more
-    /// follow.
     /// Part `number` of `upload`, if it was uploaded.
     pub fn upload_part_info(
         &mut self,
@@ -616,6 +614,8 @@ impl ObjFile<'_> {
             .transpose()
     }
 
+    /// Up to `max` parts of `upload` numbered after `after`, and whether more
+    /// follow.
     pub fn list_parts(
         &mut self,
         upload: u64,
