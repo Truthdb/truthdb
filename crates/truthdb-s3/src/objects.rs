@@ -458,7 +458,9 @@ pub async fn put_object(
     let encrypted_at_rest = state.storage.is_encrypted();
     crate::sse::check_write(request.headers(), encrypted_at_rest)?;
     let customer = crate::ssec::provided(request.headers(), false)?;
-    // Fail before writing anything when the bucket or key is wrong.
+    let condition = crate::conditional::Condition::of_write(request.headers())?;
+    // Fail before writing anything when the bucket or key is wrong, or the
+    // condition does not hold.
     {
         let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
         let (check, blocked, (bucket_lock, default)) = object(state, move |file| {
@@ -471,6 +473,9 @@ pub async fn put_object(
         .await?;
         if let Err(err @ (ObjectError::NoSuchBucket | ObjectError::InvalidKey(_))) = check {
             return Err(object_error(err, &bucket, &key));
+        }
+        if let Some(condition) = &condition {
+            condition.check(check.as_ref().ok().map(ObjectInfo::etag).as_deref())?;
         }
         crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
         if let Some(lock) =
@@ -501,6 +506,13 @@ pub async fn put_object(
                 Err(err) => return Ok(Err(err)),
             };
             let stored = file.transaction(|tx| {
+                // Held again at the write, in its own transaction.
+                if let Some(condition) = &condition {
+                    let current = tx.current_etag(&bucket_name, &key_name)?.flatten();
+                    if let Err(err) = condition.recheck(current.as_deref()) {
+                        return Ok(Err(err));
+                    }
+                }
                 let stored = tx.put_object(
                     &bucket_name,
                     &key_name,
@@ -513,8 +525,12 @@ pub async fn put_object(
                 if let (Ok(info), Some(lock)) = (&stored, &lock) {
                     tx.set_lock(&bucket_name, &key_name, info.version, lock)?;
                 }
-                Ok(stored)
+                Ok(Ok(stored))
             })?;
+            let stored = match stored {
+                Ok(stored) => stored,
+                Err(err) => return Ok(Err(err)),
+            };
             let expiration = match &stored {
                 Ok(info) => crate::lifecycle::expiration_header(
                     file.lifecycle(&bucket_name)?.as_ref(),
@@ -622,7 +638,7 @@ fn parse_http_date(value: &str) -> Option<u64> {
 }
 
 /// Whether an `If-Match`/`If-None-Match` list names this ETag.
-fn etag_matches(list: &str, etag: &str) -> bool {
+pub(crate) fn etag_matches(list: &str, etag: &str) -> bool {
     list.split(',').map(str::trim).any(|candidate| {
         candidate == "*"
             || candidate == etag

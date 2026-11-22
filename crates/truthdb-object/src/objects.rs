@@ -460,6 +460,40 @@ impl ObjTxn<'_, '_> {
 
     /// The version `which` picks, unless it is missing or a delete marker:
     /// its number, whether it is the null version and its storage class.
+    /// `key`'s current version as a conditional write or delete reads it, in
+    /// this transaction: none, a delete marker (`Some(None)`), or a version
+    /// with its quoted ETag.
+    pub fn current_etag(
+        &mut self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Option<String>>, StorageError> {
+        let found = find_version(
+            self.ctx,
+            &self.trees.objects(),
+            bucket,
+            key,
+            VersionSel::Latest,
+        )?;
+        Ok(found.map(|(_, version, row)| {
+            (row.flags & FLAG_DELETE_MARKER == 0).then(|| {
+                ObjectInfo {
+                    version,
+                    null_version: false,
+                    delete_marker: false,
+                    body: row.body,
+                    size: row.size,
+                    md5: row.md5,
+                    parts: row.parts,
+                    mtime_ms: row.mtime_ms,
+                    storage_class: class_of(row.flags),
+                    attrs: ObjectAttrs::default(),
+                }
+                .etag()
+            })
+        }))
+    }
+
     pub(crate) fn find_live(
         &mut self,
         bucket: &str,

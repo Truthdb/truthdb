@@ -11942,6 +11942,160 @@ print("ok")
 }
 
 #[test]
+fn writes_and_deletes_hold_to_their_conditions() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "conditional");
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (user_key, user_secret) = user_with_key(&server, &account, "writer", Some(&policy));
+    let deletes_only = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (deleter_key, deleter_secret) =
+        user_with_key(&server, &account, "deleter", Some(&deletes_only));
+    let script = server.dir.join("conditional_writes.py");
+    std::fs::write(&script, CONDITIONAL_WRITES_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &user_key,
+            &user_secret,
+            &deleter_key,
+            &deleter_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const CONDITIONAL_WRITES_SCRIPT: &str = r#"
+import sys, json, threading, time
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, user_key, user_secret, deleter_key, deleter_secret = sys.argv[1:9]
+def client(access, secret_key):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3, user = client(key, secret), client(user_key, user_secret)
+deleter_client = client(deleter_key, deleter_secret)
+def refused(call, code, status=None):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+        if status:
+            assert error.response["ResponseMetadata"]["HTTPStatusCode"] == status, error.response
+s3.create_bucket(Bucket="cond")
+# Create only if absent; compare-and-swap on the ETag.
+first = s3.put_object(Bucket="cond", Key="k", Body=b"one", IfNoneMatch="*")["ETag"]
+refused(lambda: s3.put_object(Bucket="cond", Key="k", Body=b"two", IfNoneMatch="*"), "PreconditionFailed", 412)
+second = s3.put_object(Bucket="cond", Key="k", Body=b"two", IfMatch=first)["ETag"]
+refused(lambda: s3.put_object(Bucket="cond", Key="k", Body=b"three", IfMatch=first), "PreconditionFailed", 412)
+assert s3.get_object(Bucket="cond", Key="k")["Body"].read() == b"two"
+refused(lambda: s3.put_object(Bucket="cond", Key="missing", Body=b"x", IfMatch=first), "NoSuchKey", 404)
+# A copy's destination.
+refused(lambda: s3.copy_object(Bucket="cond", Key="k", CopySource={"Bucket": "cond", "Key": "k"},
+    MetadataDirective="REPLACE", IfNoneMatch="*"), "PreconditionFailed", 412)
+s3.copy_object(Bucket="cond", Key="copy", CopySource={"Bucket": "cond", "Key": "k"}, IfNoneMatch="*")
+s3.copy_object(Bucket="cond", Key="copy", CopySource={"Bucket": "cond", "Key": "k"},
+    MetadataDirective="REPLACE", Metadata={"m": "1"}, IfMatch=second)
+refused(lambda: s3.copy_object(Bucket="cond", Key="copy", CopySource={"Bucket": "cond", "Key": "k"},
+    MetadataDirective="REPLACE", IfMatch=first), "PreconditionFailed", 412)
+# A multipart upload: what was written meanwhile counts at its completion,
+# and a failed completion leaves the upload.
+upload = s3.create_multipart_upload(Bucket="cond", Key="mp")["UploadId"]
+part = s3.upload_part(Bucket="cond", Key="mp", UploadId=upload, PartNumber=1, Body=b"p")["ETag"]
+s3.put_object(Bucket="cond", Key="mp", Body=b"meanwhile")
+parts = {"Parts": [{"PartNumber": 1, "ETag": part}]}
+refused(lambda: s3.complete_multipart_upload(Bucket="cond", Key="mp", UploadId=upload,
+    MultipartUpload=parts, IfNoneMatch="*"), "PreconditionFailed", 412)
+meanwhile = s3.head_object(Bucket="cond", Key="mp")["ETag"]
+s3.complete_multipart_upload(Bucket="cond", Key="mp", UploadId=upload, MultipartUpload=parts, IfMatch=meanwhile)
+assert s3.get_object(Bucket="cond", Key="mp")["Body"].read() == b"p"
+# Versioned: the current version only; a delete marker is none to a write.
+s3.create_bucket(Bucket="vcond")
+s3.put_bucket_versioning(Bucket="vcond", VersioningConfiguration={"Status": "Enabled"})
+old = s3.put_object(Bucket="vcond", Key="v", Body=b"old")["ETag"]
+s3.delete_object(Bucket="vcond", Key="v")
+refused(lambda: s3.put_object(Bucket="vcond", Key="v", Body=b"x", IfMatch=old), "NoSuchKey", 404)
+s3.put_object(Bucket="vcond", Key="v", Body=b"new", IfNoneMatch="*")
+# Conditional deletes: a mismatch, a match; any (*) on a marker matches
+# nothing; nothing there.
+current = s3.head_object(Bucket="vcond", Key="v")["ETag"]
+refused(lambda: s3.delete_object(Bucket="vcond", Key="v", IfMatch=old), "PreconditionFailed", 412)
+s3.delete_object(Bucket="vcond", Key="v", IfMatch=current)
+refused(lambda: s3.delete_object(Bucket="vcond", Key="v", IfMatch="*"), "PreconditionFailed", 412)
+refused(lambda: s3.delete_object(Bucket="vcond", Key="never", IfMatch="*"), "NoSuchKey", 404)
+# Directory buckets' delete conditions are not here.
+refused(lambda: s3.delete_object(Bucket="cond", Key="k", IfMatchSize=3), "NotImplemented", 501)
+# Compared with an ETag, a delete reads the object: it needs s3:GetObject
+# too; with * it does not.
+held = s3.put_object(Bucket="cond", Key="held", Body=b"h")["ETag"]
+refused(lambda: deleter_client.delete_object(Bucket="cond", Key="held", IfMatch=held), "AccessDenied", 403)
+deleter_client.delete_object(Bucket="cond", Key="held", IfMatch="*")
+# DeleteObjects with each object's ETag.
+a = s3.put_object(Bucket="cond", Key="a", Body=b"a")["ETag"]
+s3.put_object(Bucket="cond", Key="b", Body=b"b")
+result = s3.delete_objects(Bucket="cond", Delete={"Objects": [
+    {"Key": "a", "ETag": a}, {"Key": "b", "ETag": a}]})
+assert [d["Key"] for d in result.get("Deleted", [])] == ["a"], result
+assert [(e["Key"], e["Code"]) for e in result["Errors"]] == [("b", "PreconditionFailed")], result
+s3.head_object(Bucket="cond", Key="b")
+# A delete that wins the race against a write's If-Match: a conflict.
+s3.put_object(Bucket="vcond", Key="race", Body=b"r")
+raced = s3.head_object(Bucket="vcond", Key="race")["ETag"]
+# The body is slow once the request is sent; meanwhile a delete wins.
+import io
+armed = threading.Event()
+class Slow(io.BytesIO):
+    def read(self, size=-1):
+        if armed.is_set():
+            time.sleep(1.5)
+            armed.clear()
+        return super().read(size)
+racer = client(key, secret)
+deleter = threading.Thread(target=lambda: (time.sleep(0.5), s3.delete_object(Bucket="vcond", Key="race")))
+def arm(**kwargs):
+    armed.set()
+    deleter.start()
+racer.meta.events.register("before-send.s3.PutObject", arm)
+refused(lambda: racer.put_object(Bucket="vcond", Key="race", Body=Slow(b"slow"), IfMatch=raced),
+    "ConditionalRequestConflict", 409)
+deleter.join()
+# A bucket policy that enforces conditional writes (S3's example): objects
+# are made only with If-None-Match; the parts of an upload need none.
+s3.create_bucket(Bucket="enforced")
+s3.put_bucket_policy(Bucket="enforced", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::enforced/*",
+    "Condition": {"Null": {"s3:if-none-match": "true"}, "Bool": {"s3:ObjectCreationOperation": "true"}}}]}))
+refused(lambda: user.put_object(Bucket="enforced", Key="e", Body=b"e"), "AccessDenied", 403)
+user.put_object(Bucket="enforced", Key="e", Body=b"e", IfNoneMatch="*")
+upload = user.create_multipart_upload(Bucket="enforced", Key="m")["UploadId"]
+part = user.upload_part(Bucket="enforced", Key="m", UploadId=upload, PartNumber=1, Body=b"m")["ETag"]
+parts = {"Parts": [{"PartNumber": 1, "ETag": part}]}
+refused(lambda: user.complete_multipart_upload(Bucket="enforced", Key="m", UploadId=upload,
+    MultipartUpload=parts), "AccessDenied", 403)
+user.complete_multipart_upload(Bucket="enforced", Key="m", UploadId=upload, MultipartUpload=parts, IfNoneMatch="*")
+print("ok")
+"#;
+
+#[test]
 fn reads_answer_conditional_and_range_requests_as_caches_expect() {
     let (server, key, secret) = server_with_key();
     let port = server.s3_port;

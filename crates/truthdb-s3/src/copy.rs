@@ -215,6 +215,9 @@ async fn copy_whole(
     } else {
         Vec::new()
     };
+    // The destination's conditions (`If-Match`, `If-None-Match`).
+    let condition = crate::conditional::Condition::of_write(&headers)?;
+    let write_condition = condition.clone();
     let (dst_bucket, dst_key) = (bucket.clone(), key.clone());
     let lookup_source_key = source_key.clone();
     // Resolve and share (or lease) in one lock hold: the source cannot
@@ -274,6 +277,13 @@ async fn copy_whole(
                 Err(err) => return Ok(Err(err)),
             };
         if !shared {
+            // Checked before the copy is streamed, and again at its write.
+            if let Some(condition) = &condition {
+                let current = file.head_object(&dst_bucket, &dst_key, VersionSel::Latest)?;
+                if let Err(err) = condition.check(current.ok().map(|info| info.etag()).as_deref()) {
+                    return Ok(Err(err));
+                }
+            }
             attrs.customer_key = target_record;
             if source.size > MAX_PUT_BYTES {
                 return Ok(Err(too_large_source()));
@@ -289,6 +299,12 @@ async fn copy_whole(
         }
         attrs.customer_key = source.attrs.customer_key.clone();
         let copied = file.transaction(|tx| {
+            if let Some(condition) = &condition {
+                let current = tx.current_etag(&dst_bucket, &dst_key)?.flatten();
+                if let Err(err) = condition.check(current.as_deref()) {
+                    return Ok(Err(err));
+                }
+            }
             let copied = tx.copy_object(
                 &dst_bucket,
                 &dst_key,
@@ -301,11 +317,12 @@ async fn copy_whole(
             if let (Ok(copied), Some(lock)) = (&copied, &shared_lock) {
                 tx.set_lock(&dst_bucket, &dst_key, copied.version, lock)?;
             }
-            Ok(copied)
+            Ok(Ok(copied))
         })?;
         let copied = match copied {
-            Ok(copied) => copied,
-            Err(err) => return Ok(Err(object_error(err, &dst_bucket, &dst_key))),
+            Ok(Ok(copied)) => copied,
+            Ok(Err(err)) => return Ok(Err(object_error(err, &dst_bucket, &dst_key))),
+            Err(err) => return Ok(Err(err)),
         };
         let mut versions = Vec::new();
         if let Some(version) = source_version {
@@ -359,6 +376,12 @@ async fn copy_whole(
                         Err(err) => return Ok(Err(err)),
                     };
                 let stored = file.transaction(|tx| {
+                    if let Some(condition) = &write_condition {
+                        let current = tx.current_etag(&dst_bucket, &dst_key)?.flatten();
+                        if let Err(err) = condition.recheck(current.as_deref()) {
+                            return Ok(Err(err));
+                        }
+                    }
                     let stored = tx.put_object(
                         &dst_bucket,
                         &dst_key,
@@ -371,8 +394,12 @@ async fn copy_whole(
                     if let (Ok(info), Some(lock)) = (&stored, &lock) {
                         tx.set_lock(&dst_bucket, &dst_key, info.version, lock)?;
                     }
-                    Ok(stored)
+                    Ok(Ok(stored))
                 })?;
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(err) => return Ok(Err(err)),
+                };
                 Ok(Ok((stored, versioning_of(file, &dst_bucket)?)))
             })
             .await??;

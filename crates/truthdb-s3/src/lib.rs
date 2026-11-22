@@ -10,6 +10,7 @@ pub mod batch;
 pub mod batch_run;
 pub mod cloudtrail;
 pub mod cloudwatch;
+pub mod conditional;
 pub mod copy;
 pub mod cors;
 pub mod delete;
