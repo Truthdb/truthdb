@@ -7,7 +7,10 @@
 //!
 //! Each replication is checked when it is made, not only when the
 //! configuration was put. A rule of the source's configuration must still
-//! send the version there (or it is not replicated, and has no status). The
+//! send the version there (or it is not replicated, and has no status); one
+//! for a bucket being waited for is checked as it is passed over, so a rule
+//! changed, disabled or deleted drops its work at once. Replicas made stay,
+//! as do the statuses recorded. The
 //! destination must still exist, have versioning enabled, and have Object
 //! Lock when the source has it, and the one who put the configuration must
 //! be allowed `s3:GetObjectVersionForReplication` on the source version
@@ -516,12 +519,19 @@ fn prepare(
         queue.last().map(|queued| queued.number)
     };
     let mut made = 0;
+    let mut configs = HashMap::new();
     for queued in &queue {
         if made == BATCH {
             next = Some(queued.number - 1);
             break;
         }
         if held.contains(&queued.destination) {
+            // One no rule sends any more goes now, not when its bucket is
+            // next tried (it would be pending until then).
+            if !still_sent(file, queued, &mut configs)? {
+                file.transaction(|tx| tx.drop_replication(queued, now_ms()))?;
+                continue;
+            }
             passed
                 .entry(queued.destination.clone())
                 .or_insert(queued.number);
@@ -533,6 +543,32 @@ fn prepare(
         }
     }
     Ok((made, next))
+}
+
+/// Whether a rule of its source's configuration (read once a call, into
+/// `configs`) still sends `queued` to its destination, as [`replicate`]
+/// decides it: a new replica or a delete marker by its key, a tag change
+/// by its version's tags now.
+fn still_sent(
+    file: &mut ObjFile<'_>,
+    queued: &QueuedReplication,
+    configs: &mut HashMap<String, Option<ReplicationConfig>>,
+) -> Result<bool, StorageError> {
+    if !configs.contains_key(&queued.bucket) {
+        let config = file.replication(&queued.bucket)?;
+        configs.insert(queued.bucket.clone(), config);
+    }
+    let Some(Some(config)) = configs.get(&queued.bucket) else {
+        return Ok(false);
+    };
+    let tags = match queued.work {
+        ReplicationWork::Metadata => file
+            .object_version(&queued.bucket, &queued.key, VersionSel::Seq(queued.version))?
+            .map(|info| info.attrs.tags)
+            .unwrap_or_default(),
+        ReplicationWork::Create | ReplicationWork::DeleteMarker => Vec::new(),
+    };
+    Ok(rule_naming(config, queued, &tags).is_some())
 }
 
 /// Sends `job`'s replica: in one PUT, or in parts past [`PART`]; a delete
@@ -2064,6 +2100,161 @@ mod tests {
             &lock(500),
             1_000
         )));
+    }
+
+    #[test]
+    fn work_for_a_bucket_being_waited_for_goes_once_no_rule_sends_it() {
+        use truthdb_object::{
+            BodyWriter, ObjectAttrs, ReplicationDestination, ReplicationRule, StorageClass,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-s3-replication-stopped-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let storage = create(&path);
+        let me = "111111111111";
+        let rule = |id: &str, prefix: &str, bucket: &str, enabled: bool| ReplicationRule {
+            id: id.into(),
+            priority: 1,
+            enabled,
+            filter: truthdb_object::ReplicationFilter::Prefix(prefix.into()),
+            replica_modifications: false,
+            delete_markers: false,
+            destination: ReplicationDestination {
+                bucket: bucket.into(),
+                account: None,
+                storage_class: None,
+                owner_override: false,
+                owner: None,
+                metrics: None,
+                event_threshold: false,
+                replication_time: None,
+            },
+        };
+        let config = |rules| ReplicationConfig {
+            role: "role".into(),
+            rules,
+            account: me.into(),
+            user: None,
+        };
+        let put_config = |rules| {
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| tx.put_replication("src", &config(rules)))
+                .unwrap()
+        };
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_account(me, "me", 1)?.unwrap();
+                tx.create_bucket("src", me, 1)?.unwrap();
+                tx.set_versioning("src", Versioning::Enabled)?.unwrap();
+                for name in ["far", "other"] {
+                    tx.create_remote_bucket(&RemoteBucket {
+                        name: name.into(),
+                        account: me.into(),
+                        endpoint: "http://127.0.0.1:1".into(),
+                        region: "us-east-1".into(),
+                        access_key: "k".into(),
+                        secret: "s".into(),
+                        ca_pem: None,
+                        created_ms: 1,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let put = |key: &str| {
+            let mut writer = BodyWriter::begin(&storage, 1).unwrap();
+            writer.write(&storage, b"x", 1).unwrap();
+            let sealed = writer.finish(&storage, 1).unwrap();
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| {
+                    tx.put_object(
+                        "src",
+                        key,
+                        &sealed,
+                        &ObjectAttrs::default(),
+                        StorageClass::Standard,
+                        1,
+                        0,
+                    )
+                })
+                .unwrap()
+                .unwrap()
+                .version
+        };
+        let queued = || {
+            ObjFile::new(&mut storage.lock())
+                .replication_queue(None, 100)
+                .unwrap()
+                .into_iter()
+                .map(|q| (q.key, q.destination))
+                .collect::<Vec<_>>()
+        };
+        let status = |key: &str, version: u64| {
+            ObjFile::new(&mut storage.lock())
+                .replication_status("src", key, version)
+                .unwrap()
+        };
+        // Both buckets are being waited for: their work is passed over,
+        // while a rule still sends it.
+        let held: HashSet<String> = ["far".to_string(), "other".to_string()].into();
+        let scan = || {
+            let mut lock = storage.lock();
+            let mut file = ObjFile::new(&mut lock);
+            let (mut jobs, mut passed) = (Vec::new(), HashMap::new());
+            prepare(&mut file, None, &held, &mut jobs, &mut passed).unwrap();
+            assert!(jobs.is_empty());
+            passed
+        };
+        let both = |key: &str| {
+            vec![
+                (key.to_string(), "far".to_string()),
+                (key.to_string(), "other".to_string()),
+            ]
+        };
+        put_config(vec![
+            rule("f", "", "far", true),
+            rule("o", "", "other", true),
+        ]);
+        let a = put("a");
+        assert_eq!(scan().len(), 2);
+        assert_eq!(queued(), both("a"));
+        // A rule set to Disabled: its work goes; the other's stays.
+        put_config(vec![
+            rule("f", "", "far", false),
+            rule("o", "", "other", true),
+        ]);
+        assert_eq!(scan().len(), 1);
+        assert_eq!(queued(), [("a".to_string(), "other".to_string())]);
+        assert_eq!(status("a", a), Some(ReplicationStatus::Pending));
+        // A configuration replaced by one naming other keys only.
+        put_config(vec![
+            rule("f", "", "far", true),
+            rule("o", "logs/", "other", true),
+        ]);
+        let b = put("b");
+        assert_eq!(
+            queued(),
+            [
+                ("a".to_string(), "other".to_string()),
+                ("b".to_string(), "far".to_string())
+            ]
+        );
+        scan();
+        assert_eq!(queued(), [("b".to_string(), "far".to_string())]);
+        // a's last destination went: no status left; b is still on its way.
+        assert_eq!(status("a", a), None);
+        assert_eq!(status("b", b), Some(ReplicationStatus::Pending));
+        // The configuration deleted: everything goes.
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_replication("src").map(|_| ()))
+            .unwrap();
+        assert!(scan().is_empty());
+        assert!(queued().is_empty());
+        assert_eq!(status("b", b), None);
+        drop(storage);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
