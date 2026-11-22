@@ -645,6 +645,55 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
+    /// Queues `info`, a version of `bucket`'s `key`, to be replicated again,
+    /// as a Batch Replication task does: to each destination a rule of the
+    /// bucket's configuration names for it now, whatever its status. A
+    /// source version is PENDING until each is made (replications of it
+    /// still queued count on); a replica stays REPLICA. Returns false, and
+    /// queues nothing, when no rule replicates it (or it is archived, or a
+    /// delete marker).
+    pub fn replicate_again(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        info: &ObjectInfo,
+    ) -> Result<bool, StorageError> {
+        let Some(config) = self.replication_config(bucket)? else {
+            return Ok(false);
+        };
+        let rules = config.rules_for(key, &info.attrs.tags);
+        if rules.is_empty() || info.delete_marker || info.storage_class.is_archived() {
+            return Ok(false);
+        }
+        let queued = rules.len() as u16;
+        match self.status_row(bucket, key, info.version)? {
+            Some(StatusRow::Replica) => {}
+            row => {
+                let still = match row {
+                    Some(StatusRow::Source(tally)) => tally.pending,
+                    _ => 0,
+                };
+                let tally = Tally {
+                    pending: still.saturating_add(queued),
+                    ..Tally::default()
+                };
+                self.set_status_row(bucket, key, info.version, &StatusRow::Source(tally))?;
+            }
+        }
+        for rule in rules {
+            self.enqueue(QueuedReplication {
+                number: 0,
+                work: ReplicationWork::Create,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version: info.version,
+                destination: rule.destination.bucket.clone(),
+                storage_class: rule.destination.storage_class,
+            })?;
+        }
+        Ok(true)
+    }
+
     /// Queues a change of a version's tags (now `tags`) for its replica,
     /// if it is queued or replicated (not one that failed) and a rule still
     /// applies to it; or, for a replica, back to the bucket its rule names

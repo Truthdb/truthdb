@@ -128,8 +128,10 @@ pub struct Job {
     /// Whether its results are still kept (until its report is written).
     pub results_left: bool,
     /// A generated manifest's listing: the last key listed (`None`: none
-    /// yet), and whether the listing is done.
+    /// yet), the last version of it listed when it lists every version,
+    /// and whether the listing is done.
     pub listed_after: Option<String>,
+    pub listed_version: Option<u64>,
     pub listing_done: bool,
     /// The generated manifest written out: its bucket, key, S3 version id
     /// (empty: none) and ETag.
@@ -165,6 +167,7 @@ impl Job {
             next_result: 0,
             results_left: true,
             listed_after: None,
+            listed_version: None,
             listing_done: false,
             generated: None,
         }
@@ -188,7 +191,8 @@ impl Job {
     }
 }
 
-const FORMAT: u8 = 1;
+/// The format jobs are written in; format 1 (no listed version) is read.
+const FORMAT: u8 = 2;
 
 impl Job {
     fn encode(&self) -> Vec<u8> {
@@ -250,12 +254,14 @@ impl Job {
             }
             None => out.u8(0),
         }
+        out.opt_u64(self.listed_version);
         out.0
     }
 
     fn decode(number: u64, bytes: &[u8]) -> Result<Self, StorageError> {
         let mut input = Reader::new(bytes, "batch job");
-        if input.u8()? != FORMAT {
+        let format = input.u8()?;
+        if !(1..=FORMAT).contains(&format) {
             return Err(input.corrupt());
         }
         let tag = input.u64()?;
@@ -318,6 +324,10 @@ impl Job {
                 Some((input.str()?, input.str()?, input.str()?, input.str()?))
             } else {
                 None
+            },
+            listed_version: match format {
+                1 => None,
+                _ => input.opt_u64()?,
             },
         };
         if !input.rest().is_empty() {
@@ -629,5 +639,40 @@ impl ObjFile<'_> {
             Ok((seq, JobResult::decode(&row)?))
         })
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Job;
+
+    #[test]
+    fn a_job_keeps_its_listed_version_and_one_of_format_1_still_reads() {
+        let mut job = Job::new("111122223333", None, "token", vec![7]);
+        job.listed_after = Some("k".into());
+        job.listed_version = Some(42);
+        let bytes = job.encode();
+        assert_eq!(bytes[0], 2);
+        let read = Job::decode(0, &bytes).unwrap();
+        assert_eq!(
+            (read.listed_after.as_deref(), read.listed_version),
+            (Some("k"), Some(42))
+        );
+        // Format 1: no listed version at the end.
+        job.listed_version = None;
+        let mut old = job.encode();
+        assert_eq!(old.pop(), Some(0));
+        old[0] = 1;
+        let read = Job::decode(0, &old).unwrap();
+        assert_eq!(
+            (read.listed_after.as_deref(), read.listed_version),
+            (Some("k"), None)
+        );
+        // Format 1 with bytes after its end, or an unknown format: corrupt.
+        let mut long = old.clone();
+        long.push(0);
+        assert!(Job::decode(0, &long).is_err());
+        old[0] = 3;
+        assert!(Job::decode(0, &old).is_err());
     }
 }

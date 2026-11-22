@@ -227,8 +227,12 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
             }
         }
     };
+    // S3 no longer offers it: existing objects are replicated by Batch
+    // Replication (a batch job's S3ReplicateObject).
     if element.one("ExistingObjectReplication")?.is_some() {
-        return Err(not_yet("ExistingObjectReplication"));
+        return Err(S3Error::not_implemented(
+            "ExistingObjectReplication is not offered; replicate existing objects with a batch job's S3ReplicateObject",
+        ));
     }
     let destination = destination(element.one("Destination")?.ok_or_else(malformed)?)?;
     Ok(ReplicationRule {

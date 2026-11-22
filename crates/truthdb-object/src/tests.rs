@@ -7129,6 +7129,158 @@ fn an_account_with_remote_buckets_is_not_dropped() {
 }
 
 #[test]
+fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
+    use crate::{
+        ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
+        ReplicationStatus, StorageClass, VersionSel, Versioning,
+    };
+    let path = temp_path("replication-again");
+    let storage = create(&path);
+    let to = |bucket: &str, prefix: &str| ReplicationRule {
+        id: bucket.to_string(),
+        priority: 1,
+        enabled: true,
+        filter: ReplicationFilter::Prefix(prefix.to_string()),
+        replica_modifications: false,
+        destination: ReplicationDestination {
+            bucket: bucket.to_string(),
+            account: None,
+            storage_class: None,
+            owner_override: false,
+            owner: None,
+        },
+    };
+    let config = |rules| ReplicationConfig {
+        role: "role".into(),
+        rules,
+        account: DEFAULT_ACCOUNT.into(),
+        user: None,
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["src", "one", "two", "plain"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+            }
+            tx.put_replication("src", &config(vec![to("one", ""), to("two", "")]))?;
+            tx.put_replication("one", &config(vec![to("two", "docs/")]))
+        })
+        .unwrap();
+    let status = |bucket: &str, key: &str, version: u64| {
+        ObjFile::new(&mut storage.lock())
+            .replication_status(bucket, key, version)
+            .unwrap()
+    };
+    let queued = |bucket: &str, key: &str| {
+        ObjFile::new(&mut storage.lock())
+            .replication_queue(None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|q| q.bucket == bucket && q.key == key)
+            .collect::<Vec<_>>()
+    };
+    let finish = |q: &crate::QueuedReplication, how: ReplicationStatus| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.finish_replication(q, Some(how)))
+            .unwrap()
+    };
+    let again = |bucket: &str, key: &str, version: u64| {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        let info = file
+            .object_version(bucket, key, VersionSel::Seq(version))
+            .unwrap()
+            .unwrap();
+        file.transaction(|tx| tx.replicate_again(bucket, key, &info))
+            .unwrap()
+    };
+    // FAILED for one destination: queued again for both, PENDING until
+    // both are made again.
+    let a = put_at(&storage, "src", "a", 10, StorageClass::Standard, T0);
+    let first = queued("src", "a");
+    finish(&first[0], ReplicationStatus::Completed);
+    finish(&first[1], ReplicationStatus::Failed);
+    assert_eq!(status("src", "a", a), Some(ReplicationStatus::Failed));
+    assert!(again("src", "a", a));
+    let second = queued("src", "a");
+    assert_eq!(
+        second
+            .iter()
+            .map(|q| q.destination.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+    assert_eq!(status("src", "a", a), Some(ReplicationStatus::Pending));
+    finish(&second[0], ReplicationStatus::Completed);
+    assert_eq!(status("src", "a", a), Some(ReplicationStatus::Pending));
+    finish(&second[1], ReplicationStatus::Completed);
+    assert_eq!(status("src", "a", a), Some(ReplicationStatus::Completed));
+    // Still queued: what is queued already counts on, so it is PENDING
+    // until every replication queued is made.
+    let b = put_at(&storage, "src", "b", 10, StorageClass::Standard, T0);
+    assert!(again("src", "b", b));
+    let all = queued("src", "b");
+    assert_eq!(all.len(), 4);
+    for q in &all[..3] {
+        finish(q, ReplicationStatus::Completed);
+        assert_eq!(status("src", "b", b), Some(ReplicationStatus::Pending));
+    }
+    finish(&all[3], ReplicationStatus::Completed);
+    assert_eq!(status("src", "b", b), Some(ReplicationStatus::Completed));
+    // A replica is replicated on by its bucket's own rules, and stays a
+    // replica.
+    let c = put_at(&storage, "src", "docs/c", 10, StorageClass::Standard, T0);
+    {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        let info = file
+            .object_version("src", "docs/c", VersionSel::Seq(c))
+            .unwrap()
+            .unwrap();
+        file.transaction(|tx| {
+            tx.insert_replica(
+                "one",
+                "docs/c",
+                &info,
+                &info.attrs,
+                info.storage_class,
+                &crate::ObjectLock::default(),
+                T0,
+                0,
+            )
+            .map(|made| assert_eq!(made, Ok(true)))
+        })
+        .unwrap();
+    }
+    assert!(again("one", "docs/c", c));
+    let onward = queued("one", "docs/c");
+    assert_eq!(onward.len(), 1);
+    assert_eq!(onward[0].destination, "two");
+    assert_eq!(status("one", "docs/c", c), Some(ReplicationStatus::Replica));
+    finish(&onward[0], ReplicationStatus::Completed);
+    assert_eq!(status("one", "docs/c", c), Some(ReplicationStatus::Replica));
+    // Not eligible, nothing queued: no rule for its key, no configuration,
+    // archived, a delete marker.
+    let outside = put_at(&storage, "one", "other", 10, StorageClass::Standard, T0);
+    assert!(!again("one", "other", outside));
+    let plain = put_at(&storage, "plain", "p", 10, StorageClass::Standard, T0);
+    assert!(!again("plain", "p", plain));
+    let cold = put_at(&storage, "src", "cold", 10, StorageClass::Glacier, T0);
+    assert!(!again("src", "cold", cold));
+    assert_eq!(status("src", "cold", cold), None);
+    let marker = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("src", "a", None, false, T0, 0))
+        .unwrap()
+        .unwrap();
+    let marker = marker.version.expect("a delete marker");
+    assert!(!again("src", "a", marker));
+    assert!(queued("one", "other").is_empty() && queued("plain", "p").is_empty());
+    assert!(queued("src", "cold").is_empty());
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_version_replicated_to_several_destinations_is_completed_once_all_are_made() {
     use crate::{
         ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
