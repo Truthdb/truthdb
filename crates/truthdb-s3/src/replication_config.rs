@@ -11,14 +11,16 @@
 //! owner enforced ownership every bucket here has. Rules filter by key
 //! prefix. What later replication steps build is refused rather than
 //! accepted and ignored: tag filters, rules without a Filter (whose delete
-//! markers replicate), delete-marker replication, several destinations,
-//! KMS encryption, replication time and metrics, and existing-object
-//! replication.
+//! markers replicate), several destinations, KMS encryption, replication
+//! time and metrics, and existing-object replication. Delete-marker
+//! replication is refused for a rule that filters by tags, as S3 refuses
+//! it.
 //!
 //! The `Role` is kept as given: there are no IAM roles, so replication acts
 //! as the one who put the configuration (its account, and its user): it
 //! replicates a version only if they may `s3:GetObjectVersionForReplication`
-//! it and `s3:ReplicateObject` in the destination. The object engine keeps
+//! it and `s3:ReplicateObject` in the destination, and a delete marker only
+//! if they may `s3:ReplicateDelete` there. The object engine keeps
 //! the configuration and queues what it replicates (see
 //! `truthdb_object::ReplicationConfig`); `replication_run` writes the
 //! replicas.
@@ -202,8 +204,17 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
         )
     })?;
     markers.only(&["Status"])?;
-    if status(markers)? {
-        return Err(not_yet("Delete marker replication"));
+    let delete_markers = status(markers)?;
+    // S3 replicates no delete markers for a rule that filters by tags.
+    let tagged = match &filter {
+        ReplicationFilter::Tag(..) => true,
+        ReplicationFilter::And { tags, .. } => !tags.is_empty(),
+        ReplicationFilter::All | ReplicationFilter::Prefix(_) => false,
+    };
+    if delete_markers && tagged {
+        return Err(invalid(
+            "Delete marker replication is not supported if any Tag filter is specified",
+        ));
     }
     // Replica modification sync; objects under KMS keys (there is no KMS
     // here) are not offered.
@@ -241,6 +252,7 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
         enabled,
         filter,
         replica_modifications,
+        delete_markers,
         destination,
     })
 }
@@ -342,9 +354,14 @@ pub fn render(config: &ReplicationConfig) -> String {
                  </SseKmsEncryptedObjects></SourceSelectionCriteria>",
             );
         }
-        out.push_str(
-            "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>",
-        );
+        out.push_str(&format!(
+            "<DeleteMarkerReplication><Status>{}</Status></DeleteMarkerReplication>",
+            if rule.delete_markers {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        ));
         let destination = &rule.destination;
         out.push_str(&format!(
             "<Destination><Bucket>{BUCKET_ARN}{}</Bucket>",
@@ -639,6 +656,7 @@ mod tests {
                 enabled: true,
                 filter: ReplicationFilter::Prefix("logs/ & more".into()),
                 replica_modifications: false,
+                delete_markers: false,
                 destination: Destination {
                     bucket: "copies".into(),
                     account: Some("000000000001".into()),
@@ -869,15 +887,30 @@ mod tests {
                 "{destination}"
             );
         }
-        // Enabled delete-marker replication, and a second destination.
-        assert_eq!(
-            code(
-                "<Rule><Status>Enabled</Status><Priority>1</Priority><Filter/>\
+        // Delete-marker replication: read and rendered back for a rule by
+        // prefix (or of every key); refused for one that filters by tags,
+        // as S3 replicates no markers for those.
+        let markers = |filter: &str| {
+            format!(
+                "<Rule><Status>Enabled</Status><Priority>1</Priority>{filter}\
                  <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>\
                  <Destination><Bucket>arn:aws:s3:::copies</Bucket></Destination></Rule>"
-            ),
-            unbuilt
-        );
+            )
+        };
+        for filter in ["<Filter/>", "<Filter><Prefix>p/</Prefix></Filter>"] {
+            let parsed = config(&markers(filter)).unwrap();
+            assert!(parsed.rules[0].delete_markers, "{filter}");
+            assert_eq!(parse(render(&parsed).as_bytes()), Ok(parsed));
+        }
+        assert!(!config(&rule_with("<Filter/>")).unwrap().rules[0].delete_markers);
+        for filter in [
+            "<Filter><Tag><Key>a</Key><Value>1</Value></Tag></Filter>",
+            "<Filter><And><Prefix>p/</Prefix><Tag><Key>a</Key><Value>1</Value></Tag></And></Filter>",
+        ] {
+            assert_eq!(code(&markers(filter)), invalid, "{filter}");
+        }
+        let untagged = config(&markers("<Filter><And><Prefix>p/</Prefix></And></Filter>")).unwrap();
+        assert!(untagged.rules[0].delete_markers);
         // Several destinations.
         let several = config(&format!(
             "{}{}",

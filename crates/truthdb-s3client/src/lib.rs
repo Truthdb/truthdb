@@ -889,6 +889,20 @@ impl Client {
         .map(|_| ())
     }
 
+    /// Whether the bucket has versioning enabled (GetBucketVersioning).
+    pub async fn versioning_enabled(&self, bucket: &str) -> Result<bool, Error> {
+        let (_, body) = self
+            .call(
+                Method::GET,
+                &Self::bucket_path(bucket)?,
+                "versioning",
+                &[],
+                Bytes::new(),
+            )
+            .await?;
+        Ok(texts(&body, "Status")? == ["Enabled"])
+    }
+
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), Error> {
         self.call(
             Method::DELETE,

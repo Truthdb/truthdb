@@ -6828,6 +6828,7 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
                 enabled: true,
                 filter: crate::ReplicationFilter::Prefix(prefix.to_string()),
                 replica_modifications: false,
+                delete_markers: false,
                 destination: ReplicationDestination {
                     bucket: "dst".to_string(),
                     account: None,
@@ -7129,6 +7130,152 @@ fn an_account_with_remote_buckets_is_not_dropped() {
 }
 
 #[test]
+fn a_delete_marker_is_queued_for_the_rules_that_replicate_them_and_kept_as_made() {
+    use crate::{
+        ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
+        ReplicationWork, StorageClass, VersionSel, Versioning,
+    };
+    let path = temp_path("replication-markers");
+    let storage = create(&path);
+    let to = |bucket: &str, prefix: &str, delete_markers: bool| ReplicationRule {
+        id: bucket.to_string(),
+        priority: 1,
+        enabled: true,
+        filter: ReplicationFilter::Prefix(prefix.to_string()),
+        replica_modifications: false,
+        delete_markers,
+        destination: ReplicationDestination {
+            bucket: bucket.to_string(),
+            account: None,
+            storage_class: None,
+            owner_override: false,
+            owner: None,
+        },
+    };
+    let config = ReplicationConfig {
+        role: "role".into(),
+        rules: vec![
+            to("marked", "", true),
+            to("plain", "", false),
+            to("docs", "docs/", true),
+        ],
+        account: DEFAULT_ACCOUNT.into(),
+        user: None,
+    };
+    // Stored as format 4; one stored as format 3 (no marker flag) reads
+    // with none.
+    let encoded = config.encode();
+    assert_eq!(encoded[0], 4);
+    assert_eq!(ReplicationConfig::decode(&encoded).unwrap(), config);
+    let single = ReplicationConfig {
+        rules: vec![to("plain", "", false)],
+        ..config.clone()
+    };
+    let mut old = single.encode();
+    assert_eq!(old.pop(), Some(0));
+    old[0] = 3;
+    assert_eq!(ReplicationConfig::decode(&old).unwrap(), single);
+    old[0] = 5;
+    assert!(ReplicationConfig::decode(&old).is_err());
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["src", "marked", "plain", "docs"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+            }
+            tx.put_replication("src", &config)
+        })
+        .unwrap();
+    let a = put_at(&storage, "src", "a", 10, StorageClass::Standard, T0);
+    let marker = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let deleted = tx
+                .delete_object("src", "a", None, false, T0 + 5, 0)?
+                .unwrap();
+            tx.queue_marker_replication("src", "a", deleted.version.unwrap())?;
+            Ok(deleted.version.unwrap())
+        })
+        .unwrap();
+    let markers: Vec<String> = ObjFile::new(&mut storage.lock())
+        .replication_queue(None, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|q| q.work == ReplicationWork::DeleteMarker)
+        .map(|q| {
+            assert_eq!(
+                (q.bucket.as_str(), q.key.as_str(), q.version),
+                ("src", "a", marker)
+            );
+            q.destination
+        })
+        .collect();
+    assert_eq!(
+        markers,
+        ["marked"],
+        "only to the rule asking for markers, for its keys"
+    );
+    // No status: a marker has none.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .replication_status("src", "a", marker)
+            .unwrap(),
+        None
+    );
+    // Its replica: a marker of the same number and time, the key's newest
+    // version there; made once.
+    let insert = |bucket: &str| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.insert_marker_replica(bucket, "a", marker, T0 + 5, T0 + 9))
+            .unwrap()
+    };
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let info = file
+        .object_version("src", "a", VersionSel::Seq(a))
+        .unwrap()
+        .unwrap();
+    file.transaction(|tx| {
+        tx.insert_replica(
+            "marked",
+            "a",
+            &info,
+            &info.attrs,
+            info.storage_class,
+            &crate::ObjectLock::default(),
+            T0,
+            0,
+        )
+        .map(|made| assert_eq!(made, Ok(true)))
+    })
+    .unwrap();
+    drop(guard);
+    assert_eq!(insert("marked"), Ok(true));
+    assert_eq!(insert("marked"), Ok(false));
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let newest = file
+        .object_version("marked", "a", VersionSel::Latest)
+        .unwrap()
+        .unwrap();
+    assert!(newest.delete_marker);
+    assert_eq!((newest.version, newest.mtime_ms), (marker, T0 + 5));
+    assert!(
+        file.head_object("marked", "a", VersionSel::Latest)
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        file.head_object("marked", "a", VersionSel::Seq(a))
+            .unwrap()
+            .is_ok()
+    );
+    drop(guard);
+    assert_eq!(insert("missing"), Err(crate::ObjectError::NoSuchBucket));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
     use crate::{
         ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
@@ -7142,6 +7289,7 @@ fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
         enabled: true,
         filter: ReplicationFilter::Prefix(prefix.to_string()),
         replica_modifications: false,
+        delete_markers: false,
         destination: ReplicationDestination {
             bucket: bucket.to_string(),
             account: None,
@@ -7303,6 +7451,7 @@ fn a_version_replicated_to_several_destinations_is_completed_once_all_are_made()
         enabled: true,
         filter: ReplicationFilter::All,
         replica_modifications: false,
+        delete_markers: false,
         destination: ReplicationDestination {
             bucket: bucket.to_string(),
             account: None,
