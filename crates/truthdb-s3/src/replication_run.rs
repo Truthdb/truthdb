@@ -561,11 +561,15 @@ fn still_sent(
     let Some(Some(config)) = configs.get(&queued.bucket) else {
         return Ok(false);
     };
+    // A version gone is closed as `replicate` closes it, when its bucket
+    // is next tried (not dropped here).
+    let Ok(version) =
+        file.object_version(&queued.bucket, &queued.key, VersionSel::Seq(queued.version))?
+    else {
+        return Ok(true);
+    };
     let tags = match queued.work {
-        ReplicationWork::Metadata => file
-            .object_version(&queued.bucket, &queued.key, VersionSel::Seq(queued.version))?
-            .map(|info| info.attrs.tags)
-            .unwrap_or_default(),
+        ReplicationWork::Metadata => version.attrs.tags,
         ReplicationWork::Create | ReplicationWork::DeleteMarker => Vec::new(),
     };
     Ok(rule_naming(config, queued, &tags).is_some())
