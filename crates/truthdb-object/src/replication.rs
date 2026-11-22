@@ -649,7 +649,8 @@ impl ObjTxn<'_, '_> {
     /// as a Batch Replication task does: to each destination a rule of the
     /// bucket's configuration names for it now, whatever its status. A
     /// source version is PENDING until each is made (replications of it
-    /// still queued count on); a replica stays REPLICA. Returns false, and
+    /// still queued count on, and one that failed is tried again); a
+    /// replica stays REPLICA. Returns false, and
     /// queues nothing, when no rule replicates it (or it is archived, or a
     /// delete marker).
     pub fn replicate_again(
@@ -669,13 +670,17 @@ impl ObjTxn<'_, '_> {
         match self.status_row(bucket, key, info.version)? {
             Some(StatusRow::Replica) => {}
             row => {
-                let still = match row {
-                    Some(StatusRow::Source(tally)) => tally.pending,
-                    _ => 0,
+                // Failures are tried again; replications made stay counted,
+                // so a version whose new ones are dropped unmade (its rules
+                // gone) is still COMPLETED.
+                let before = match row {
+                    Some(StatusRow::Source(tally)) => tally,
+                    _ => Tally::default(),
                 };
                 let tally = Tally {
-                    pending: still.saturating_add(queued),
-                    ..Tally::default()
+                    pending: before.pending.saturating_add(queued),
+                    completed: before.completed,
+                    failed: 0,
                 };
                 self.set_status_row(bucket, key, info.version, &StatusRow::Source(tally))?;
             }

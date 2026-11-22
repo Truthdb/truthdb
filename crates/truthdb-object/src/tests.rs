@@ -7215,6 +7215,15 @@ fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
     assert_eq!(status("src", "a", a), Some(ReplicationStatus::Pending));
     finish(&second[1], ReplicationStatus::Completed);
     assert_eq!(status("src", "a", a), Some(ReplicationStatus::Completed));
+    // Queued again and dropped unmade (no rule sends it any more): still
+    // COMPLETED, as its replicas are made.
+    assert!(again("src", "a", a));
+    for q in queued("src", "a") {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.drop_replication(&q))
+            .unwrap();
+    }
+    assert_eq!(status("src", "a", a), Some(ReplicationStatus::Completed));
     // Still queued: what is queued already counts on, so it is PENDING
     // until every replication queued is made.
     let b = put_at(&storage, "src", "b", 10, StorageClass::Standard, T0);

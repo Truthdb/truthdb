@@ -9894,26 +9894,41 @@ fn batch_replication_replicates_again_what_a_manifest_or_its_filters_name_across
         assert!(rows.contains(line), "{line}: {rows}");
     }
 
-    // A creator who may not s3:InitiateReplication: each task denied.
-    let policy = r#"{"Version": "2012-10-17", "Statement": [
-        {"Effect": "Allow", "Action": ["s3:CreateJob", "s3:GetObject", "s3:GetObjectVersion",
-         "s3:PutObject", "s3:PutInventoryConfiguration"], "Resource": "*"}]}"#
-        .replace('\n', " ");
-    let (user_key, user_secret) = user_with_key(&server, &account, "replicator", Some(&policy));
+    // A creator who may not s3:InitiateReplication: each task denied. One
+    // who may not s3:GetReplicationConfiguration generates no manifest.
+    let policy = |actions: &str| {
+        format!(
+            r#"{{"Version": "2012-10-17", "Statement": [{{"Effect": "Allow", "Action": [
+            "s3:CreateJob", "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject",
+            "s3:PutInventoryConfiguration"{actions}], "Resource": "*"}}]}}"#
+        )
+        .replace('\n', " ")
+    };
+    let created_after = "<CreatedAfter>2000-01-01T00:00:00Z</CreatedAfter>";
+    let read_config = policy(r#", "s3:GetReplicationConfiguration""#);
+    let (user_key, user_secret) =
+        user_with_key(&server, &account, "replicator", Some(&read_config));
     let job = create(
         &server,
         (&user_key, &user_secret),
-        generated(
-            "gen-2",
-            "src",
-            "<CreatedAfter>2000-01-01T00:00:00Z</CreatedAfter>",
-            false,
-        ),
+        generated("gen-2", "src", created_after, false),
     );
     let answer = ended(&server, &job);
     assert_eq!(
-        xml_value(&answer, "NumberOfTasksSucceeded"),
-        "0",
+        counts(&answer),
+        ("4".into(), "0".into(), "4".into()),
+        "{answer}"
+    );
+    let (user_key, user_secret) = user_with_key(&server, &account, "blind", Some(&policy("")));
+    let job = create(
+        &server,
+        (&user_key, &user_secret),
+        generated("gen-4", "src", created_after, false),
+    );
+    let answer = ended(&server, &job);
+    assert_eq!(
+        xml_value(&answer, "FailureCode"),
+        "AccessDenied",
         "{answer}"
     );
 

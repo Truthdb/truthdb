@@ -719,9 +719,15 @@ fn prepare_listing(
         .map(|()| None);
     }
     let authz = Authz::load_now(file, &creator(job), vec![bucket.clone()], Vec::new(), now)?;
+    // Batch Replication reads the bucket's replication configuration for
+    // it too, as AWS's role policy for a generated manifest asks.
     if authz
         .check("s3:PutInventoryConfiguration", Resource::Bucket(bucket))
         .is_err()
+        || (spec.operation == Operation::Replicate
+            && authz
+                .check("s3:GetReplicationConfiguration", Resource::Bucket(bucket))
+                .is_err())
     {
         return finish_failed(
             file,
