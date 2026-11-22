@@ -411,7 +411,7 @@ fn record(
     call: &Call,
     who: &Caller,
     recipient: &str,
-    owner: Option<&str>,
+    (owner, source_owner): (Option<&str>, Option<&str>),
     time_ms: u64,
     request_id: &str,
     event_id: &str,
@@ -504,6 +504,9 @@ fn record(
             if let (Some(key), Fit::Whole) = (&call.key, fit) {
                 record["requestParameters"]["key"] = json!(truncated(key, MAX_KEY));
             }
+            if let Some(source) = &call.source {
+                resources.insert(1, source_resource(state, source, source_owner, account));
+            }
             record["resources"] = json!(resources);
         } else {
             let mut resources = vec![json!({
@@ -532,18 +535,8 @@ fn record(
                 ),
                 None => {}
             }
-            if let Some((source_bucket, source_key)) = &call.source {
-                resources.insert(
-                    1,
-                    json!({
-                        "type": "AWS::S3::Object",
-                        "ARN": format!(
-                            "arn:aws:s3:::{}/{}",
-                            truncated(&printable(source_bucket), 255),
-                            truncated(source_key, MAX_KEY)
-                        ),
-                    }),
-                );
+            if let Some(source) = &call.source {
+                resources.insert(1, source_resource(state, source, source_owner, account));
             }
             record["resources"] = json!(resources);
         }
@@ -558,6 +551,28 @@ fn record(
         });
     }
     record
+}
+
+/// A copy's source object as a resource: S3's object, or (in a directory
+/// bucket) S3 Express's, a prefix of its bucket's ARN, as the bucket's own
+/// events have it. Its bucket's owner when known, else the caller's
+/// account.
+fn source_resource(
+    state: &S3State,
+    (bucket, key): &(String, String),
+    owner: Option<&str>,
+    account: &str,
+) -> Value {
+    let printed = printable(bucket);
+    let bucket = truncated(&printed, 255);
+    if bucket.ends_with(crate::directory::SUFFIX) {
+        let arn = crate::directory::arn(&state.region, owner.unwrap_or(account), bucket);
+        return json!({ "type": "AWS::S3Express::Object", "ARNPrefix": format!("{arn}/") });
+    }
+    json!({
+        "type": "AWS::S3::Object",
+        "ARN": format!("arn:aws:s3:::{bucket}/{}", truncated(key, MAX_KEY)),
+    })
 }
 
 /// The events waiting to be written, and how many of each account.
@@ -720,8 +735,18 @@ impl ActivityRecorder {
         // As much of it as fits a row.
         let mut bytes = None;
         for fit in [Fit::Whole, Fit::NoParameters, Fit::Short, Fit::Bare] {
+            // A management event is no copy: it has no source.
             let built = record(
-                state, call, &who, &account, owner, time_ms, request_id, &event_id, error, fit,
+                state,
+                call,
+                &who,
+                &account,
+                (owner, None),
+                time_ms,
+                request_id,
+                &event_id,
+                error,
+                fit,
             )
             .to_string()
             .into_bytes();
@@ -852,8 +877,8 @@ impl ActivityRecorder {
         }
         // A copy's source bucket's owner is told too (as it was when the
         // source read was allowed).
-        if let Some(source_owner) = copied_from {
-            accounts.push(source_owner);
+        if let Some(source_owner) = &copied_from {
+            accounts.push(source_owner.clone());
         }
         accounts.sort();
         accounts.dedup();
@@ -873,7 +898,7 @@ impl ActivityRecorder {
                 call,
                 &who,
                 &account,
-                owner,
+                (owner, copied_from.as_deref()),
                 time_ms,
                 request_id,
                 &event_id,

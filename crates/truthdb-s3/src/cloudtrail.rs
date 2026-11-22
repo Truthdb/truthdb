@@ -245,7 +245,8 @@ fn username(event: &Value) -> Option<String> {
     }
 }
 
-/// An event's resources: each one's name (a bucket's) and type.
+/// An event's resources: each one's name (a bucket's, also of a directory
+/// bucket's S3 Express ARN) and type.
 fn resources(event: &Value) -> Vec<(String, String)> {
     event["resources"]
         .as_array()
@@ -254,8 +255,16 @@ fn resources(event: &Value) -> Vec<(String, String)> {
                 .iter()
                 .filter_map(|resource| {
                     let arn = resource["ARN"].as_str()?;
+                    let name = arn
+                        .strip_prefix("arn:aws:s3:::")
+                        .or_else(|| {
+                            arn.strip_prefix("arn:aws:s3express:")
+                                .and_then(|rest| rest.split_once(":bucket/"))
+                                .map(|(_, name)| name)
+                        })
+                        .unwrap_or(arn);
                     Some((
-                        arn.strip_prefix("arn:aws:s3:::").unwrap_or(arn).to_string(),
+                        name.to_string(),
                         resource["type"].as_str().unwrap_or("").to_string(),
                     ))
                 })

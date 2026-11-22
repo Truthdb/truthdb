@@ -17974,13 +17974,27 @@ while not any(r["eventName"] == "GetObject" for r in records("express")):
     time.sleep(0.5)
 time.sleep(2.5)
 express = records("express")
-assert {r["eventSource"] for r in express} == {"s3express.amazonaws.com"}, express
+on_b = [r for r in express if r["requestParameters"].get("bucketName") == B]
+assert on_b and {r["eventSource"] for r in on_b} == {"s3express.amazonaws.com"}, express
 got = next(r for r in express if r["eventName"] == "GetObject")
 assert got["resources"] == [{"type": "AWS::S3Express::Object", "ARNPrefix": arn + "/"},
     {"accountId": account, "type": "AWS::S3Express::DirectoryBucket", "ARN": arn}], got
 assert got["requestParameters"]["key"] == "dir/a", got
 assert "ListObjectsV2" in {r["eventName"] for r in express}, express
+# A copy out of a directory bucket reads S3 Express's object; one into it,
+# S3's: each selected by its source's type.
+out = next(r for r in express if r["eventName"] == "CopyObject"
+    and r["requestParameters"].get("bucketName") == "general")
+assert out["eventSource"] == "s3.amazonaws.com", out
+assert out["resources"][1] == {"type": "AWS::S3Express::Object", "ARNPrefix": arn + "/"}, out
 basic = records("basic")
-assert basic and not [r for r in basic if r["requestParameters"].get("bucketName") == B], basic
+into = [r for r in basic if r["requestParameters"].get("bucketName") == B]
+assert {r["eventName"] for r in into} == {"CopyObject"}, into
+copied = next(r for r in into if r["requestParameters"]["key"] == "dir/copied")
+assert copied["resources"][1] == {"type": "AWS::S3::Object", "ARN": "arn:aws:s3:::general/g"}, copied
+assert copied["resources"][0]["type"] == "AWS::S3Express::Object", copied
+# Looked up by its bucket's name.
+named = trail.lookup_events(LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": B}])["Events"]
+assert "CreateBucket" in {e["EventName"] for e in named}, named
 print("ok")
 "#;
