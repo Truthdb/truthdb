@@ -13709,7 +13709,9 @@ refused(lambda: s3.put_object_lock_configuration(Bucket="relocking",
 # What later steps build is refused, not ignored.
 put("source", rule(Filter={"Tag": {"Key": "a", "Value": "b"}}))
 s3.delete_bucket_replication(Bucket="source")
-refused(lambda: put("source", rule(DeleteMarkerReplication={"Status": "Enabled"})), "NotImplemented")
+# Delete-marker replication is accepted.
+put("source", rule(DeleteMarkerReplication={"Status": "Enabled"}))
+s3.delete_bucket_replication(Bucket="source")
 # Several destinations are accepted.
 put("source", rule(), dict(rule("locked-copies"), ID="two"))
 s3.delete_bucket_replication(Bucket="source")
@@ -14349,6 +14351,148 @@ time.sleep(2)
 assert tags("dst", "docs/team", team) == {"team": "a", "seen": "3"}
 versions = lambda b: len(s3.list_object_versions(Bucket=b, Prefix="docs/team")["Versions"])
 assert versions("src") == 1 and versions("dst") == 1
+print("ok")
+"#;
+
+#[test]
+fn delete_markers_are_replicated_where_rules_ask_and_deletes_of_versions_never() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let source = start_server();
+    let target = start_server();
+    let (account, key, secret) = account_with_key(&source, "marking");
+    let (_, far_key, far_secret) = account_with_key(&target, "faraway");
+    // A user who may do anything but s3:ReplicateDelete.
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:ReplicateDelete", "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (user_key, user_secret) = user_with_key(&source, &account, "nodeletes", Some(&policy));
+    let endpoint = format!("http://127.0.0.1:{}", target.s3_port);
+    let made = native(
+        source.native_port,
+        &format!(
+            "s3 create remote bucket far-marks {account} {endpoint} us-east-1 {far_key} {far_secret}"
+        ),
+    );
+    assert_eq!(made["remote_bucket"], "far-marks", "{made}");
+    let script = source.dir.join("delete_markers.py");
+    std::fs::write(&script, DELETE_MARKERS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &source.s3_port.to_string(),
+            &target.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &far_key,
+            &far_secret,
+            &user_key,
+            &user_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const DELETE_MARKERS_SCRIPT: &str = r#"
+import sys, time
+import boto3, botocore.config, botocore.exceptions
+port, far_port, account, key, secret, far_key, far_secret, user_key, user_secret = sys.argv[1:10]
+def client(at, access, secret_key):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{at}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3, far, user = client(port, key, secret), client(far_port, far_key, far_secret), client(port, user_key, user_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+def wait(test, what):
+    deadline = time.time() + 30
+    while not test():
+        assert time.time() < deadline, what
+        time.sleep(0.1)
+def versioned(client, bucket):
+    client.create_bucket(Bucket=bucket)
+    client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+for bucket in ["src", "dst", "unmarked", "src-user", "dst-user"]:
+    versioned(s3, bucket)
+versioned(far, "far-marks")
+def rule(destination, priority, markers, **extra):
+    return dict({"ID": destination, "Priority": priority, "Status": "Enabled", "Filter": {},
+        "DeleteMarkerReplication": {"Status": "Enabled" if markers else "Disabled"},
+        "Destination": {"Bucket": f"arn:aws:s3:::{destination}"}}, **extra)
+ROLE = f"arn:aws:iam::{account}:role/replication"
+# Refused for a rule filtering by tags, as S3 replicates no markers there.
+refused(lambda: s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE,
+    "Rules": [rule("dst", 1, True, Filter={"Tag": {"Key": "t", "Value": "1"}})]}), "InvalidArgument")
+s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE,
+    "Rules": [rule("dst", 1, True), rule("unmarked", 2, False), rule("far-marks", 3, True)]})
+rules = s3.get_bucket_replication(Bucket="src")["ReplicationConfiguration"]["Rules"]
+assert [r["DeleteMarkerReplication"]["Status"] for r in rules] == ["Enabled", "Disabled", "Enabled"], rules
+def status(bucket, key, version):
+    return s3.head_object(Bucket=bucket, Key=key, VersionId=version).get("ReplicationStatus")
+def markers(client, bucket, key):
+    return [m["VersionId"] for m in client.list_object_versions(Bucket=bucket, Prefix=key).get("DeleteMarkers", [])
+        if m["Key"] == key]
+def gone(client, bucket, key):
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return False
+    except botocore.exceptions.ClientError as error:
+        return error.response["Error"]["Code"] == "404"
+a = s3.put_object(Bucket="src", Key="a", Body=b"a")["VersionId"]
+wait(lambda: status("src", "a", a) == "COMPLETED", "a replicated")
+deleted = s3.delete_object(Bucket="src", Key="a")
+assert deleted["DeleteMarker"], deleted
+marker = deleted["VersionId"]
+# The marker reaches the destinations whose rule asks: here with the
+# source's version id; there as a DELETE (its own marker).
+wait(lambda: markers(s3, "dst", "a") == [marker], "marker replicated")
+assert gone(s3, "dst", "a")
+assert s3.head_object(Bucket="dst", Key="a", VersionId=a)["ContentLength"] == 1
+wait(lambda: gone(far, "far-marks", "a"), "marker sent")
+assert len(markers(far, "far-marks", "a")) == 1
+# DeleteObjects makes a marker that is replicated too.
+c = s3.put_object(Bucket="src", Key="c", Body=b"c")["VersionId"]
+wait(lambda: status("src", "c", c) == "COMPLETED", "c replicated")
+answer = s3.delete_objects(Bucket="src", Delete={"Objects": [{"Key": "c"}]})
+c_marker = answer["Deleted"][0]["DeleteMarkerVersionId"]
+wait(lambda: markers(s3, "dst", "c") == [c_marker], "c marker replicated")
+# Deletes by version id are never replicated: of a version, nor of the
+# marker itself.
+b = s3.put_object(Bucket="src", Key="b", Body=b"b")["VersionId"]
+wait(lambda: status("src", "b", b) == "COMPLETED", "b replicated")
+s3.delete_object(Bucket="src", Key="b", VersionId=b)
+s3.delete_object(Bucket="src", Key="a", VersionId=marker)
+s3.delete_objects(Bucket="src", Delete={"Objects": [{"Key": "c", "VersionId": c_marker}]})
+time.sleep(2)
+assert s3.head_object(Bucket="dst", Key="b", VersionId=b)["ContentLength"] == 1
+assert not gone(far, "far-marks", "b")
+assert markers(s3, "dst", "a") == [marker] and markers(s3, "dst", "c") == [c_marker]
+# Not where the rule does not ask for markers.
+assert markers(s3, "unmarked", "a") == [] and not gone(s3, "unmarked", "a")
+# A configuration whose creator may not s3:ReplicateDelete: the object is
+# replicated, its marker is not.
+user.put_bucket_replication(Bucket="src-user", ReplicationConfiguration={"Role": ROLE,
+    "Rules": [rule("dst-user", 1, True)]})
+u = s3.put_object(Bucket="src-user", Key="u", Body=b"u")["VersionId"]
+wait(lambda: status("src-user", "u", u) == "COMPLETED", "u replicated")
+s3.delete_object(Bucket="src-user", Key="u")
+time.sleep(2)
+assert markers(s3, "dst-user", "u") == [] and not gone(s3, "dst-user", "u")
 print("ok")
 "#;
 

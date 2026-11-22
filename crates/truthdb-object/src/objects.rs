@@ -1025,21 +1025,26 @@ impl ObjTxn<'_, '_> {
             .map(|_| ()))
     }
 
-    /// Adds a delete marker as the key's newest version.
-    fn add_delete_marker(
+    /// Adds a delete marker as the key's newest version; or, `given` (a
+    /// replica's), of that version number and time.
+    pub(crate) fn add_delete_marker(
         &mut self,
         bucket: &str,
         key: &str,
         null_version: bool,
+        given: Option<(u64, u64)>,
         now_ms: u64,
     ) -> Result<u64, StorageError> {
-        let version = next_counter(self, NEXT_VERSION_KEY)?;
+        let (version, mtime_ms) = match given {
+            Some(given) => given,
+            None => (next_counter(self, NEXT_VERSION_KEY)?, now_ms),
+        };
         let row = VersionRow {
             body: 0,
             size: 0,
             md5: [0; 16],
             parts: 0,
-            mtime_ms: now_ms,
+            mtime_ms,
             flags: FLAG_DELETE_MARKER | if null_version { FLAG_NULL_VERSION } else { 0 },
         };
         let before = self.key_head(bucket, key)?;
@@ -1063,7 +1068,7 @@ impl ObjTxn<'_, '_> {
                     size: 0,
                     md5: [0; 16],
                     parts: 0,
-                    last_modified_ms: now_ms,
+                    last_modified_ms: mtime_ms,
                     storage_class: StorageClass::Standard,
                 }),
             },
@@ -1104,7 +1109,7 @@ impl ObjTxn<'_, '_> {
                     Deleted::default()
                 }
                 Versioning::Enabled => Deleted {
-                    version: Some(self.add_delete_marker(bucket, key, false, now_ms)?),
+                    version: Some(self.add_delete_marker(bucket, key, false, None, now_ms)?),
                     null_version: false,
                     delete_marker: true,
                 },
@@ -1116,7 +1121,7 @@ impl ObjTxn<'_, '_> {
                         return Ok(Err(err));
                     }
                     Deleted {
-                        version: Some(self.add_delete_marker(bucket, key, true, now_ms)?),
+                        version: Some(self.add_delete_marker(bucket, key, true, None, now_ms)?),
                         null_version: true,
                         delete_marker: true,
                     }

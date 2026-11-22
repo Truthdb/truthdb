@@ -10,7 +10,9 @@
 //! `insert_replica`). The source's status tallies its destinations: FAILED
 //! once one cannot take it, PENDING until every one has it, then COMPLETED;
 //! the replica is REPLICA.
-//! A replica is never queued itself. A change to a queued or replicated
+//! A replica is never queued itself. A delete marker a delete makes (not
+//! one lifecycle makes) is queued to the destinations whose rule replicates
+//! delete markers; it has no status. A change to a queued or replicated
 //! version's tags is queued for its replica too. A change to its lock is
 //! not: the replica's lock is the source's when it is written, and then the
 //! destination's own (merging two locks would either weaken one or lock
@@ -42,8 +44,8 @@ use crate::{
 const NEXT_REPLICATION_KEY: &[u8] = b"next_replication";
 /// The configuration's stored form: 1 has no owner override nor
 /// destination owner, 2 filters by prefix only, 3 has tag filters and
-/// replica modification sync.
-const FORMAT: u8 = 3;
+/// replica modification sync, 4 delete marker replication.
+const FORMAT: u8 = 4;
 
 /// A bucket's replication configuration (as PutBucketReplication sets it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,9 @@ pub struct ReplicationRule {
     /// change of a replica in this bucket is sent back to the bucket its
     /// rule names.
     pub replica_modifications: bool,
+    /// `DeleteMarkerReplication` `Enabled`: a delete marker made by a
+    /// delete (not by lifecycle) is replicated too.
+    pub delete_markers: bool,
     pub destination: ReplicationDestination,
 }
 
@@ -207,6 +212,7 @@ impl ReplicationConfig {
                     out.str(owner);
                 }
             }
+            out.u8(rule.delete_markers as u8);
         }
         out.0
     }
@@ -258,12 +264,14 @@ impl ReplicationConfig {
                 true => Some(input.str()?),
                 false => None,
             };
+            let delete_markers = format >= 4 && input.present()?;
             rules.push(ReplicationRule {
                 id,
                 priority,
                 enabled,
                 filter,
                 replica_modifications,
+                delete_markers,
                 destination: ReplicationDestination {
                     bucket,
                     account,
@@ -438,6 +446,8 @@ pub enum ReplicationWork {
     Create,
     /// Gives it the source's tags as they are now.
     Metadata,
+    /// Gives it the source's delete marker.
+    DeleteMarker,
 }
 
 /// One queued replication of a version.
@@ -460,6 +470,7 @@ impl QueuedReplication {
         out.u8(match self.work {
             ReplicationWork::Create => 0,
             ReplicationWork::Metadata => 1,
+            ReplicationWork::DeleteMarker => 2,
         });
         out.str(&self.bucket);
         out.str(&self.key);
@@ -474,6 +485,7 @@ impl QueuedReplication {
         let work = match input.u8()? {
             0 => ReplicationWork::Create,
             1 => ReplicationWork::Metadata,
+            2 => ReplicationWork::DeleteMarker,
             _ => return Err(input.corrupt()),
         };
         let queued = QueuedReplication {
@@ -643,6 +655,66 @@ impl ObjTxn<'_, '_> {
             })?;
         }
         Ok(())
+    }
+
+    /// Queues the replication of delete marker `version`, just made in
+    /// `bucket` by a delete of `key`, to each destination whose rule for the
+    /// key replicates delete markers. A marker has no replication status.
+    pub fn queue_marker_replication(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<(), StorageError> {
+        let Some(config) = self.replication_config(bucket)? else {
+            return Ok(());
+        };
+        for rule in config.rules_for(key, &[]) {
+            if rule.delete_markers {
+                self.enqueue(QueuedReplication {
+                    number: 0,
+                    work: ReplicationWork::DeleteMarker,
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version,
+                    destination: rule.destination.bucket.clone(),
+                    storage_class: None,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the replica of delete marker `version` of `key` (made at
+    /// `mtime_ms`) in `bucket`: a delete marker of the same number and time.
+    /// The bucket must have versioning enabled (the caller checks it).
+    /// Returns whether it was written (false: that version is there).
+    pub fn insert_marker_replica(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        mtime_ms: u64,
+        now_ms: u64,
+    ) -> Result<Result<bool, ObjectError>, StorageError> {
+        let Some(bucket_row) = self.bucket_row(bucket)? else {
+            return Ok(Err(ObjectError::NoSuchBucket));
+        };
+        if bucket_row.versioning != Versioning::Enabled {
+            return Err(StorageError::InvalidFile(
+                "a replica is written only in a bucket with versioning enabled".to_string(),
+            ));
+        }
+        if self
+            .trees
+            .objects()
+            .get(self.ctx, &version_key(bucket, key, version))?
+            .is_some()
+        {
+            return Ok(Ok(false));
+        }
+        self.add_delete_marker(bucket, key, false, Some((version, mtime_ms)), now_ms)?;
+        Ok(Ok(true))
     }
 
     /// Queues `info`, a version of `bucket`'s `key`, to be replicated again,

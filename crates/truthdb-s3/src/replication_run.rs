@@ -21,6 +21,13 @@
 //! written only once every version's state is keyed by its bucket and key
 //! (see `truthdb_object::ObjFile::versions_keyed`): a replica's number is
 //! its source's. A standby writes none (its log is the primary's).
+//!
+//! A delete marker a rule replicates is made here as a marker of the same
+//! number and time, or sent to another service as a DELETE of its key (not
+//! sent again when the key there is deleted already). It needs the
+//! destination's owner and versioning as a replica does, and the
+//! configuration's creator may `s3:ReplicateDelete` there; it has no
+//! status, so one that cannot be made is dropped (its reason logged).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -62,7 +69,9 @@ type Waits = HashMap<String, (Instant, Duration)>;
 struct RemoteJob {
     queued: QueuedReplication,
     remote: RemoteBucket,
-    body: u64,
+    /// The leased body to send; none for a delete marker (sent as a
+    /// DELETE).
+    body: Option<u64>,
     size: u64,
     layout: Vec<(u64, u64, u64)>,
     headers: Vec<(String, String)>,
@@ -295,7 +304,9 @@ async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
             Err(err) => {
                 // Nothing prepared is sent: its leases go.
                 for job in &jobs {
-                    file.release_lease(job.body);
+                    if let Some(body) = job.body {
+                        file.release_lease(body);
+                    }
                 }
                 Err(err)
             }
@@ -368,7 +379,8 @@ fn prepare(
     Ok((made, next))
 }
 
-/// Sends `job`'s replica: in one PUT, or in parts past [`PART`].
+/// Sends `job`'s replica: in one PUT, or in parts past [`PART`]; a delete
+/// marker as a DELETE of its key.
 async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
     let remote = &job.remote;
     let client = truthdb_s3client::Client::new(truthdb_s3client::Config {
@@ -379,6 +391,15 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
         ca_pem: remote.ca_pem.clone(),
     })
     .map_err(service)?;
+    if job.body.is_none() {
+        // Sent once even across a crash: a key whose newest version there
+        // is a delete marker (or that has none) is deleted already.
+        let (bucket, key) = (&remote.name, &job.queued.key);
+        return match client.head_object(bucket, key).await.map_err(service)? {
+            None => Ok(()),
+            Some(_) => client.delete_object(bucket, key).await.map_err(service),
+        };
+    }
     let (tx, mut rx) = mpsc::channel(4);
     let engine = state.engine.clone();
     let (layout, size) = (job.layout.clone(), job.size);
@@ -490,7 +511,9 @@ fn finish_remote(
     job: &RemoteJob,
     outcome: Result<(), Fail>,
 ) -> Result<(), StorageError> {
-    file.release_lease(job.body);
+    if let Some(body) = job.body {
+        file.release_lease(body);
+    }
     let queued = &job.queued;
     let why = match &outcome {
         Ok(()) | Err(Fail::Skipped) => None,
@@ -722,7 +745,7 @@ fn remote_job(
     Ok(Some(RemoteJob {
         queued: queued.clone(),
         remote,
-        body: source.body,
+        body: Some(source.body),
         size: source.size,
         layout,
         headers: remote_headers(source, class.unwrap_or(source.storage_class), &lock, now),
@@ -751,7 +774,124 @@ fn rule_naming<'c>(
                 })
             }),
         ReplicationWork::Metadata => config.rule_to(&queued.key, tags, &queued.destination),
+        // A marker has no tags: the rule for its key, if it replicates
+        // delete markers.
+        ReplicationWork::DeleteMarker => config
+            .rule_to(&queued.key, &[], &queued.destination)
+            .filter(|rule| rule.delete_markers),
     }
+}
+
+/// Makes the replica of a queued delete marker in this server (a marker of
+/// the same version number and time), or prepares it for another service
+/// (a DELETE of its key there), and takes it off the queue. A marker has no
+/// replication status: one not made is dropped (its reason logged).
+fn replicate_marker(
+    file: &mut ObjFile<'_>,
+    queued: &QueuedReplication,
+    now: u64,
+) -> Result<Option<RemoteJob>, StorageError> {
+    let found = match file.bucket(&queued.bucket)? {
+        Some(bucket) => file
+            .object_version(&queued.bucket, &queued.key, VersionSel::Seq(queued.version))?
+            .ok()
+            .map(|info| (bucket, info)),
+        None => None,
+    };
+    // A rule must still replicate the key's delete markers there.
+    let config = match &found {
+        Some(_) => file
+            .replication(&queued.bucket)?
+            .filter(|config| rule_naming(config, queued, &[]).is_some()),
+        None => None,
+    };
+    let (Some((bucket, marker)), Some(config)) = (found, config) else {
+        return file
+            .transaction(|tx| tx.drop_replication(queued))
+            .map(|()| None);
+    };
+    let refusal = if file.bucket(&queued.destination)?.is_none()
+        && let Some(remote) = file.remote_bucket(&queued.destination)?
+    {
+        if remote.account == bucket.owner {
+            return Ok(Some(RemoteJob {
+                queued: queued.clone(),
+                remote,
+                body: None,
+                size: 0,
+                layout: Vec::new(),
+                headers: Vec::new(),
+            }));
+        }
+        Some("the remote bucket is recorded for another account")
+    } else {
+        marker_refused(file, &bucket, &config, queued)?
+    };
+    if let Some(why) = refusal {
+        eprintln!(
+            "replication: the delete marker {}/{} version {} is not replicated to {}: {why}",
+            queued.bucket, queued.key, queued.version, queued.destination
+        );
+        return file
+            .transaction(|tx| tx.finish_replication(queued, None))
+            .map(|()| None);
+    }
+    let same_owner = file
+        .bucket(&queued.destination)?
+        .is_some_and(|destination| destination.owner == bucket.owner);
+    file.set_origin(Origin {
+        operation: "Replicate".to_string(),
+        request_id: format!("replication-{}", queued.number),
+        account: Some(config.account.clone()),
+        user: config.user.clone().filter(|_| same_owner),
+        ..Origin::default()
+    });
+    file.transaction(|tx| {
+        match tx.insert_marker_replica(
+            &queued.destination,
+            &queued.key,
+            queued.version,
+            marker.mtime_ms,
+            now,
+        )? {
+            // Checked above, in the same lock hold.
+            Err(err) => Err(StorageError::InvalidFile(format!(
+                "the destination of a replication is gone: {err:?}"
+            ))),
+            Ok(_) => tx.finish_replication(queued, None),
+        }
+    })
+    .map(|()| None)
+}
+
+/// Why the destination of queued delete marker `queued` cannot take it
+/// now, if it cannot: as for a replica, its owner and versioning, and the
+/// configuration's creator may `s3:ReplicateDelete` there.
+fn marker_refused(
+    file: &mut ObjFile<'_>,
+    source: &BucketInfo,
+    config: &ReplicationConfig,
+    queued: &QueuedReplication,
+) -> Result<Option<&'static str>, StorageError> {
+    let Some(destination) = file.bucket(&queued.destination)? else {
+        return Ok(Some("the destination bucket does not exist"));
+    };
+    let owner = rule_naming(config, queued, &[])
+        .and_then(|rule| rule.destination.owner.clone())
+        .unwrap_or_else(|| source.owner.clone());
+    Ok(if destination.owner != owner {
+        Some("the destination bucket's owner is not the one it had when replication was set")
+    } else if destination.versioning != Versioning::Enabled {
+        Some("the destination bucket does not have versioning enabled")
+    } else {
+        creator_authz(file, config, queued)?
+            .check(
+                "s3:ReplicateDelete",
+                Resource::Object(&queued.destination, &queued.key),
+            )
+            .err()
+            .map(|_| "the configuration's creator may not s3:ReplicateDelete there")
+    })
 }
 
 /// Makes one queued replication in this server and takes it off the
@@ -761,6 +901,9 @@ fn replicate(
     queued: &QueuedReplication,
     now: u64,
 ) -> Result<Option<RemoteJob>, StorageError> {
+    if queued.work == ReplicationWork::DeleteMarker {
+        return replicate_marker(file, queued, now);
+    }
     let found = match file.bucket(&queued.bucket)? {
         Some(bucket) => file
             .object_version(&queued.bucket, &queued.key, VersionSel::Seq(queued.version))?
@@ -804,7 +947,7 @@ fn replicate(
         );
         let status = match queued.work {
             ReplicationWork::Create => Some(ReplicationStatus::Failed),
-            ReplicationWork::Metadata => None,
+            ReplicationWork::Metadata | ReplicationWork::DeleteMarker => None,
         };
         return file
             .transaction(|tx| tx.finish_replication(queued, status))
@@ -825,7 +968,9 @@ fn replicate(
             }
         }
         // A tag change only: the lock is not used.
-        ReplicationWork::Create | ReplicationWork::Metadata => source_lock,
+        ReplicationWork::Create | ReplicationWork::Metadata | ReplicationWork::DeleteMarker => {
+            source_lock
+        }
     };
     // Journalled as the configuration's creator; in another account's
     // bucket, as its account only (its user's name is not told there).
@@ -861,6 +1006,9 @@ fn replicate(
                 Ok(_) => tx.finish_replication(queued, Some(ReplicationStatus::Completed)),
             }
         }),
+        ReplicationWork::DeleteMarker => {
+            unreachable!("a delete marker is made by replicate_marker")
+        }
         ReplicationWork::Metadata => {
             // The version of that number there: the replica, or (a change
             // of a replica sent back) its source; version numbers are one
@@ -956,6 +1104,7 @@ mod tests {
                 enabled: true,
                 filter: truthdb_object::ReplicationFilter::All,
                 replica_modifications: false,
+                delete_markers: false,
                 destination: ReplicationDestination {
                     bucket: "dst".into(),
                     account: None,
@@ -1221,6 +1370,132 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_marker_is_made_sent_or_dropped_as_its_rule_and_destination_allow() {
+        use truthdb_object::{ReplicationDestination, ReplicationRule, VersionSel};
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-s3-marker-replication-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let storage = create(&path);
+        let me = "111111111111";
+        let to = |bucket: &str, delete_markers: bool| ReplicationRule {
+            id: bucket.to_string(),
+            priority: 1,
+            enabled: true,
+            filter: truthdb_object::ReplicationFilter::All,
+            replica_modifications: false,
+            delete_markers,
+            destination: ReplicationDestination {
+                bucket: bucket.to_string(),
+                account: None,
+                storage_class: None,
+                owner_override: false,
+                owner: None,
+            },
+        };
+        let config = |rules| ReplicationConfig {
+            role: "role".into(),
+            rules,
+            account: me.into(),
+            user: None,
+        };
+        let remote = |name: &str, account: &str| RemoteBucket {
+            name: name.into(),
+            account: account.into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret: "s".into(),
+            ca_pem: None,
+            created_ms: 1,
+        };
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_account(me, "me", 1)?.unwrap();
+                for bucket in ["src", "dst", "paused"] {
+                    tx.create_bucket(bucket, me, 1)?.unwrap();
+                    tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+                }
+                tx.set_versioning("paused", Versioning::Suspended)?.unwrap();
+                tx.create_remote_bucket(&remote("far", me))?;
+                tx.create_remote_bucket(&remote("theirs", "222222222222"))?;
+                tx.put_replication(
+                    "src",
+                    &config(vec![
+                        to("dst", true),
+                        to("paused", true),
+                        to("far", true),
+                        to("theirs", true),
+                    ]),
+                )
+            })
+            .unwrap();
+        let delete = |key: &str| {
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| {
+                    let marker = tx
+                        .delete_object("src", key, None, false, 5, 0)?
+                        .unwrap()
+                        .version
+                        .unwrap();
+                    tx.queue_marker_replication("src", key, marker)?;
+                    Ok(marker)
+                })
+                .unwrap()
+        };
+        let queue = || {
+            ObjFile::new(&mut storage.lock())
+                .replication_queue(None, 10)
+                .unwrap()
+        };
+        let run = |queued: &QueuedReplication| {
+            let mut lock = storage.lock();
+            replicate(&mut ObjFile::new(&mut lock), queued, now_ms()).unwrap()
+        };
+        let newest = |bucket: &str, key: &str| {
+            ObjFile::new(&mut storage.lock())
+                .object_version(bucket, key, VersionSel::Latest)
+                .unwrap()
+                .ok()
+        };
+        let marker = delete("a");
+        let queued = queue();
+        assert_eq!(queued.len(), 4);
+        // Here: a marker of the same number. Not in a bucket without
+        // versioning enabled. There: a DELETE, nothing to lease; not to a
+        // bucket recorded for another account.
+        let mut sent = None;
+        for queued in &queued {
+            let job = run(queued);
+            match queued.destination.as_str() {
+                "far" => sent = Some(job.expect("prepared for the other service")),
+                _ => assert!(job.is_none(), "{}", queued.destination),
+            }
+        }
+        let made = newest("dst", "a").expect("a marker there");
+        assert!(made.delete_marker && made.version == marker);
+        assert!(newest("paused", "a").is_none());
+        let sent = sent.unwrap();
+        assert_eq!((sent.remote.name.as_str(), sent.body), ("far", None));
+        assert_eq!(queue().len(), 1, "only the one being sent is left");
+        finish_remote(&mut ObjFile::new(&mut storage.lock()), &sent, Ok(())).unwrap();
+        assert!(queue().is_empty());
+        // Queued, then its rule no longer replicates markers: dropped unmade.
+        let later = delete("b");
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_replication("src", &config(vec![to("dst", false)])))
+            .unwrap();
+        for queued in queue() {
+            assert!(run(&queued).is_none());
+        }
+        assert!(queue().is_empty());
+        assert!(newest("dst", "b").is_none_or(|info| info.version != later));
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn a_replica_for_another_service_is_prepared_with_its_headers_or_failed() {
         use truthdb_object::{
             BodyWriter, CustomerKey, ObjectAttrs, ReplicationDestination, ReplicationRule,
@@ -1258,6 +1533,7 @@ mod tests {
                             enabled: true,
                             filter: truthdb_object::ReplicationFilter::All,
                             replica_modifications: false,
+                            delete_markers: false,
                             destination: ReplicationDestination {
                                 bucket: "far".into(),
                                 account: None,
@@ -1374,7 +1650,7 @@ mod tests {
         {
             let mut lock = storage.lock();
             let mut file = ObjFile::new(&mut lock);
-            file.release_lease(job.body);
+            file.release_lease(job.body.unwrap());
             file.transaction(|tx| {
                 tx.finish_replication(&job.queued, None)?;
                 tx.drop_remote_bucket("far")?;
@@ -1537,6 +1813,7 @@ mod tests {
             enabled: true,
             filter: truthdb_object::ReplicationFilter::Prefix(prefix.into()),
             replica_modifications: false,
+            delete_markers: false,
             destination: ReplicationDestination {
                 bucket: bucket.into(),
                 account: None,
@@ -1695,6 +1972,7 @@ mod tests {
                             enabled: true,
                             filter: ReplicationFilter::Tag("tier".into(), "gold".into()),
                             replica_modifications: false,
+                            delete_markers: false,
                             destination: ReplicationDestination {
                                 bucket: "dst".into(),
                                 account: None,
