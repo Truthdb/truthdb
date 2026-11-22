@@ -11974,9 +11974,20 @@ fn every_read_sees_the_writes_acknowledged_before_it() {
         assert_eq!(call(port, "HEAD", &path, "", &[], b"").1.0, 200);
         assert!(listed(port, &format!("new{n:02}")).contains(&format!("<Key>new{n:02}</Key>")));
         // Overwritten: the new data; deleted: gone, and not listed.
-        let newer = format!("newer {n}");
+        let newer = format!("newer {n} longer");
         assert_eq!(call(port, "PUT", &path, "", &[], newer.as_bytes()).1.0, 200);
-        assert_eq!(call(port, "GET", &path, "", &[], b"").1, (200, newer));
+        assert_eq!(
+            call(port, "GET", &path, "", &[], b"").1,
+            (200, newer.clone())
+        );
+        let (head, _) = call(port, "HEAD", &path, "", &[], b"");
+        assert_eq!(
+            response_header(&head, "content-length"),
+            Some(newer.len().to_string())
+        );
+        assert!(
+            listed(port, &format!("new{n:02}")).contains(&format!("<Size>{}</Size>", newer.len()))
+        );
         assert_eq!(call(port, "DELETE", &path, "", &[], b"").1.0, 204);
         assert_eq!(call(port, "GET", &path, "", &[], b"").1.0, 404);
         assert!(!listed(port, &format!("new{n:02}")).contains("<Key>"));
@@ -12074,7 +12085,8 @@ fn every_read_sees_the_writes_acknowledged_before_it() {
 
     // Overwritten while being read: each read is the old object or the new
     // one, whole. The object spans several segments, so a read takes
-    // several lock holds (its body leased meanwhile).
+    // several lock holds. (A body is also kept for a grace after it is
+    // replaced, so this does not test the lease: the object crate does.)
     let size = 3 * 1024 * 1024 + 17;
     let (a, b) = (vec![b'a'; size], vec![b'b'; size]);
     assert_eq!(call(port, "PUT", "/seen/swap", "", &[], &a).1.0, 200);
@@ -12098,7 +12110,7 @@ fn every_read_sees_the_writes_acknowledged_before_it() {
             }
         })
     };
-    let (mut overlapped, mut seen) = (0, std::collections::HashSet::new());
+    let mut seen = std::collections::HashSet::new();
     while !writer.is_finished() {
         let (_, (status, body)) = call(port, "GET", "/seen/swap", "", &[], b"");
         assert_eq!(status, 200);
@@ -12109,13 +12121,11 @@ fn every_read_sees_the_writes_acknowledged_before_it() {
             body.len()
         );
         seen.insert(first);
-        overlapped += 1;
     }
     writer.join().unwrap();
-    assert!(overlapped > 0, "no read overlapped the writes");
     assert!(
         seen.contains(&Some(b'b')),
-        "no read saw an overwrite: {seen:?} in {overlapped} reads"
+        "no read saw an overwrite: {seen:?}"
     );
     // The last write acknowledged is the one read after.
     assert_eq!(
