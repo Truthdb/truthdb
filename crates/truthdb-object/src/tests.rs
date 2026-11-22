@@ -7211,6 +7211,29 @@ fn a_version_replicated_to_several_destinations_is_completed_once_all_are_made()
     assert_eq!(status("b", b), Some(ReplicationStatus::Failed));
     finish(&b_queue[0], Some(ReplicationStatus::Completed));
     assert_eq!(status("b", b), Some(ReplicationStatus::Failed));
+    // FAILED for one, its tag change still goes to the destinations (the
+    // runner writes it only where there is a replica).
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.set_tags(
+                "src",
+                "b",
+                crate::VersionSel::Seq(b),
+                vec![("t".into(), "1".into())],
+                T0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let tag_changes: Vec<String> = queued("b")
+        .into_iter()
+        .filter(|q| q.work == crate::ReplicationWork::Metadata)
+        .map(|q| q.destination)
+        .collect();
+    assert_eq!(tag_changes, ["one", "two"]);
+    for q in queued("b") {
+        finish(&q, None);
+    }
     // A destination no rule sends to any more does not count: one made and
     // one dropped is COMPLETED, both dropped is no status.
     let c = put_at(&storage, "src", "c", 10, StorageClass::Standard, T0);

@@ -2,12 +2,14 @@
 //! replication configuration names rules: each, while enabled, replicates
 //! the new versions of the keys under its prefix to its destination bucket.
 //! A version written in the bucket is matched against the rules in the same
-//! transaction: the rule that applies (the highest priority of those whose
-//! prefix the key has) marks it PENDING and queues its replication. A
-//! runner beside the S3 listener takes the queue in order and writes each
-//! replica: the same version number and time, attributes, tags and lock,
-//! the body shared (see `insert_replica`). Then the source is COMPLETED, or
-//! FAILED when the destination cannot take it, and the replica is REPLICA.
+//! transaction: for each destination, the rule that applies (the highest
+//! priority of those to it whose filter names the version) queues its
+//! replication there, and the version is PENDING. A runner beside the S3
+//! listener takes the queue in order and writes each replica: the same
+//! version number and time, attributes, tags and lock, the body shared (see
+//! `insert_replica`). The source's status tallies its destinations: FAILED
+//! once one cannot take it, PENDING until every one has it, then COMPLETED;
+//! the replica is REPLICA.
 //! A replica is never queued itself. A change to a queued or replicated
 //! version's tags is queued for its replica too. A change to its lock is
 //! not: the replica's lock is the source's when it is written, and then the
@@ -654,15 +656,18 @@ impl ObjTxn<'_, '_> {
         version: u64,
         tags: &[(String, String)],
     ) -> Result<(), StorageError> {
-        let status = self.replication_status_of(bucket, key, version)?;
+        // A source version sends to the destinations holding (or about to
+        // hold) its replica, whatever another destination did: one may
+        // have failed while others have it.
+        let row = self.status_row(bucket, key, version)?;
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(());
         };
         for rule in config.rules_for(key, tags) {
-            let sent = match status {
-                Some(ReplicationStatus::Pending | ReplicationStatus::Completed) => true,
-                Some(ReplicationStatus::Replica) => rule.replica_modifications,
-                _ => false,
+            let sent = match &row {
+                Some(StatusRow::Source(tally)) => tally.pending > 0 || tally.completed > 0,
+                Some(StatusRow::Replica) => rule.replica_modifications,
+                None => false,
             };
             if sent {
                 self.enqueue(QueuedReplication {
