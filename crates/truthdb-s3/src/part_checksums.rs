@@ -109,7 +109,8 @@ pub(crate) fn part_algorithm(upload: Option<&StoredChecksum>) -> &str {
 }
 
 /// The object's checksum, made of its `parts`' as `upload` asks; none when
-/// a part has none of that algorithm (a part copied with UploadPartCopy).
+/// a part has none of that algorithm (a part from before this build, or one
+/// of an upload that asked for none, sent with another algorithm's).
 pub(crate) fn of_object(
     upload: Option<&StoredChecksum>,
     parts: &[PartInfo],

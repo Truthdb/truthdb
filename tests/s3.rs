@@ -12074,6 +12074,9 @@ assert (copied["ChecksumSHA256"], copied["ChecksumType"]) == (sha_whole, "FULL_O
 s3.copy_object(Bucket="mpsums", Key="as-sha", CopySource={"Bucket": "mpsums", "Key": "as-sha"},
     ChecksumAlgorithm="CRC32")
 assert s3.head_object(Bucket="mpsums", Key="as-sha", ChecksumMode="ENABLED")["ChecksumCRC32"] == crc32
+# In place, asking for the algorithm it already has: nothing changes, refused.
+refused(lambda: s3.copy_object(Bucket="mpsums", Key="as-sha",
+    CopySource={"Bucket": "mpsums", "Key": "as-sha"}, ChecksumAlgorithm="CRC32"), "InvalidRequest")
 copied = s3.copy_object(Bucket="mpsums", Key="sha-copy", CopySource={"Bucket": "mpsums", "Key": "sha"})["CopyObjectResult"]
 assert (copied["ChecksumSHA256"], copied["ChecksumType"]) == (sha_whole, "FULL_OBJECT"), copied
 copied = s3.copy_object(Bucket="mpsums", Key="plain-copy", CopySource={"Bucket": "mpsums", "Key": "sdkparts"})["CopyObjectResult"]

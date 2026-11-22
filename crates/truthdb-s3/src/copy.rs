@@ -241,11 +241,28 @@ async fn copy_whole(
             Err(err) => return Ok(Err(err)),
         };
         let shared = source.attrs.customer_key.is_some() == target_record.is_some() && same_keys;
+        // The copy keeps its source's checksum, a whole one of the algorithm
+        // asked for (if any); else one is computed as its bytes are copied:
+        // of the algorithm asked for, or the source's for a composite one
+        // (its value changes, as S3's does for a multipart source), or
+        // CRC64NVME for a source with none, as S3 gives one. A change of the
+        // algorithm is a change, for a copy onto itself.
+        let recompute = match (&wanted, &source.attrs.checksum) {
+            (Some(wanted), Some(kept)) if kept.full_object && kept.algorithm == *wanted => None,
+            (Some(wanted), _) => Some(wanted.clone()),
+            (None, Some(kept)) if kept.full_object => None,
+            // One larger than a copy's bytes may be (5 GiB) is shared, with
+            // what it has, as before: only asking for an algorithm refuses
+            // it.
+            (None, _) if source.size > MAX_PUT_BYTES => None,
+            (None, Some(kept)) => Some(kept.algorithm.clone()),
+            (None, None) => Some("CRC64NVME".to_string()),
+        };
         // A copy to itself must change something: its metadata, its
         // storage class, its redirect location, or its encryption.
         if !replace
             && website_redirect.is_none()
-            && wanted.is_none()
+            && !(wanted.is_some() && recompute.is_some())
             && shared
             && class == source.storage_class
             && (src_bucket.as_str(), src_key.as_str()) == (&dst_bucket, &dst_key)
@@ -295,18 +312,6 @@ async fn copy_whole(
                 &dst_key,
             )));
         }
-        // The copy keeps its source's checksum, a whole one of the algorithm
-        // asked for (if any); else one is computed as its bytes are copied:
-        // of the algorithm asked for, or the source's for a composite one
-        // (its value changes, as S3's does for a multipart source), or
-        // CRC64NVME for a source with none, as S3 gives one.
-        let recompute = match (&wanted, &source.attrs.checksum) {
-            (Some(wanted), Some(kept)) if kept.full_object && kept.algorithm == *wanted => None,
-            (Some(wanted), _) => Some(wanted.clone()),
-            (None, Some(kept)) if kept.full_object => None,
-            (None, Some(kept)) => Some(kept.algorithm.clone()),
-            (None, None) => Some("CRC64NVME".to_string()),
-        };
         if !shared || recompute.is_some() {
             let algorithm = recompute.unwrap_or_else(|| {
                 crate::part_checksums::part_algorithm(source.attrs.checksum.as_ref()).to_string()
