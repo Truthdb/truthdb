@@ -184,7 +184,8 @@ pub async fn upload_part(
         let blocked = object(state, move |file| crate::sse::sse_c_blocked(file, &name)).await?;
         crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
     }
-    let sealed = receive_body(state, request, auth, customer.as_ref(), class).await?;
+    // Its checksum is verified; parts keep none yet.
+    let (sealed, _) = receive_body(state, request, auth, customer.as_ref(), class).await?;
     let info = object(state, move |file| {
         file.transaction(|tx| tx.upload_part(upload, number, &sealed, now_ms(), DROP_GRACE_MS))
     })

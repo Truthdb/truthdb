@@ -258,6 +258,9 @@ async fn copy_whole(
             source.attrs.clone()
         };
         attrs.website_redirect = website_redirect;
+        // The body's checksum, whatever the directive (its bytes are the
+        // source's).
+        attrs.checksum = source.attrs.checksum.clone();
         attrs.tags = if replace_tags {
             new_tags
         } else {

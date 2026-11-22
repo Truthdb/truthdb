@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use truthdb_core::storage::StorageError;
 use truthdb_object::{
     ObjFile, ObjectAttrs, ObjectError, ObjectInfo, RestoreState, SEGMENT_BYTES, SealedBody,
-    StorageClass, VersionSel, Versioning,
+    StorageClass, StoredChecksum, VersionSel, Versioning,
 };
 
 use crate::error::S3Error;
@@ -193,6 +193,8 @@ pub fn metadata_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
         tags: Vec::new(),
         customer_key: None,
         website_redirect: website_redirect_from(headers)?,
+        // The body's, once it is read.
+        checksum: None,
     })
 }
 
@@ -228,8 +230,24 @@ pub async fn receive_body(
     auth: Authenticated,
     key: Option<&crate::ssec::ProvidedKey>,
     class: StorageClass,
-) -> Result<SealedBody, S3Error> {
+) -> Result<(SealedBody, StoredChecksum), S3Error> {
     let headers = request.headers().clone();
+    // A checksum of an algorithm this server does not compute is refused,
+    // not ignored.
+    if let Some((name, _)) = headers.iter().find(|(name, _)| {
+        name.as_str().starts_with("x-amz-checksum-")
+            && !crate::server::CHECKSUM_HEADERS.contains(&name.as_str())
+            && ![
+                "x-amz-checksum-algorithm",
+                "x-amz-checksum-type",
+                "x-amz-checksum-mode",
+            ]
+            .contains(&name.as_str())
+    }) {
+        return Err(S3Error::not_implemented(format!(
+            "the checksum {name} is not supported"
+        )));
+    }
     let declared: Option<u64> =
         header(&headers, "x-amz-decoded-content-length").and_then(|value| value.parse().ok());
     let length: Option<u64> = declared
@@ -273,6 +291,9 @@ pub async fn receive_body(
     };
     let mut sink = BodySink::begin(state, key, class).await?;
     let mut decoder = PayloadDecoder::new(auth.framing, auth.checksum)?;
+    if let Some(algorithm) = header(&headers, "x-amz-sdk-checksum-algorithm") {
+        decoder.computing(algorithm.trim())?;
+    }
     let mut decoded = Vec::new();
     let mut incoming = request.into_body();
     while let Some(frame) = incoming.frame().await {
@@ -287,14 +308,14 @@ pub async fn receive_body(
         }
         sink.push(state, &decoded).await?;
     }
-    decoder.finish(declared)?;
+    let (_, checksum) = decoder.finish(declared)?;
     let (sealed, plain_md5) = sink.finish(state).await?;
     if content_md5.is_some_and(|expected| expected != plain_md5) {
         return Err(S3Error::bad_digest(
             "The Content-MD5 you specified did not match what we received.",
         ));
     }
-    Ok(sealed)
+    Ok((sealed, checksum))
 }
 
 /// A body written into the object engine as it arrives: in segments, with
@@ -486,7 +507,8 @@ pub async fn put_object(
     }
     attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
     let headers = request.headers().clone();
-    let sealed = receive_body(state, request, auth, customer.as_ref(), class).await?;
+    let (sealed, checksum) = receive_body(state, request, auth, customer.as_ref(), class).await?;
+    attrs.checksum = Some(checksum);
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (stored, versioning, expiration) =
         crate::scope::object_as(state, "PutObject", move |file| {
@@ -558,6 +580,9 @@ pub async fn put_object(
         ),
         customer_key,
     );
+    if let Some(checksum) = &info.attrs.checksum {
+        response = with_checksum(response, checksum);
+    }
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         response = response.header("x-amz-version-id", version);
     }
@@ -692,6 +717,27 @@ pub fn precondition(headers: &HeaderMap, prefix: &str, info: &ObjectInfo) -> Opt
         return Some(StatusCode::NOT_MODIFIED);
     }
     None
+}
+
+/// `checksum` as S3 sends it: `x-amz-checksum-<algorithm>` and
+/// `x-amz-checksum-type`.
+pub(crate) fn with_checksum(
+    builder: hyper::http::response::Builder,
+    checksum: &StoredChecksum,
+) -> hyper::http::response::Builder {
+    builder
+        .header(
+            format!("x-amz-checksum-{}", checksum.algorithm.to_ascii_lowercase()),
+            &checksum.value,
+        )
+        .header(
+            "x-amz-checksum-type",
+            if checksum.full_object {
+                "FULL_OBJECT"
+            } else {
+                "COMPOSITE"
+            },
+        )
 }
 
 /// The headers every GET and HEAD answer carries.
@@ -1159,6 +1205,15 @@ pub(crate) async fn read_object(
         lock_visible.legal_hold,
     )
     .header("content-length", len.to_string());
+    // Its checksum, when asked for, on a read of the whole object (a range
+    // or a part is not what it was computed over).
+    if range.is_none()
+        && span.is_none()
+        && header(headers, "x-amz-checksum-mode").is_some_and(|mode| mode == "ENABLED")
+        && let Some(checksum) = &info.attrs.checksum
+    {
+        builder = with_checksum(builder, checksum);
+    }
     if let Some((first, last)) = range {
         builder = builder.header(
             "content-range",
