@@ -28,6 +28,10 @@ pub enum SeriesBy {
     Filter(String),
     /// A storage type (the `StorageType` dimension).
     StorageType(String),
+    /// A replication rule's replications to a destination bucket (the
+    /// `DestinationBucket` and `RuleId` dimensions; the series' bucket is
+    /// the `SourceBucket`).
+    Replication { destination: String, rule: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,11 +41,13 @@ pub struct MetricSeries {
 }
 
 impl MetricSeries {
-    /// `bucket, 0, kind, value, 0`.
+    /// `bucket, 0, kind, value, 0` (a replication series' value is its
+    /// destination, 0, and its rule id).
     fn key(&self) -> Vec<u8> {
         let (kind, value) = match &self.by {
-            SeriesBy::Filter(id) => (0u8, id.as_str()),
-            SeriesBy::StorageType(storage_type) => (1u8, storage_type.as_str()),
+            SeriesBy::Filter(id) => (0u8, id.clone()),
+            SeriesBy::StorageType(storage_type) => (1u8, storage_type.clone()),
+            SeriesBy::Replication { destination, rule } => (2u8, format!("{destination}\0{rule}")),
         };
         [self.bucket.as_bytes(), &[0, kind], value.as_bytes(), &[0]].concat()
     }
@@ -53,17 +59,27 @@ impl MetricSeries {
             .ok_or_else(|| corrupt("metric series"))?;
         let bucket = std::str::from_utf8(&key[..split]).map_err(|_| corrupt("metric series"))?;
         let kind = *key.get(split + 1).ok_or_else(|| corrupt("metric series"))?;
-        let rest = &key[split + 2..];
-        let end = rest
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(|| corrupt("metric series"))?;
-        let value = std::str::from_utf8(&rest[..end])
-            .map_err(|_| corrupt("metric series"))?
-            .to_string();
+        let mut rest = &key[split + 2..];
+        let mut used = split + 2;
+        let mut field = || -> Result<String, StorageError> {
+            let end = rest
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| corrupt("metric series"))?;
+            let value = std::str::from_utf8(&rest[..end])
+                .map_err(|_| corrupt("metric series"))?
+                .to_string();
+            rest = &rest[end + 1..];
+            used += end + 1;
+            Ok(value)
+        };
         let by = match kind {
-            0 => SeriesBy::Filter(value),
-            1 => SeriesBy::StorageType(value),
+            0 => SeriesBy::Filter(field()?),
+            1 => SeriesBy::StorageType(field()?),
+            2 => SeriesBy::Replication {
+                destination: field()?,
+                rule: field()?,
+            },
             _ => return Err(corrupt("metric series")),
         };
         Ok((
@@ -71,7 +87,7 @@ impl MetricSeries {
                 bucket: bucket.to_string(),
                 by,
             },
-            split + 2 + end + 1,
+            used,
         ))
     }
 }

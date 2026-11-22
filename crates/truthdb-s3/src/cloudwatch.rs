@@ -21,7 +21,9 @@ use truthdb_engine::metrics::LATENCY_BOUNDS_MS;
 use truthdb_object::{MetricSeries, RESOLUTIONS, SeriesBy, Stats};
 
 use crate::error::S3Error;
-use crate::metric_history::{ALL_STORAGE_TYPES, BUCKET_SIZE_BYTES, METRICS, NUMBER_OF_OBJECTS};
+use crate::metric_history::{
+    ALL_STORAGE_TYPES, BUCKET_SIZE_BYTES, METRICS, NUMBER_OF_OBJECTS, is_replication_metric,
+};
 use crate::server::{Body, Connection, S3State, full};
 
 const TARGET_PREFIX: &str = "GraniteServiceVersion20100801.";
@@ -285,6 +287,19 @@ fn series_of(
             .find(|(dimension, _)| dimension == name)
             .and_then(|(_, value)| value.clone())
     };
+    // A replication metric: by source bucket, destination and rule.
+    if is_replication_metric(code) {
+        let bucket = value("SourceBucket")?;
+        let created = *owned.get(&bucket)?;
+        if dimensions.len() != 3 {
+            return None;
+        }
+        let by = SeriesBy::Replication {
+            destination: value("DestinationBucket")?,
+            rule: value("RuleId")?,
+        };
+        return Some((MetricSeries { bucket, by }, created));
+    }
     let bucket = value("BucketName")?;
     let created = *owned.get(&bucket)?;
     if dimensions.len() != 2 {
@@ -735,11 +750,21 @@ async fn list_metrics(
             if last < since {
                 continue;
             }
-            let (dimension, value) = match &series.by {
-                SeriesBy::Filter(id) => ("FilterId", id.clone()),
-                SeriesBy::StorageType(storage) => ("StorageType", storage.clone()),
+            let dims = match &series.by {
+                SeriesBy::Filter(id) => vec![
+                    ("BucketName", series.bucket.clone()),
+                    ("FilterId", id.clone()),
+                ],
+                SeriesBy::StorageType(storage) => vec![
+                    ("BucketName", series.bucket.clone()),
+                    ("StorageType", storage.clone()),
+                ],
+                SeriesBy::Replication { destination, rule } => vec![
+                    ("SourceBucket", series.bucket.clone()),
+                    ("DestinationBucket", destination.clone()),
+                    ("RuleId", rule.clone()),
+                ],
             };
-            let dims = [("BucketName", series.bucket.clone()), (dimension, value)];
             if !filters.iter().all(|(name, value)| {
                 dims.iter().any(|(dim, dim_value)| {
                     dim == name && value.as_ref().is_none_or(|value| value == dim_value)

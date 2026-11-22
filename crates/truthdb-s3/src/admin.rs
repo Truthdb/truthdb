@@ -408,6 +408,50 @@ fn render_objects(storage: &Storage, out: &mut String) -> Result<(), StorageErro
             );
         }
     }
+    let now = crate::objects::now_ms();
+    let replication = file.replication_backlog()?;
+    for (name, kind, help, read) in [
+        (
+            "truthdb_s3_replication_pending_operations",
+            "gauge",
+            "Replication operations a rule has queued.",
+            (|rule: &truthdb_object::ReplicationBacklog, _: u64| rule.operations)
+                as fn(&truthdb_object::ReplicationBacklog, u64) -> u64,
+        ),
+        (
+            "truthdb_s3_replication_pending_bytes",
+            "gauge",
+            "Bytes of the new replicas a rule has queued.",
+            |rule, _| rule.bytes,
+        ),
+        (
+            "truthdb_s3_replication_lag_seconds",
+            "gauge",
+            "Age of the oldest replication a rule has queued.",
+            |rule, now| {
+                rule.oldest_ms
+                    .map_or(0, |oldest| now.saturating_sub(oldest) / 1000)
+            },
+        ),
+        (
+            "truthdb_s3_replication_failed_operations_total",
+            "counter",
+            "Replication operations of a rule that failed.",
+            |rule, _| rule.failed,
+        ),
+    ] {
+        family(out, name, kind, help);
+        for rule in &replication {
+            let _ = writeln!(
+                out,
+                "{name}{{source=\"{}\",destination=\"{}\",rule=\"{}\"}} {}",
+                label(&rule.bucket),
+                label(&rule.destination),
+                label(&rule.rule),
+                read(rule, now)
+            );
+        }
+    }
     Ok(())
 }
 

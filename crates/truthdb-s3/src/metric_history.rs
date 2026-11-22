@@ -22,7 +22,7 @@ use crate::server::S3State;
 
 /// The metrics, by the code the history keeps them under: their names and
 /// units.
-pub const METRICS: [(u8, &str, &str); 15] = [
+pub const METRICS: [(u8, &str, &str); 19] = [
     (ALL_REQUESTS, "AllRequests", "Count"),
     (1, "GetRequests", "Count"),
     (2, "PutRequests", "Count"),
@@ -38,6 +38,22 @@ pub const METRICS: [(u8, &str, &str); 15] = [
     (TOTAL_REQUEST_LATENCY, "TotalRequestLatency", "Milliseconds"),
     (BUCKET_SIZE_BYTES, "BucketSizeBytes", "Bytes"),
     (NUMBER_OF_OBJECTS, "NumberOfObjects", "Count"),
+    (REPLICATION_LATENCY, "ReplicationLatency", "Seconds"),
+    (
+        BYTES_PENDING_REPLICATION,
+        "BytesPendingReplication",
+        "Bytes",
+    ),
+    (
+        OPERATIONS_PENDING_REPLICATION,
+        "OperationsPendingReplication",
+        "Count",
+    ),
+    (
+        OPERATIONS_FAILED_REPLICATION,
+        "OperationsFailedReplication",
+        "Count",
+    ),
 ];
 const ALL_REQUESTS: u8 = 0;
 const BYTES_DOWNLOADED: u8 = 7;
@@ -48,6 +64,17 @@ pub const FIRST_BYTE_LATENCY: u8 = 11;
 pub const TOTAL_REQUEST_LATENCY: u8 = 12;
 pub const BUCKET_SIZE_BYTES: u8 = 13;
 pub const NUMBER_OF_OBJECTS: u8 = 14;
+/// The replication metrics, by rule (see `replication_run`).
+pub const REPLICATION_LATENCY: u8 = 15;
+pub const BYTES_PENDING_REPLICATION: u8 = 16;
+pub const OPERATIONS_PENDING_REPLICATION: u8 = 17;
+pub const OPERATIONS_FAILED_REPLICATION: u8 = 18;
+
+/// Whether metric `code` is a replication metric (kept by rule, not by a
+/// metrics configuration).
+pub fn is_replication_metric(code: u8) -> bool {
+    (REPLICATION_LATENCY..=OPERATIONS_FAILED_REPLICATION).contains(&code)
+}
 
 /// The storage type a storage class's bytes are reported under.
 pub fn storage_type(class: StorageClass) -> &'static str {
@@ -320,6 +347,18 @@ impl MetricRecorder {
     /// (seconds) is in.
     pub(crate) fn record(&self, matched: &Matched, at: u64, point: &MetricPoint) {
         self.record_series(&matched.series, matched.made_ms, at, point);
+    }
+
+    /// Adds `point` to `series` (of a bucket made at `made_ms`) at the
+    /// minute `at` (seconds) is in.
+    pub(crate) fn record_one(
+        &self,
+        series: &MetricSeries,
+        made_ms: u64,
+        at: u64,
+        point: &MetricPoint,
+    ) {
+        self.record_series(std::slice::from_ref(series), made_ms, at, point);
     }
 
     fn record_series(&self, series: &[MetricSeries], made_ms: u64, at: u64, point: &MetricPoint) {

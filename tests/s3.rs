@@ -14509,6 +14509,210 @@ print("ok")
 "#;
 
 #[test]
+fn replication_backlogs_are_shown_and_measured_per_rule() {
+    // A Python with boto3 installed (pip install boto3), for CloudWatch.
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "watching");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    let versioning = |bucket: &str, status: &str| {
+        let body =
+            format!("<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>");
+        assert_eq!(
+            call("PUT", bucket, "versioning", &[], body.as_bytes()).1.0,
+            200
+        );
+    };
+    for bucket in ["/src", "/dst", "/quiet"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+        versioning(bucket, "Enabled");
+    }
+    // A bucket on a service that is down: what is sent there waits.
+    let made = native(
+        server.native_port,
+        &format!("s3 create remote bucket down-far {account} http://127.0.0.1:1 us-east-1 k s"),
+    );
+    assert_eq!(made["remote_bucket"], "down-far", "{made}");
+    let rule = |id: &str, destination: &str, priority: u32, monitoring: &str| {
+        format!(
+            "<Rule><ID>{id}</ID><Priority>{priority}</Priority><Status>Enabled</Status><Filter/>\
+             <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+             <Destination><Bucket>arn:aws:s3:::{destination}</Bucket>{monitoring}</Destination></Rule>"
+        )
+    };
+    let config = |rules: &str| {
+        format!(
+            "<ReplicationConfiguration><Role>arn:aws:iam::{account}:role/r</Role>{rules}\
+             </ReplicationConfiguration>"
+        )
+    };
+    let put_config = |body: &str| {
+        let md5 = content_md5(body.as_bytes());
+        let (_, (status, answer)) = call(
+            "PUT",
+            "/src",
+            "replication",
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+        );
+        (status, xml_value(&answer, "Code"))
+    };
+    let timed = "<ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time>\
+        </ReplicationTime><Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes>\
+        </EventThreshold></Metrics>";
+    let metrics = "<Metrics><Status>Enabled</Status></Metrics>";
+    // Refused: time control without metrics; a time other than 15 minutes.
+    let untimed = "<ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time>\
+        </ReplicationTime>";
+    assert_eq!(
+        put_config(&config(&rule("x", "dst", 1, untimed))),
+        (400, "InvalidRequest".to_string())
+    );
+    assert_eq!(
+        put_config(&config(&rule(
+            "x",
+            "dst",
+            1,
+            &timed.replacen("15", "30", 1)
+        ))),
+        (400, "InvalidArgument".to_string())
+    );
+    let rules = format!(
+        "{}{}{}",
+        rule("timed", "dst", 1, timed),
+        rule("far", "down-far", 2, metrics),
+        rule("unmeasured", "quiet", 3, "")
+    );
+    {
+        let md5 = content_md5(config(&rules).as_bytes());
+        let answer = call(
+            "PUT",
+            "/src",
+            "replication",
+            &[("content-md5", &md5)],
+            config(&rules).as_bytes(),
+        );
+        assert_eq!(answer.1.0, 200, "{}", answer.1.1);
+    }
+    // A destination that can no longer take replicas: they fail.
+    versioning("/quiet", "Suspended");
+    let (_, (_, got)) = call("GET", "/src", "replication", &[], b"");
+    assert!(
+        got.contains(timed) && got.contains(&format!("arn:aws:s3:::down-far</Bucket>{metrics}")),
+        "{got}"
+    );
+    for (name, body) in [("a", &b"12345"[..]), ("b", &b"1234567"[..])] {
+        assert_eq!(call("PUT", &format!("/src/{name}"), "", &[], body).1.0, 200);
+    }
+    // The backlog by rule: the remote's two (12 bytes) wait; the local
+    // destination has both (no row); the suspended one failed both.
+    let deadline = Instant::now() + DEADLINE;
+    let rows = loop {
+        let rows = sql_rows(
+            server.native_port,
+            "SELECT source_bucket, destination_bucket, rule_id, pending_operations, \
+             pending_bytes, failed_operations FROM sys.dm_s3_replication ORDER BY rule_id",
+        );
+        if rows.len() == 2 && rows[1][5] == "2" {
+            break rows;
+        }
+        assert!(Instant::now() < deadline, "{rows:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let row = |items: &[&str]| {
+        items
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows,
+        [
+            row(&["src", "down-far", "far", "2", "12", "0"]),
+            row(&["src", "quiet", "unmeasured", "0", "0", "2"]),
+        ]
+    );
+    let lag = sql_rows(
+        server.native_port,
+        "SELECT lag_seconds FROM sys.dm_s3_replication WHERE oldest_pending IS NOT NULL",
+    );
+    assert_eq!(lag.len(), 1, "only the waiting rule has an oldest: {lag:?}");
+    // The same as Prometheus gauges.
+    let bearer = format!("Authorization: Bearer {ADMIN_TOKEN}\r\n");
+    let (_, _, page) = admin_call(server.admin_port.unwrap(), "GET", "/metrics", &bearer);
+    for line in [
+        "truthdb_s3_replication_pending_operations{source=\"src\",destination=\"down-far\",rule=\"far\"} 2",
+        "truthdb_s3_replication_pending_bytes{source=\"src\",destination=\"down-far\",rule=\"far\"} 12",
+        "truthdb_s3_replication_failed_operations_total{source=\"src\",destination=\"quiet\",rule=\"unmeasured\"} 2",
+    ] {
+        assert!(page.contains(line), "{line}\n{page}");
+    }
+    // CloudWatch: the rules that measure theirs, once a minute.
+    let script = server.dir.join("replication_metrics.py");
+    std::fs::write(&script, REPLICATION_METRICS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const REPLICATION_METRICS_SCRIPT: &str = r#"
+import sys, time, datetime
+import boto3, botocore.config
+port, key, secret = sys.argv[1:4]
+cw = boto3.client("cloudwatch", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+def dims(destination, rule):
+    return [{"Name": "SourceBucket", "Value": "src"}, {"Name": "DestinationBucket", "Value": destination},
+        {"Name": "RuleId", "Value": rule}]
+def latest(name, destination, rule):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    points = cw.get_metric_statistics(Namespace="AWS/S3", MetricName=name, Dimensions=dims(destination, rule),
+        StartTime=now - datetime.timedelta(minutes=10), EndTime=now + datetime.timedelta(minutes=1),
+        Period=60, Statistics=["Maximum"])["Datapoints"]
+    return max(points, key=lambda p: p["Timestamp"])["Maximum"] if points else None
+deadline = time.time() + 150
+while latest("OperationsPendingReplication", "down-far", "far") != 2:
+    assert time.time() < deadline, latest("OperationsPendingReplication", "down-far", "far")
+    time.sleep(1)
+assert latest("BytesPendingReplication", "down-far", "far") == 12
+assert latest("ReplicationLatency", "down-far", "far") >= 0
+# The local destination has them both: none pending once sampled again.
+while latest("OperationsPendingReplication", "dst", "timed") != 0:
+    assert time.time() < deadline, latest("OperationsPendingReplication", "dst", "timed")
+    time.sleep(1)
+listed = cw.list_metrics(Namespace="AWS/S3", Dimensions=[{"Name": "SourceBucket", "Value": "src"}])["Metrics"]
+rules = sorted({[d["Value"] for d in m["Dimensions"] if d["Name"] == "RuleId"][0] for m in listed})
+assert rules == ["far", "timed"], listed
+names = sorted({m["MetricName"] for m in listed})
+assert names == ["BytesPendingReplication", "OperationsFailedReplication",
+    "OperationsPendingReplication", "ReplicationLatency"], names
+print("ok")
+"#;
+
+#[test]
 fn a_version_is_replicated_to_each_destination_and_completed_once_all_have_it() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

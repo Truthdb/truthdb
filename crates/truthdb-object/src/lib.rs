@@ -92,8 +92,8 @@ pub use objects::{
 pub use pack::{PackStep, PackWork, pack_segment};
 pub use remote_buckets::RemoteBucket;
 pub use replication::{
-    QueuedReplication, ReplicationConfig, ReplicationDestination, ReplicationFilter,
-    ReplicationRule, ReplicationStatus, ReplicationWork,
+    QueuedReplication, ReplicationBacklog, ReplicationConfig, ReplicationDestination,
+    ReplicationFilter, ReplicationRule, ReplicationStatus, ReplicationWork,
 };
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use stored::{Backlogs, BodyUse, StoredBody};
@@ -211,6 +211,13 @@ const REPLICATION_STATUS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 44;
 const REPLICATION_QUEUE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 45;
 /// bucket name -> a bucket on another S3 service (see `remote_buckets`).
 const REMOTE_BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 46;
+/// (source bucket, 0, destination, 0, rule id) -> what the rule has queued
+/// and how much of it failed (see `replication`).
+const REPLICATION_BACKLOG_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 47;
+/// (source bucket, 0, destination, 0, rule id, 0, number) -> when that
+/// queued replication was queued: a rule's queue in order (see
+/// `replication`).
+const REPLICATION_BY_RULE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 48;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -335,7 +342,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 47;
+const TREE_COUNT: usize = 49;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -491,6 +498,12 @@ impl Trees {
     }
     pub fn remote_buckets(&self) -> BTree {
         self.tree(REMOTE_BUCKETS_TREE)
+    }
+    pub fn replication_backlog(&self) -> BTree {
+        self.tree(REPLICATION_BACKLOG_TREE)
+    }
+    pub fn replication_by_rule(&self) -> BTree {
+        self.tree(REPLICATION_BY_RULE_TREE)
     }
 }
 
