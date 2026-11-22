@@ -86,8 +86,8 @@ pub use notifications::{
     event_message, event_type, test_message,
 };
 pub use objects::{
-    CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, VersionSel,
-    version_id,
+    CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, StoredChecksum,
+    VersionSel, version_id,
 };
 pub use pack::{PackStep, PackWork, pack_segment};
 pub use remote_buckets::RemoteBucket;

@@ -11942,6 +11942,128 @@ print("ok")
 }
 
 #[test]
+fn checksums_are_kept_and_returned_as_s3_returns_them() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    let script = server.dir.join("checksums.py");
+    std::fs::write(&script, CHECKSUMS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // A checksum of an algorithm not computed here is refused, not ignored.
+    let (_, (status, answer)) = send_with(
+        server.s3_port,
+        "PUT",
+        "/sums/unknown",
+        "",
+        &[("x-amz-checksum-sha512", "AAAA")],
+        b"x",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(
+        (status, xml_value(&answer, "Code").as_str()),
+        (501, "NotImplemented")
+    );
+    // The algorithm an SDK names without sending a value is the one computed.
+    let (head, (status, _)) = send_with(
+        server.s3_port,
+        "PUT",
+        "/sums/named",
+        "",
+        &[("x-amz-sdk-checksum-algorithm", "SHA1")],
+        b"x",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "x-amz-checksum-sha1").as_deref(),
+        Some("EfatjsUqKYSrqv18O1FlA3hcIHI=")
+    );
+    // One S3 does not name is the request's error; one it names that is not
+    // computed here is not implemented.
+    for (algorithm, expected) in [
+        ("BOGUS", (400, "InvalidRequest")),
+        ("XXHASH64", (501, "NotImplemented")),
+    ] {
+        let (_, (status, answer)) = send_with(
+            server.s3_port,
+            "PUT",
+            "/sums/named",
+            "",
+            &[("x-amz-sdk-checksum-algorithm", algorithm)],
+            b"x",
+            &key,
+            Some(&secret),
+        );
+        assert_eq!(
+            (status, xml_value(&answer, "Code").as_str()),
+            expected,
+            "{algorithm}"
+        );
+    }
+}
+
+const CHECKSUMS_SCRIPT: &str = r#"
+import sys, base64, hashlib, zlib
+import boto3, botocore.config, botocore.exceptions
+port, key, secret = sys.argv[1:4]
+def client(**config):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}, **config))
+s3 = client()
+bare = client(request_checksum_calculation="when_required", response_checksum_validation="when_required")
+s3.create_bucket(Bucket="sums")
+b64 = lambda raw: base64.b64encode(raw).decode()
+data = b"123456789"
+# Sent with one: kept, and answered with on the PUT.
+sha = b64(hashlib.sha256(data).digest())
+put = s3.put_object(Bucket="sums", Key="sha", Body=data, ChecksumAlgorithm="SHA256")
+assert put["ChecksumSHA256"] == sha and put["ChecksumType"] == "FULL_OBJECT", put
+# Sent with none: S3's default, CRC64NVME, computed and kept.
+crc64 = b64((0xae8b14860a799888).to_bytes(8, "big"))
+put = bare.put_object(Bucket="sums", Key="plain", Body=data)
+assert put["ChecksumCRC64NVME"] == crc64, put
+# Returned on a read of the whole object only when asked; the SDK checks it.
+got = s3.get_object(Bucket="sums", Key="sha", ChecksumMode="ENABLED")
+assert got["Body"].read() == data and got["ChecksumSHA256"] == sha and got["ChecksumType"] == "FULL_OBJECT", got
+head = s3.head_object(Bucket="sums", Key="plain", ChecksumMode="ENABLED")
+assert head["ChecksumCRC64NVME"] == crc64, head
+assert "ChecksumCRC64NVME" not in bare.head_object(Bucket="sums", Key="plain")
+assert "ChecksumSHA256" not in s3.get_object(Bucket="sums", Key="sha", ChecksumMode="ENABLED", Range="bytes=0-3")
+# CRC32, as the SDK computes it by default.
+crc32 = b64(zlib.crc32(data).to_bytes(4, "big"))
+put = s3.put_object(Bucket="sums", Key="crc", Body=data)
+assert put["ChecksumCRC32"] == crc32, put
+# A copy keeps its source's, whatever its metadata.
+copied = s3.copy_object(Bucket="sums", Key="copy", CopySource={"Bucket": "sums", "Key": "sha"},
+    MetadataDirective="REPLACE", Metadata={"m": "1"})["CopyObjectResult"]
+assert copied["ChecksumSHA256"] == sha and copied["ChecksumType"] == "FULL_OBJECT", copied
+assert s3.head_object(Bucket="sums", Key="copy", ChecksumMode="ENABLED")["ChecksumSHA256"] == sha
+# A wrong one is refused.
+try:
+    bare.put_object(Bucket="sums", Key="bad", Body=data, ChecksumSHA256=b64(hashlib.sha256(b"x").digest()))
+    raise SystemExit("not refused")
+except botocore.exceptions.ClientError as error:
+    assert error.response["Error"]["Code"] == "BadDigest", error.response
+print("ok")
+"#;
+
+#[test]
 fn every_read_sees_the_writes_acknowledged_before_it() {
     let (mut server, key, secret) = server_with_key();
     // Every call on a connection of its own.

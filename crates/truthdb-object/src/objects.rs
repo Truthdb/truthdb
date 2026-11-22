@@ -40,6 +40,18 @@ pub struct ObjectAttrs {
     /// Where a website endpoint redirects requests for the object
     /// (`x-amz-website-redirect-location`).
     pub website_redirect: Option<String>,
+    /// The body's checksum, as S3 keeps and returns it.
+    pub checksum: Option<StoredChecksum>,
+}
+
+/// A body's checksum: its algorithm as S3 names it (`CRC64NVME`, ...),
+/// whether it is of the whole object (`FULL_OBJECT`) or of its parts'
+/// checksums (`COMPOSITE`), and its value, base64 as S3 sends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChecksum {
+    pub algorithm: String,
+    pub full_object: bool,
+    pub value: String,
 }
 
 /// What is kept of a customer-provided key (SSE-C): its MD5 as the client
@@ -94,6 +106,18 @@ impl ObjectAttrs {
         if let Some(location) = &self.website_redirect {
             field(13, location);
         }
+        // `<algorithm> <FULL_OBJECT|COMPOSITE> <value>`.
+        if let Some(checksum) = &self.checksum {
+            let kind = if checksum.full_object {
+                "FULL_OBJECT"
+            } else {
+                "COMPOSITE"
+            };
+            field(
+                14,
+                &format!("{} {kind} {}", checksum.algorithm, checksum.value),
+            );
+        }
         out
     }
 
@@ -135,6 +159,23 @@ impl ObjectAttrs {
                     })
                 }
                 13 => attrs.website_redirect = Some(value),
+                14 => {
+                    let mut parts = value.splitn(3, ' ');
+                    let (Some(algorithm), Some(kind), Some(value)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        return Err(corrupt());
+                    };
+                    attrs.checksum = Some(StoredChecksum {
+                        algorithm: algorithm.to_string(),
+                        full_object: match kind {
+                            "FULL_OBJECT" => true,
+                            "COMPOSITE" => false,
+                            _ => return Err(corrupt()),
+                        },
+                        value: value.to_string(),
+                    });
+                }
                 _ => return Err(corrupt()),
             }
         }
@@ -1320,9 +1361,30 @@ mod tests {
                 key_md5: "kMd5==".to_string(),
                 verifier: "salt+mac".to_string(),
             }),
+            checksum: Some(StoredChecksum {
+                algorithm: "CRC64NVME".to_string(),
+                full_object: true,
+                value: "AAAAAAAAAAA=".to_string(),
+            }),
         };
         assert_eq!(ObjectAttrs::decode(&attrs.encode()).unwrap(), attrs);
         assert!(ObjectAttrs::default().is_empty());
+        // A composite checksum's kind; a checksum field of a bad shape.
+        let composite = ObjectAttrs {
+            checksum: Some(StoredChecksum {
+                algorithm: "SHA256".to_string(),
+                full_object: false,
+                value: "x/y+=".to_string(),
+            }),
+            ..ObjectAttrs::default()
+        };
+        assert_eq!(ObjectAttrs::decode(&composite.encode()).unwrap(), composite);
+        for bad in ["CRC32", "CRC32 PARTLY x"] {
+            let mut bytes = vec![14];
+            bytes.extend_from_slice(&(bad.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(bad.as_bytes());
+            assert!(ObjectAttrs::decode(&bytes).is_err(), "{bad}");
+        }
     }
 
     #[test]

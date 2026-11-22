@@ -115,10 +115,27 @@ pub struct PayloadDecoder {
     chunk: Vec<u8>,
     chunk_signature: String,
     sha256: Option<digest::Context>,
-    /// The checksum to verify and, for a header checksum, its expected value
-    /// (a trailer brings its value at the end).
-    checksum: Option<(String, Checksum, Option<String>)>,
+    /// The body's checksum, by its header's name: one to verify, or one
+    /// computed to be kept.
+    checksum: (String, Checksum, Kept),
     decoded: u64,
+}
+
+/// What the body's checksum is to its request.
+enum Kept {
+    /// Sent to be verified: its value (a trailer brings it at the end).
+    Verified(Option<String>),
+    /// None was sent: computed, to be kept (CRC64NVME, S3's default, or the
+    /// algorithm `computing` names).
+    Computed,
+}
+
+/// The S3 name of the algorithm a `x-amz-checksum-<algorithm>` header names.
+fn algorithm_of(header: &str) -> String {
+    header
+        .strip_prefix("x-amz-checksum-")
+        .unwrap_or(header)
+        .to_ascii_uppercase()
 }
 
 impl PayloadDecoder {
@@ -135,12 +152,16 @@ impl PayloadDecoder {
         let sha256 =
             matches!(framing, Framing::Sha256(_)).then(|| digest::Context::new(&digest::SHA256));
         let checksum = match checksum {
-            Some((name, value)) => Some((
+            Some((name, value)) => (
                 name.to_ascii_lowercase(),
                 Checksum::for_header(&name)?,
-                value,
-            )),
-            None => None,
+                Kept::Verified(value),
+            ),
+            None => (
+                "x-amz-checksum-crc64nvme".to_string(),
+                Checksum::Crc64Nvme(CRC64NVME.digest()),
+                Kept::Computed,
+            ),
         };
         Ok(PayloadDecoder {
             framing,
@@ -160,6 +181,35 @@ impl PayloadDecoder {
         })
     }
 
+    /// With no checksum to verify, computes `algorithm`'s (as
+    /// `x-amz-sdk-checksum-algorithm` names it) to be kept, not CRC64NVME.
+    pub fn computing(&mut self, algorithm: &str) -> Result<(), S3Error> {
+        // One S3 does not name is the request's error; one it names that is
+        // not computed here is not implemented.
+        const NAMED: [&str; 10] = [
+            "CRC32",
+            "CRC32C",
+            "CRC64NVME",
+            "SHA1",
+            "SHA256",
+            "SHA512",
+            "MD5",
+            "XXHASH64",
+            "XXHASH3",
+            "XXHASH128",
+        ];
+        if !NAMED.contains(&algorithm.to_ascii_uppercase().as_str()) {
+            return Err(S3Error::invalid_request(format!(
+                "Value for x-amz-sdk-checksum-algorithm header is invalid: {algorithm}"
+            )));
+        }
+        if let Kept::Computed = self.checksum.2 {
+            let name = format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase());
+            self.checksum = (name.clone(), Checksum::for_header(&name)?, Kept::Computed);
+        }
+        Ok(())
+    }
+
     /// Body bytes decoded so far.
     pub fn decoded_len(&self) -> u64 {
         self.decoded
@@ -169,9 +219,7 @@ impl PayloadDecoder {
         if let Some(context) = &mut self.sha256 {
             context.update(bytes);
         }
-        if let Some((_, checksum, _)) = &mut self.checksum {
-            checksum.update(bytes);
-        }
+        self.checksum.1.update(bytes);
         self.decoded += bytes.len() as u64;
         out.extend_from_slice(bytes);
     }
@@ -269,7 +317,7 @@ impl PayloadDecoder {
                         .split_once(':')
                         .ok_or_else(|| malformed("a trailer line has no ':'"))?;
                     let name = name.trim().to_ascii_lowercase();
-                    if let Some((expected_name, _, value_slot)) = &mut self.checksum
+                    if let (expected_name, _, Kept::Verified(value_slot)) = &mut self.checksum
                         && *expected_name == name
                     {
                         *value_slot = Some(value.trim().to_string());
@@ -309,8 +357,12 @@ impl PayloadDecoder {
 
     /// The body ended: check that the framing is complete and every digest and
     /// checksum matches. `declared_len` is `x-amz-decoded-content-length` for
-    /// a chunked body.
-    pub fn finish(self, declared_len: Option<u64>) -> Result<u64, S3Error> {
+    /// a chunked body. Returns its length and its checksum, the one verified
+    /// or computed.
+    pub fn finish(
+        self,
+        declared_len: Option<u64>,
+    ) -> Result<(u64, truthdb_object::StoredChecksum), S3Error> {
         let chunked = matches!(
             self.framing,
             Framing::SignedChunks { .. } | Framing::UnsignedTrailer
@@ -335,16 +387,28 @@ impl PayloadDecoder {
                 "The provided 'x-amz-content-sha256' header does not match what was computed.",
             ));
         }
-        if let Some((name, checksum, expected)) = self.checksum {
-            let expected = expected
-                .ok_or_else(|| S3Error::invalid_request(format!("no {name} value was sent")))?;
-            if checksum.finish() != expected {
-                return Err(S3Error::bad_digest(format!(
-                    "The {name} you specified did not match the calculated checksum."
-                )));
+        let (name, checksum, kept) = self.checksum;
+        let value = match kept {
+            Kept::Verified(expected) => {
+                let expected = expected
+                    .ok_or_else(|| S3Error::invalid_request(format!("no {name} value was sent")))?;
+                if checksum.finish() != expected {
+                    return Err(S3Error::bad_digest(format!(
+                        "The {name} you specified did not match the calculated checksum."
+                    )));
+                }
+                expected
             }
-        }
-        Ok(self.decoded)
+            Kept::Computed => checksum.finish(),
+        };
+        Ok((
+            self.decoded,
+            truthdb_object::StoredChecksum {
+                algorithm: algorithm_of(&name),
+                full_object: true,
+                value,
+            },
+        ))
     }
 }
 

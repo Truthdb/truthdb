@@ -258,6 +258,9 @@ async fn copy_whole(
             source.attrs.clone()
         };
         attrs.website_redirect = website_redirect;
+        // The body's checksum, whatever the directive (its bytes are the
+        // source's).
+        attrs.checksum = source.attrs.checksum.clone();
         attrs.tags = if replace_tags {
             new_tags
         } else {
@@ -435,8 +438,26 @@ async fn copy_whole(
             (info, versions)
         }
     };
+    // Its checksum, as CopyObjectResult carries it (`ChecksumSHA256`, ...).
+    let checksum = info
+        .attrs
+        .checksum
+        .as_ref()
+        .map(|checksum| {
+            let name = &checksum.algorithm;
+            format!(
+                "<Checksum{name}>{}</Checksum{name}><ChecksumType>{}</ChecksumType>",
+                escape(&checksum.value),
+                if checksum.full_object {
+                    "FULL_OBJECT"
+                } else {
+                    "COMPOSITE"
+                }
+            )
+        })
+        .unwrap_or_default();
     let mut response = xml(format!(
-        "<CopyObjectResult xmlns=\"{XMLNS}\"><ETag>{}</ETag><LastModified>{}</LastModified></CopyObjectResult>",
+        "<CopyObjectResult xmlns=\"{XMLNS}\"><ETag>{}</ETag><LastModified>{}</LastModified>{checksum}</CopyObjectResult>",
         escape(&info.etag()),
         iso8601(info.mtime_ms)
     ));

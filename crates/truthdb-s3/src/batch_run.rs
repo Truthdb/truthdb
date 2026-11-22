@@ -1299,8 +1299,10 @@ fn plan(
         .clone()
         .unwrap_or_else(|| source.attrs.tags.clone());
     attrs.customer_key = None;
-    // A copy's redirect location is never the source's.
+    // A copy's redirect location is never the source's; its checksum is,
+    // whatever the metadata.
     attrs.website_redirect = None;
+    attrs.checksum = source.attrs.checksum.clone();
     let (bucket_lock, default) = crate::object_lock::bucket_state(file, &copy.bucket)?;
     let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
         .ok()
