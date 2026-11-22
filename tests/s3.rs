@@ -9649,6 +9649,332 @@ fn create_job_body(
 }
 
 #[test]
+fn batch_replication_replicates_again_what_a_manifest_or_its_filters_name_across_a_crash() {
+    let mut server = start_server();
+    let (account, key, secret) = account_with_key(&server, "rebatch");
+    let as_with = |server: &Server,
+                   who: (&str, &str),
+                   method: &str,
+                   path: &str,
+                   query: &str,
+                   extra: &[(&str, &str)],
+                   body: &[u8]| {
+        let mut headers = vec![("x-amz-account-id", account.as_str())];
+        headers.extend_from_slice(extra);
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &headers,
+            body,
+            who.0,
+            Some(who.1),
+        )
+    };
+    let call = |server: &Server, method: &str, path: &str, query: &str, body: &[u8]| {
+        as_with(server, (&key, &secret), method, path, query, &[], body)
+    };
+    let versioning = |server: &Server, bucket: &str, status: &str| {
+        let body =
+            format!("<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>");
+        let (_, (code, answer)) = call(server, "PUT", bucket, "versioning", body.as_bytes());
+        assert_eq!(code, 200, "{answer}");
+    };
+    for bucket in ["/src", "/dst", "/hist", "/reports"] {
+        assert_eq!(call(&server, "PUT", bucket, "", b"").1.0, 200);
+    }
+    for bucket in ["/src", "/dst", "/hist"] {
+        versioning(&server, bucket, "Enabled");
+    }
+    let put = |server: &Server, path: &str, extra: &[(&str, &str)]| -> String {
+        let (head, (code, answer)) =
+            as_with(server, (&key, &secret), "PUT", path, "", extra, b"body");
+        assert_eq!(code, 200, "{answer}");
+        response_header(&head, "x-amz-version-id").expect("a version")
+    };
+    let replicate = |server: &Server, bucket: &str| {
+        let body = format!(
+            "<ReplicationConfiguration><Role>arn:aws:iam::{account}:role/replication</Role>\
+             <Rule><ID>all</ID><Priority>1</Priority><Status>Enabled</Status><Filter><Prefix></Prefix></Filter>\
+             <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+             <Destination><Bucket>arn:aws:s3:::dst</Bucket></Destination></Rule></ReplicationConfiguration>"
+        );
+        let md5 = content_md5(body.as_bytes());
+        let (_, (code, answer)) = as_with(
+            server,
+            (&key, &secret),
+            "PUT",
+            bucket,
+            "replication",
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+        );
+        assert_eq!(code, 200, "{answer}");
+    };
+    let status = |server: &Server, bucket: &str, key: &str, version: &str| {
+        let (head, (code, _)) = call(
+            server,
+            "HEAD",
+            &format!("/{bucket}/{key}"),
+            &format!("versionId={version}"),
+            b"",
+        );
+        assert_eq!(code, 200, "{bucket}/{key} {version}");
+        response_header(&head, "x-amz-replication-status")
+    };
+    let wait_status = |server: &Server, bucket: &str, key: &str, version: &str, want: &str| {
+        let deadline = Instant::now() + DEADLINE;
+        while status(server, bucket, key, version).as_deref() != Some(want) {
+            assert!(
+                Instant::now() < deadline,
+                "{bucket}/{key} {version} never {want}: {:?}",
+                status(server, bucket, key, version)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // Written before the configuration: no status. Then one replicated,
+    // one FAILED (the destination cannot take it), one archived.
+    let old = put(&server, "/src/a.txt", &[]);
+    replicate(&server, "/src");
+    let newer = put(&server, "/src/a.txt", &[]);
+    wait_status(&server, "src", "a.txt", &newer, "COMPLETED");
+    versioning(&server, "/dst", "Suspended");
+    let failed = put(&server, "/src/c.txt", &[]);
+    wait_status(&server, "src", "c.txt", &failed, "FAILED");
+    versioning(&server, "/dst", "Enabled");
+    let cold = put(&server, "/src/cold", &[("x-amz-storage-class", "GLACIER")]);
+    assert_eq!(status(&server, "src", "a.txt", &old), None);
+    assert_eq!(status(&server, "src", "cold", &cold), None);
+
+    let generated = |token: &str, source: &str, filter: &str, output: bool| {
+        let output = match output {
+            true => {
+                "<EnableManifestOutput>true</EnableManifestOutput><ManifestOutputLocation>\
+                     <Bucket>arn:aws:s3:::reports</Bucket><ManifestPrefix>gen</ManifestPrefix>\
+                     <ManifestFormat>S3InventoryReport_CSV_20211130</ManifestFormat></ManifestOutputLocation>"
+            }
+            false => "<EnableManifestOutput>false</EnableManifestOutput>",
+        };
+        format!(
+            "<CreateJobRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
+             <ClientRequestToken>{token}</ClientRequestToken><Operation><S3ReplicateObject/></Operation>\
+             <ManifestGenerator><S3JobManifestGenerator><SourceBucket>arn:aws:s3:::{source}</SourceBucket>\
+             {output}<Filter>{filter}</Filter></S3JobManifestGenerator></ManifestGenerator>\
+             <Report><Enabled>true</Enabled><Bucket>arn:aws:s3:::reports</Bucket>\
+             <Format>Report_CSV_20180820</Format><Prefix>rep</Prefix><ReportScope>AllTasks</ReportScope></Report>\
+             <Priority>1</Priority><RoleArn>arn:aws:iam::111122223333:role/batch</RoleArn>\
+             </CreateJobRequest>"
+        )
+    };
+    let create = |server: &Server, who: (&str, &str), body: String| -> String {
+        let (_, (code, answer)) = as_with(
+            server,
+            who,
+            "POST",
+            "/v20180820/jobs",
+            "",
+            &[],
+            body.as_bytes(),
+        );
+        assert_eq!(code, 200, "{answer}");
+        xml_value(&answer, "JobId")
+    };
+    let described = |server: &Server, job: &str| {
+        call(server, "GET", &format!("/v20180820/jobs/{job}"), "", b"")
+            .1
+            .1
+    };
+    let ended = |server: &Server, job: &str| -> String {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let answer = described(server, job);
+            let state = answer
+                .rsplit("</ProgressSummary>")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if ["Complete", "Failed"].contains(&xml_value(&state, "Status").as_str()) {
+                return answer;
+            }
+            assert!(Instant::now() < deadline, "{answer}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let counts = |answer: &str| {
+        (
+            xml_value(answer, "TotalNumberOfTasks"),
+            xml_value(answer, "NumberOfTasksSucceeded"),
+            xml_value(answer, "NumberOfTasksFailed"),
+        )
+    };
+    // A generated manifest of what is eligible and not yet (or not)
+    // replicated: every version, the older one of a.txt among them; not
+    // the archived one, not what is COMPLETED.
+    let filter = "<EligibleForReplication>true</EligibleForReplication>\
+        <ObjectReplicationStatuses><member>NONE</member><member>FAILED</member></ObjectReplicationStatuses>";
+    let job = create(
+        &server,
+        (&key, &secret),
+        generated("gen-1", "src", filter, true),
+    );
+    let answer = ended(&server, &job);
+    assert_eq!(
+        counts(&answer),
+        ("2".into(), "2".into(), "0".into()),
+        "{answer}"
+    );
+    let descriptor = xml_value(&answer, "GeneratedManifestDescriptor");
+    let manifest = xml_value(&descriptor, "ObjectArn");
+    let (_, (_, lines)) = call(
+        &server,
+        "GET",
+        &format!("/{}", manifest.strip_prefix("arn:aws:s3:::").unwrap()),
+        "",
+        b"",
+    );
+    assert_eq!(lines, format!("src,a.txt,{old}\nsrc,c.txt,{failed}\n"));
+    wait_status(&server, "src", "a.txt", &old, "COMPLETED");
+    wait_status(&server, "src", "c.txt", &failed, "COMPLETED");
+    assert_eq!(
+        status(&server, "dst", "a.txt", &old).as_deref(),
+        Some("REPLICA")
+    );
+    assert_eq!(
+        status(&server, "dst", "c.txt", &failed).as_deref(),
+        Some("REPLICA")
+    );
+    assert_eq!(status(&server, "src", "cold", &cold), None);
+
+    // A manifest's lines: what is COMPLETED is replicated again; what no
+    // rule replicates (archived, or in a bucket with no configuration)
+    // fails as not eligible, its status unchanged.
+    let hist_one = put(&server, "/hist/one", &[]);
+    let list = "src,a.txt\nsrc,cold\nhist,one\nsrc,missing\n";
+    let (head, (code, _)) = call(&server, "PUT", "/reports/lists/m.csv", "", list.as_bytes());
+    assert_eq!(code, 200);
+    let etag = response_header(&head, "etag").unwrap();
+    let body = create_job_body("csv-1", "<S3ReplicateObject/>", "lists/m.csv", &etag, "").replace(
+        "arn:aws:s3:::src/lists/m.csv",
+        "arn:aws:s3:::reports/lists/m.csv",
+    );
+    let job = create(&server, (&key, &secret), body);
+    let answer = ended(&server, &job);
+    assert_eq!(
+        counts(&answer),
+        ("4".into(), "1".into(), "3".into()),
+        "{answer}"
+    );
+    wait_status(&server, "src", "a.txt", &newer, "COMPLETED");
+    assert_eq!(status(&server, "src", "cold", &cold), None);
+    assert_eq!(status(&server, "hist", "one", &hist_one), None);
+    let (_, (_, listed)) = call(
+        &server,
+        "GET",
+        "/reports",
+        &format!("list-type=2&prefix=rep/job-{job}/results/"),
+        b"",
+    );
+    let mut rows = String::new();
+    for part in listed.split("<Key>").skip(1) {
+        let name = part.split("</Key>").next().unwrap();
+        rows.push_str(
+            &call(&server, "GET", &format!("/reports/{name}"), "", b"")
+                .1
+                .1,
+        );
+    }
+    for line in [
+        "src,cold,,failed,400,SrcObjectNotEligible,",
+        "hist,one,,failed,400,SrcObjectNotEligible,",
+        "src,missing,,failed,404,NoSuchKey,",
+        "src,a.txt,,succeeded,200,,Successful",
+    ] {
+        assert!(rows.contains(line), "{line}: {rows}");
+    }
+
+    // A creator who may not s3:InitiateReplication: each task denied. One
+    // who may not s3:GetReplicationConfiguration generates no manifest.
+    let policy = |actions: &str| {
+        format!(
+            r#"{{"Version": "2012-10-17", "Statement": [{{"Effect": "Allow", "Action": [
+            "s3:CreateJob", "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject",
+            "s3:PutInventoryConfiguration"{actions}], "Resource": "*"}}]}}"#
+        )
+        .replace('\n', " ")
+    };
+    let created_after = "<CreatedAfter>2000-01-01T00:00:00Z</CreatedAfter>";
+    let read_config = policy(r#", "s3:GetReplicationConfiguration""#);
+    let (user_key, user_secret) =
+        user_with_key(&server, &account, "replicator", Some(&read_config));
+    let job = create(
+        &server,
+        (&user_key, &user_secret),
+        generated("gen-2", "src", created_after, false),
+    );
+    let answer = ended(&server, &job);
+    assert_eq!(
+        counts(&answer),
+        ("4".into(), "0".into(), "4".into()),
+        "{answer}"
+    );
+    let (user_key, user_secret) = user_with_key(&server, &account, "blind", Some(&policy("")));
+    let job = create(
+        &server,
+        (&user_key, &user_secret),
+        generated("gen-4", "src", created_after, false),
+    );
+    let answer = ended(&server, &job);
+    assert_eq!(
+        xml_value(&answer, "FailureCode"),
+        "AccessDenied",
+        "{answer}"
+    );
+
+    // More versions of one key than one listing page holds, written before
+    // its bucket replicates, the newest a delete marker: every version is
+    // listed (the marker is not), and each is replicated once the job is
+    // done, across a crash.
+    let mut versions = vec![hist_one];
+    for _ in 0..1004 {
+        versions.push(put(&server, "/hist/many", &[]));
+    }
+    let (head, (code, _)) = call(&server, "DELETE", "/hist/many", "", b"");
+    assert_eq!(code, 204);
+    assert!(response_header(&head, "x-amz-delete-marker").is_some());
+    replicate(&server, "/hist");
+    let statuses = "<ObjectReplicationStatuses><member>NONE</member></ObjectReplicationStatuses>";
+    let job = create(
+        &server,
+        (&key, &secret),
+        generated("gen-3", "hist", statuses, false),
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while xml_value(&described(&server, &job), "NumberOfTasksSucceeded") == "0"
+        || xml_value(&described(&server, &job), "NumberOfTasksSucceeded").is_empty()
+    {
+        assert!(Instant::now() < deadline, "{}", described(&server, &job));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    crash_and_restart(&mut server);
+    let answer = ended(&server, &job);
+    assert_eq!(
+        counts(&answer),
+        ("1005".into(), "1005".into(), "0".into()),
+        "{answer}"
+    );
+    for (n, version) in versions.iter().enumerate() {
+        let key = if n == 0 { "one" } else { "many" };
+        wait_status(&server, "hist", key, version, "COMPLETED");
+        assert_eq!(
+            status(&server, "dst", key, version).as_deref(),
+            Some("REPLICA")
+        );
+    }
+}
+
+#[test]
 fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
     let mut server = start_server();
     let (account, key, secret) = account_with_key(&server, "batcher");

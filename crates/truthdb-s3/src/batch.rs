@@ -15,7 +15,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response};
 use percent_encoding::percent_decode_str;
-use truthdb_object::{Job, JobStatus, ObjectAttrs, StorageClass, time::iso8601};
+use truthdb_object::{Job, JobStatus, ObjectAttrs, ReplicationStatus, StorageClass, time::iso8601};
 
 use crate::authz::Authz;
 use crate::error::{S3Error, escape};
@@ -56,6 +56,9 @@ pub(crate) enum Operation {
     /// the webhook of the stream topic the function names (one of the
     /// job's account's).
     Lambda(Box<LambdaSpec>),
+    /// Replicate each object again, to the destinations its bucket's
+    /// replication rules name for it (Batch Replication).
+    Replicate,
 }
 
 /// A LambdaInvoke: the function (a topic name, and the account its ARN
@@ -116,6 +119,7 @@ impl Operation {
             Operation::Retention { .. } => "S3PutObjectRetention",
             Operation::LegalHold(_) => "S3PutObjectLegalHold",
             Operation::Lambda(_) => "LambdaInvoke",
+            Operation::Replicate => "S3ReplicateObject",
         }
     }
 }
@@ -196,6 +200,8 @@ pub(crate) struct OutputSpec {
 
 /// What a generated manifest keeps: an object passing every condition
 /// given (times against its last-modified time, sizes and times strictly).
+/// The replication conditions are tested where the listing is read
+/// ([`Filter::passes`] does not test them).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Filter {
     pub created_after_ms: Option<u64>,
@@ -206,6 +212,10 @@ pub(crate) struct Filter {
     pub larger_than: Option<u64>,
     pub smaller_than: Option<u64>,
     pub classes: Vec<StorageClass>,
+    /// Only what the bucket's replication configuration replicates.
+    pub eligible: bool,
+    /// Only versions of these replication statuses (`None`: none yet).
+    pub statuses: Option<Vec<Option<ReplicationStatus>>>,
 }
 
 impl Filter {
@@ -325,10 +335,12 @@ fn generator(element: &Element) -> Result<GeneratorSpec, S3Error> {
     };
     let mut filter = Filter::default();
     if let Some(given) = generator.one("Filter")? {
-        const OFFERED: [&str; 6] = [
+        const OFFERED: [&str; 8] = [
             "CreatedAfter",
             "CreatedBefore",
+            "EligibleForReplication",
             "KeyNameConstraint",
+            "ObjectReplicationStatuses",
             "ObjectSizeGreaterThanBytes",
             "ObjectSizeLessThanBytes",
             "MatchAnyStorageClass",
@@ -377,6 +389,27 @@ fn generator(element: &Element) -> Result<GeneratorSpec, S3Error> {
             filter.prefix = constraint("MatchAnyPrefix")?;
             filter.substring = constraint("MatchAnySubstring")?;
             filter.suffix = constraint("MatchAnySuffix")?;
+        }
+        if let Some(eligible) = given.text_of("EligibleForReplication")? {
+            filter.eligible = flag(eligible)?;
+        }
+        if let Some(statuses) = given.one("ObjectReplicationStatuses")? {
+            statuses.only(&["member"])?;
+            let mut kept = Vec::new();
+            for member in statuses.all("member") {
+                kept.push(match member.text.as_str() {
+                    "NONE" => None,
+                    "FAILED" => Some(ReplicationStatus::Failed),
+                    "COMPLETED" => Some(ReplicationStatus::Completed),
+                    "REPLICA" => Some(ReplicationStatus::Replica),
+                    _ => {
+                        return Err(invalid(
+                            "A replication status is NONE, FAILED, COMPLETED or REPLICA",
+                        ));
+                    }
+                });
+            }
+            filter.statuses = Some(kept);
         }
         if let Some(classes) = given.one("MatchAnyStorageClass")? {
             classes.only(&["member"])?;
@@ -650,6 +683,10 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
                 schema_two,
                 user_arguments,
             })))
+        }
+        "S3ReplicateObject" => {
+            chosen.only(&[])?;
+            Ok(Operation::Replicate)
         }
         "S3PutObjectLegalHold" => {
             chosen.only(&["LegalHold"])?;
@@ -1522,7 +1559,7 @@ mod tests {
             "InvalidRequest"
         );
         assert_eq!(
-            code(request("<S3ReplicateObject/>", MANIFEST, REPORT)),
+            code(request("<S3ComputeObjectChecksum/>", MANIFEST, REPORT)),
             "NotImplemented"
         );
         let no_fields = MANIFEST.replace("<member>Bucket</member>", "");

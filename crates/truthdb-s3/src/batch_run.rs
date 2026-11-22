@@ -719,9 +719,15 @@ fn prepare_listing(
         .map(|()| None);
     }
     let authz = Authz::load_now(file, &creator(job), vec![bucket.clone()], Vec::new(), now)?;
+    // Batch Replication reads the bucket's replication configuration for
+    // it too, as AWS's role policy for a generated manifest asks.
     if authz
         .check("s3:PutInventoryConfiguration", Resource::Bucket(bucket))
         .is_err()
+        || (spec.operation == Operation::Replicate
+            && authz
+                .check("s3:GetReplicationConfiguration", Resource::Bucket(bucket))
+                .is_err())
     {
         return finish_failed(
             file,
@@ -755,14 +761,20 @@ fn prepare_listing(
         });
     }
     let after = job.listed_after.clone();
-    // Only the keys under a prefix filter's prefix are listed.
-    let listing = match file.list_objects(
-        bucket,
-        generator.filter.prefix.as_deref().unwrap_or(""),
-        None,
-        after.as_deref().map(ListAfter::Key),
-        LIST_PAGE,
-    )? {
+    let after_version = job.listed_version;
+    // Batch Replication lists every version, the other operations the
+    // current ones; only the keys under a prefix filter's prefix.
+    let every_version = spec.operation == Operation::Replicate;
+    let prefix = generator.filter.prefix.as_deref().unwrap_or("");
+    let resume = after.as_deref().map(|key| match after_version {
+        Some(version) => ListAfter::Version(key, version),
+        None => ListAfter::Key(key),
+    });
+    let listing = match every_version {
+        true => file.list_versions(bucket, prefix, None, resume, LIST_PAGE)?,
+        false => file.list_objects(bucket, prefix, None, resume, LIST_PAGE)?,
+    };
+    let listing = match listing {
         Ok(listing) => listing,
         Err(_) => {
             return finish_failed(
@@ -775,34 +787,54 @@ fn prepare_listing(
         }
     };
     let versioning = crate::objects::versioning_of(file, bucket)?;
-    let tasks: Vec<(String, String)> = listing
-        .objects
-        .iter()
-        .filter(|object| object.latest && !object.info.delete_marker)
-        .filter(|object| {
-            generator.filter.passes(
-                &object.key,
-                object.info.size,
-                object.info.mtime_ms,
-                object.info.storage_class,
-            )
-        })
-        .map(|object| {
-            let version = crate::objects::version_header(
-                versioning,
-                object.info.version,
-                object.info.null_version,
-            );
-            (object.key.clone(), version.unwrap_or_default())
-        })
-        .collect();
+    let filter = &generator.filter;
+    let replication = match filter.eligible {
+        true => file.replication(bucket)?,
+        false => None,
+    };
+    let mut tasks: Vec<(String, String)> = Vec::new();
+    for object in &listing.objects {
+        let info = &object.info;
+        if (!every_version && !object.latest)
+            || info.delete_marker
+            || !filter.passes(&object.key, info.size, info.mtime_ms, info.storage_class)
+        {
+            continue;
+        }
+        if let Some(statuses) = &filter.statuses {
+            let status = file.replication_status(bucket, &object.key, info.version)?;
+            if !statuses.contains(&status) {
+                continue;
+            }
+        }
+        // Eligible: a rule replicates it, by its key and tags now.
+        if filter.eligible {
+            let replicated = match &replication {
+                Some(config) if !info.storage_class.is_archived() => {
+                    let attrs = file.version_attrs(bucket, &object.key, info.version)?;
+                    !config.rules_for(&object.key, &attrs.tags).is_empty()
+                }
+                _ => false,
+            };
+            if !replicated {
+                continue;
+            }
+        }
+        let version = crate::objects::version_header(versioning, info.version, info.null_version);
+        tasks.push((object.key.clone(), version.unwrap_or_default()));
+    }
     let last = listing.last.as_ref().map(|(key, _)| key.clone());
+    let last_version = listing.last_version;
     let done = !listing.truncated;
     file.transaction(|tx| {
         let Some(mut job) = tx.job(number)? else {
             return Ok(());
         };
-        if job.status != JobStatus::Preparing || job.listed_after != after || job.listing_done {
+        if job.status != JobStatus::Preparing
+            || job.listed_after != after
+            || job.listed_version != after_version
+            || job.listing_done
+        {
             return Ok(());
         }
         for (key, version_id) in &tasks {
@@ -810,6 +842,7 @@ fn prepare_listing(
         }
         if last.is_some() {
             job.listed_after = last;
+            job.listed_version = last_version;
         }
         job.listing_done = done;
         tx.put_job(&job)
@@ -1033,6 +1066,7 @@ enum Planned {
     Restore(VersionSel, truthdb_object::RestoreRequest),
     Retention(VersionSel, truthdb_object::RetentionChange, bool),
     LegalHold(VersionSel, bool),
+    Replicate(Box<ObjectInfo>),
     Copy {
         source: Box<ObjectInfo>,
         bucket: String,
@@ -1173,6 +1207,15 @@ fn plan(
                 return Ok(Err(err));
             }
             return Ok(Ok(Planned::LegalHold(which, *on)));
+        }
+        Operation::Replicate => {
+            if let Err(err) = authz.check("s3:InitiateReplication", object) {
+                return Ok(Err(err));
+            }
+            return Ok(match file.object_version(bucket, key, which)? {
+                Ok(info) => Ok(Planned::Replicate(Box::new(info))),
+                Err(err) => Err(object_error(err, bucket, key)),
+            });
         }
         // Invoked outside the lock, not planned here.
         Operation::Lambda(_) => {
@@ -1338,6 +1381,7 @@ async fn run_tasks(
                 Operation::Restore { .. } => "RestoreObject",
                 Operation::Retention { .. } => "PutObjectRetention",
                 Operation::LegalHold(_) => "PutObjectLegalHold",
+                Operation::Replicate => "ReplicateObject",
                 Operation::Lambda(_) => "",
             }
             .to_string(),
@@ -1951,6 +1995,16 @@ fn run_one(
                 .put_legal_hold(&bucket, &key, which, on)?
                 .map(|_| ())
                 .map_err(|err| object_error(err, &bucket, &key)),
+            // Queued: the replications are made (and their status kept) as
+            // the bucket's are.
+            Ok(Planned::Replicate(info)) => match tx.replicate_again(&bucket, &key, &info)? {
+                true => Ok(()),
+                false => Err(S3Error::new(
+                    400,
+                    "SrcObjectNotEligible",
+                    "No replication rule of the bucket replicates the object",
+                )),
+            },
             Ok(Planned::Copy {
                 source,
                 bucket: to,
