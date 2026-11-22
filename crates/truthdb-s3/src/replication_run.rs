@@ -173,8 +173,9 @@ impl Metrics {
         if self.minute == Some(minute) {
             return Ok(());
         }
-        let samples = object(state, move |file| measured(file, now)).await?;
+        // Tried once a minute, whether it is read or not.
         self.minute = Some(minute);
+        let samples = object(state, move |file| measured(file, now)).await?;
         let mut failed = HashMap::new();
         for sample in samples {
             // Failures since the last sample (none known yet: from now).
