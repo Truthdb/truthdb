@@ -19,7 +19,8 @@
 //! The `Role` is kept as given: there are no IAM roles, so replication acts
 //! as the one who put the configuration (its account, and its user): it
 //! replicates a version only if they may `s3:GetObjectVersionForReplication`
-//! it and `s3:ReplicateObject` in the destination. The object engine keeps
+//! it and `s3:ReplicateObject` in the destination, and a delete marker only
+//! if they may `s3:ReplicateDelete` there. The object engine keeps
 //! the configuration and queues what it replicates (see
 //! `truthdb_object::ReplicationConfig`); `replication_run` writes the
 //! replicas.
