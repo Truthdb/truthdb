@@ -184,6 +184,25 @@ impl PayloadDecoder {
     /// With no checksum to verify, computes `algorithm`'s (as
     /// `x-amz-sdk-checksum-algorithm` names it) to be kept, not CRC64NVME.
     pub fn computing(&mut self, algorithm: &str) -> Result<(), S3Error> {
+        // One S3 does not name is the request's error; one it names that is
+        // not computed here is not implemented.
+        const NAMED: [&str; 10] = [
+            "CRC32",
+            "CRC32C",
+            "CRC64NVME",
+            "SHA1",
+            "SHA256",
+            "SHA512",
+            "MD5",
+            "XXHASH64",
+            "XXHASH3",
+            "XXHASH128",
+        ];
+        if !NAMED.contains(&algorithm.to_ascii_uppercase().as_str()) {
+            return Err(S3Error::invalid_request(format!(
+                "Value for x-amz-sdk-checksum-algorithm header is invalid: {algorithm}"
+            )));
+        }
         if let Kept::Computed = self.checksum.2 {
             let name = format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase());
             self.checksum = (name.clone(), Checksum::for_header(&name)?, Kept::Computed);

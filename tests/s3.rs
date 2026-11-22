@@ -11993,6 +11993,28 @@ fn checksums_are_kept_and_returned_as_s3_returns_them() {
         response_header(&head, "x-amz-checksum-sha1").as_deref(),
         Some("EfatjsUqKYSrqv18O1FlA3hcIHI=")
     );
+    // One S3 does not name is the request's error; one it names that is not
+    // computed here is not implemented.
+    for (algorithm, expected) in [
+        ("BOGUS", (400, "InvalidRequest")),
+        ("XXHASH64", (501, "NotImplemented")),
+    ] {
+        let (_, (status, answer)) = send_with(
+            server.s3_port,
+            "PUT",
+            "/sums/named",
+            "",
+            &[("x-amz-sdk-checksum-algorithm", algorithm)],
+            b"x",
+            &key,
+            Some(&secret),
+        );
+        assert_eq!(
+            (status, xml_value(&answer, "Code").as_str()),
+            expected,
+            "{algorithm}"
+        );
+    }
 }
 
 const CHECKSUMS_SCRIPT: &str = r#"
@@ -12028,8 +12050,9 @@ crc32 = b64(zlib.crc32(data).to_bytes(4, "big"))
 put = s3.put_object(Bucket="sums", Key="crc", Body=data)
 assert put["ChecksumCRC32"] == crc32, put
 # A copy keeps its source's, whatever its metadata.
-s3.copy_object(Bucket="sums", Key="copy", CopySource={"Bucket": "sums", "Key": "sha"},
-    MetadataDirective="REPLACE", Metadata={"m": "1"})
+copied = s3.copy_object(Bucket="sums", Key="copy", CopySource={"Bucket": "sums", "Key": "sha"},
+    MetadataDirective="REPLACE", Metadata={"m": "1"})["CopyObjectResult"]
+assert copied["ChecksumSHA256"] == sha and copied["ChecksumType"] == "FULL_OBJECT", copied
 assert s3.head_object(Bucket="sums", Key="copy", ChecksumMode="ENABLED")["ChecksumSHA256"] == sha
 # A wrong one is refused.
 try:
