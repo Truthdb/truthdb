@@ -64,6 +64,12 @@ pub(crate) fn upload_error(err: UploadError, bucket: &str, key: &str) -> S3Error
             "EntityTooLarge",
             "Your proposed upload exceeds the maximum allowed object size.",
         ),
+        // AWS gives a 400 and does not name its code.
+        UploadError::NonConsecutiveParts => S3Error::new(
+            400,
+            "InvalidPart",
+            "A directory bucket's parts are numbered consecutively from 1.",
+        ),
     }
 }
 

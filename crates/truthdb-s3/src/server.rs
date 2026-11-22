@@ -109,6 +109,10 @@ pub struct Authenticated {
     pub framing: Framing,
     /// The full-body checksum header's name and (for a header checksum) value.
     pub checksum: Option<(String, Option<String>)>,
+    /// Signed for S3 Express (`s3express`), as the SDKs sign a directory
+    /// bucket's requests (and ListDirectoryBuckets, which only that tells
+    /// from ListBuckets), rather than `s3`.
+    pub express: bool,
 }
 
 /// Serves S3 requests on `listener` (over TLS when `tls` is set) until
@@ -776,7 +780,11 @@ pub async fn authenticate(
     state: &S3State,
     request: &Request<Incoming>,
 ) -> Result<Authenticated, S3Error> {
-    let (auth, amz_date) = signed_request(state, request, "s3")?;
+    // A directory bucket's requests are signed for S3 Express; either
+    // service is taken for any bucket.
+    let express = request_service(request).as_deref() == Some("s3express");
+    let service = if express { "s3express" } else { "s3" };
+    let (auth, amz_date) = signed_request(state, request, service)?;
     let amz_date = amz_date.as_str();
     let payload_hash = header(request, "x-amz-content-sha256")
         .ok_or_else(|| S3Error::invalid_request("the request has no x-amz-content-sha256"))?
@@ -826,6 +834,7 @@ pub async fn authenticate(
         }),
         framing,
         checksum: checksum_of(request),
+        express,
     })
 }
 
@@ -935,6 +944,7 @@ pub async fn authenticate_presigned(
         }),
         framing,
         checksum: checksum_of(request),
+        express: false,
     })
 }
 
@@ -996,6 +1006,7 @@ fn anonymous(request: &Request<Incoming>) -> Result<Option<Authenticated>, S3Err
         signed: None,
         framing,
         checksum: checksum_of(request),
+        express: false,
     }))
 }
 

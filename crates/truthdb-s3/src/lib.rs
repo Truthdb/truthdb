@@ -16,6 +16,7 @@ pub mod copy;
 pub mod cors;
 pub(crate) mod crc_combine;
 pub mod delete;
+pub mod directory;
 pub mod error;
 pub mod iam_api;
 pub mod inventory_config;

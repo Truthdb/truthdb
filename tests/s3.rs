@@ -17746,3 +17746,164 @@ else:
     assert [point["SampleCount"] for point in samples] == [1.0], samples
     print("ok")
 "#;
+
+#[test]
+fn directory_buckets_are_made_listed_and_limited_as_s3_express_has_them() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "express");
+    // May read a directory bucket (a ReadOnly session's reads), and no more.
+    let reader = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3express:CreateSession", "Resource": "*", "Condition": {"StringEquals": {"s3express:SessionMode": "ReadOnly"}}}}"#;
+    let (reader_key, reader_secret) = user_with_key(&server, &account, "reader", Some(reader));
+    let script = server.dir.join("directory_buckets.py");
+    std::fs::write(&script, DIRECTORY_BUCKETS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &reader_key,
+            &reader_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const DIRECTORY_BUCKETS_SCRIPT: &str = r#"
+import sys, json
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, reader_key, reader_secret = sys.argv[1:7]
+def client(access, secret_key, express):
+    s3 = {"addressing_style": "path"}
+    if express:
+        # Signed for S3 Express with the key itself (no CreateSession yet).
+        s3["disable_s3_express_session_auth"] = True
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3=s3))
+d = client(key, secret, True)
+s3 = client(key, secret, False)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+def configuration(zone, kind="AvailabilityZone", redundancy="SingleAvailabilityZone"):
+    return {"Location": {"Type": kind, "Name": zone},
+        "Bucket": {"Type": "Directory", "DataRedundancy": redundancy}}
+B = "data--use1-az4--x-s3"
+made = d.create_bucket(Bucket=B, CreateBucketConfiguration=configuration("use1-az4"))
+arn = f"arn:aws:s3express:us-east-1:{account}:bucket/{B}"
+assert made["BucketArn"] == arn, made
+d.create_bucket(Bucket="more--use1-az4--x-s3", CreateBucketConfiguration=configuration("use1-az4"))
+s3.create_bucket(Bucket="general")
+# Refused: another zone than the name's; a directory configuration for a
+# general purpose name, and a directory name without one; a Local Zone;
+# Object Lock; EXPRESS_ONEZONE in a general purpose bucket.
+refused(lambda: d.create_bucket(Bucket="x--use1-az4--x-s3",
+    CreateBucketConfiguration=configuration("use1-az5")), "InvalidRequest")
+refused(lambda: d.create_bucket(Bucket="plain-name",
+    CreateBucketConfiguration=configuration("use1-az4")), "InvalidBucketName")
+refused(lambda: d.create_bucket(Bucket="y--use1-az4--x-s3"), "InvalidBucketName")
+refused(lambda: d.create_bucket(Bucket="z--use1-az4--x-s3",
+    CreateBucketConfiguration=configuration("use1-az4", "LocalZone", "SingleLocalZone")), "NotImplemented")
+refused(lambda: d.create_bucket(Bucket="w--use1-az4--x-s3", ObjectLockEnabledForBucket=True,
+    CreateBucketConfiguration=configuration("use1-az4")), "NotImplemented")
+refused(lambda: s3.put_object(Bucket="general", Key="k", Body=b"x", StorageClass="EXPRESS_ONEZONE"),
+    "InvalidStorageClass")
+# Listed by ListDirectoryBuckets, in pages; not by ListBuckets.
+listed = d.list_directory_buckets()["Buckets"]
+assert [(b["Name"], b["BucketArn"], b["BucketRegion"]) for b in listed] == [
+    (B, arn, "us-east-1"), ("more--use1-az4--x-s3", arn.replace(B, "more--use1-az4--x-s3"), "us-east-1")], listed
+page = d.list_directory_buckets(MaxDirectoryBuckets=1)
+assert [b["Name"] for b in page["Buckets"]] == [B] and page["ContinuationToken"], page
+rest = d.list_directory_buckets(MaxDirectoryBuckets=1, ContinuationToken=page["ContinuationToken"])
+assert [b["Name"] for b in rest["Buckets"]] == ["more--use1-az4--x-s3"] and "ContinuationToken" not in rest, rest
+assert [b["Name"] for b in s3.list_buckets()["Buckets"]] == ["general"]
+headers = d.head_bucket(Bucket=B)["ResponseMetadata"]["HTTPHeaders"]
+assert (headers["x-amz-bucket-location-type"], headers["x-amz-bucket-location-name"],
+    headers["x-amz-bucket-arn"], headers["x-amz-access-point-alias"]) == (
+    "AvailabilityZone", "use1-az4", arn, "false"), headers
+# Objects: EXPRESS_ONEZONE, the only class; null, the only version.
+d.put_object(Bucket=B, Key="dir/a", Body=b"one")
+d.put_object(Bucket=B, Key="dir/sub/b", Body=b"two", StorageClass="EXPRESS_ONEZONE")
+assert d.head_object(Bucket=B, Key="dir/a")["StorageClass"] == "EXPRESS_ONEZONE"
+assert d.get_object(Bucket=B, Key="dir/a", VersionId="null")["Body"].read() == b"one"
+refused(lambda: d.get_object(Bucket=B, Key="dir/a", VersionId="123"), "InvalidArgument")
+refused(lambda: d.put_object(Bucket=B, Key="k", Body=b"x", StorageClass="STANDARD"), "InvalidStorageClass")
+refused(lambda: d.put_object(Bucket=B, Key="k", Body=b"x", Tagging="a=b"), "NotImplemented")
+listing = d.list_objects_v2(Bucket=B, Prefix="dir/", Delimiter="/")
+assert [o["Key"] for o in listing["Contents"]] == ["dir/a"], listing
+assert [p["Prefix"] for p in listing["CommonPrefixes"]] == ["dir/sub/"], listing
+assert listing["Contents"][0]["StorageClass"] == "EXPRESS_ONEZONE", listing
+refused(lambda: d.list_objects_v2(Bucket=B, Delimiter="-"), "InvalidArgument")
+refused(lambda: d.list_objects_v2(Bucket=B, Prefix="di"), "InvalidArgument")
+refused(lambda: d.list_objects_v2(Bucket=B, StartAfter="dir/a"), "NotImplemented")
+refused(lambda: d.list_objects(Bucket=B), "NotImplemented")
+refused(lambda: d.list_object_versions(Bucket=B), "NotImplemented")
+refused(lambda: d.put_bucket_versioning(Bucket=B, VersioningConfiguration={"Status": "Enabled"}), "NotImplemented")
+refused(lambda: d.get_bucket_acl(Bucket=B), "NotImplemented")
+refused(lambda: d.put_object_tagging(Bucket=B, Key="dir/a", Tagging={"TagSet": []}), "NotImplemented")
+refused(lambda: d.put_bucket_lifecycle_configuration(Bucket=B, LifecycleConfiguration={"Rules": [
+    {"ID": "t", "Status": "Enabled", "Filter": {"Prefix": ""},
+     "Transitions": [{"Days": 30, "StorageClass": "STANDARD_IA"}]}]}), "NotImplemented")
+d.put_bucket_lifecycle_configuration(Bucket=B, LifecycleConfiguration={"Rules": [
+    {"ID": "e", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 1}}]})
+assert d.get_object_attributes(Bucket=B, Key="dir/a", ObjectAttributes=["StorageClass"])["StorageClass"] == "EXPRESS_ONEZONE"
+# Multipart: its parts numbered 1, 2, ... only.
+part = b"p" * (5 * 1024 * 1024)
+def upload(numbers):
+    made = d.create_multipart_upload(Bucket=B, Key="dir/big")
+    listed = [{"PartNumber": n, "ETag": d.upload_part(Bucket=B, Key="dir/big", UploadId=made["UploadId"],
+        PartNumber=n, Body=part)["ETag"]} for n in numbers]
+    return made["UploadId"], lambda: d.complete_multipart_upload(Bucket=B, Key="dir/big",
+        UploadId=made["UploadId"], MultipartUpload={"Parts": listed})
+gapped, complete = upload([1, 3])
+refused(complete, "InvalidPart")
+# A refused completion leaves its upload, as at S3.
+d.abort_multipart_upload(Bucket=B, Key="dir/big", UploadId=gapped)
+upload([1, 2])[1]()
+assert d.head_object(Bucket=B, Key="dir/big")["StorageClass"] == "EXPRESS_ONEZONE"
+# Copies both ways: into it EXPRESS_ONEZONE, out of it the request's class.
+s3.put_object(Bucket="general", Key="g", Body=b"general")
+d.copy_object(Bucket=B, Key="dir/copied", CopySource={"Bucket": "general", "Key": "g"})
+assert d.head_object(Bucket=B, Key="dir/copied")["StorageClass"] == "EXPRESS_ONEZONE"
+s3.copy_object(Bucket="general", Key="back", CopySource={"Bucket": B, "Key": "dir/a"})
+assert "StorageClass" not in s3.head_object(Bucket="general", Key="back")
+deleted = d.delete_objects(Bucket=B, Delete={"Objects": [{"Key": "dir/copied"}, {"Key": "dir/sub/b"}]})
+assert sorted(o["Key"] for o in deleted["Deleted"]) == ["dir/copied", "dir/sub/b"], deleted
+# Authorized as S3 Express is: a ReadOnly session's reads only.
+r = client(reader_key, reader_secret, True)
+assert r.get_object(Bucket=B, Key="dir/a")["Body"].read() == b"one"
+assert [o["Key"] for o in r.list_objects_v2(Bucket=B, Prefix="dir/")["Contents"]][0] == "dir/a"
+refused(lambda: r.put_object(Bucket=B, Key="dir/r", Body=b"r"), "AccessDenied")
+refused(lambda: r.delete_object(Bucket=B, Key="dir/a"), "AccessDenied")
+refused(lambda: r.create_bucket(Bucket="r--use1-az4--x-s3",
+    CreateBucketConfiguration=configuration("use1-az4")), "AccessDenied")
+refused(lambda: r.list_directory_buckets(), "AccessDenied")
+# A bucket policy on its S3 Express ARN.
+d.put_bucket_policy(Bucket=B, Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Deny", "Principal": "*", "Action": "s3express:CreateSession", "Resource": arn,
+     "Condition": {"StringEquals": {"s3express:SessionMode": "ReadOnly"}}}]}))
+refused(lambda: r.get_object(Bucket=B, Key="dir/a"), "AccessDenied")
+d.delete_bucket_policy(Bucket=B)
+# Emptied, it is deleted.
+for k in ["dir/a", "dir/big"]:
+    d.delete_object(Bucket=B, Key=k)
+d.delete_bucket(Bucket=B)
+assert [b["Name"] for b in d.list_directory_buckets()["Buckets"]] == ["more--use1-az4--x-s3"]
+print("ok")
+"#;

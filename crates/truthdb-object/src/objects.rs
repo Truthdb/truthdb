@@ -698,12 +698,19 @@ impl ObjTxn<'_, '_> {
         bucket: &str,
         key: &str,
         versioning: Versioning,
-        new: NewVersion,
+        mut new: NewVersion,
         attrs: &ObjectAttrs,
         given: Option<(u64, u64)>,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<ObjectInfo, StorageError> {
+        // A directory bucket's objects are EXPRESS_ONEZONE, however written.
+        if self
+            .bucket_row(bucket)?
+            .is_some_and(|row| row.zone.is_some())
+        {
+            new.storage_class = StorageClass::ExpressOnezone;
+        }
         let null_version = versioning != Versioning::Enabled;
         if null_version {
             // Replaced in place: the journal records the new version only.

@@ -578,15 +578,24 @@ pub async fn bucket_lifecycle(
             let body = crate::server::read_body(request, auth, MAX_BODY).await?;
             let config = parse(&body, header.as_deref())?;
             let min = config.min_size;
+            let transitions = config.rules.iter().any(|rule| {
+                !rule.transitions.is_empty() || !rule.noncurrent_transitions.is_empty()
+            });
             crate::scope::object(state, move |file| {
-                if file.bucket(&name)?.is_none() {
-                    return Ok(Err(()));
+                let Some(info) = file.bucket(&name)? else {
+                    return Ok(Err(None));
+                };
+                // A directory bucket's objects stay EXPRESS_ONEZONE.
+                if info.zone.is_some() && transitions {
+                    return Ok(Err(Some(S3Error::not_implemented(
+                        "Lifecycle transitions are not supported for directory buckets",
+                    ))));
                 }
                 file.transaction(|tx| tx.put_lifecycle(&name, &config, crate::objects::now_ms()))?;
                 Ok(Ok(()))
             })
             .await?
-            .map_err(|()| no_bucket())?;
+            .map_err(|err| err.unwrap_or_else(no_bucket))?;
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(MIN_SIZE_HEADER, min_size_name(min))

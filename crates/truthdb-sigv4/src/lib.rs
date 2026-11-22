@@ -264,8 +264,8 @@ pub fn canonical_request(
     )
 }
 
-/// [`canonical_request`] for `service`: every service but S3 encodes the
-/// path twice.
+/// [`canonical_request`] for `service`: every service but S3 (and S3
+/// Express, a directory bucket's) encodes the path twice.
 pub fn canonical_request_for(
     service: &str,
     method: &str,
@@ -291,7 +291,7 @@ pub fn canonical_request_for(
     }
     Ok(format!(
         "{method}\n{}\n{}\n{canonical_headers}\n{}\n{payload_hash}",
-        if service == "s3" {
+        if service == "s3" || service == "s3express" {
             canonical_uri(raw_path)
         } else {
             double_encoded_uri(raw_path)
@@ -470,6 +470,15 @@ mod tests {
         );
         assert_eq!(super::double_encoded_uri("/PutVectors"), "/PutVectors");
         assert_eq!(super::canonical_uri("/a%3Ab"), "/a%3Ab");
+        // S3 Express signs it once, as S3 does.
+        let headers = [("host".to_string(), "h".to_string())];
+        let signed = ["host".to_string()];
+        for (service, path) in [("s3express", "/a%3Ab"), ("s3vectors", "/a%253Ab")] {
+            let canonical =
+                super::canonical_request_for(service, "GET", "/a%3Ab", "", &headers, &signed, "x")
+                    .unwrap();
+            assert_eq!(canonical.lines().nth(1), Some(path), "{service}");
+        }
     }
 
     use super::*;

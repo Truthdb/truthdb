@@ -65,6 +65,8 @@ pub enum UploadError {
     EntityTooSmall(u32),
     /// The parts add up to more than 5 TiB.
     EntityTooLarge,
+    /// A directory bucket's upload lists parts not numbered 1, 2, 3, ...
+    NonConsecutiveParts,
 }
 
 /// An upload as listed.
@@ -264,9 +266,14 @@ impl ObjTxn<'_, '_> {
         if let Err(err) = validate_key(key) {
             return Ok(Err(err));
         }
-        if self.bucket_row(bucket)?.is_none() {
+        let Some(row) = self.bucket_row(bucket)? else {
             return Ok(Err(ObjectError::NoSuchBucket));
-        }
+        };
+        // A directory bucket's uploads (and objects) are EXPRESS_ONEZONE.
+        let storage_class = match row.zone {
+            Some(_) => StorageClass::ExpressOnezone,
+            None => storage_class,
+        };
         let upload = next_counter(self, NEXT_UPLOAD_KEY)?;
         let (uploads, index, attrs_tree) = (
             self.trees.uploads(),
@@ -502,6 +509,14 @@ impl ObjTxn<'_, '_> {
         }
         if listed.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
             return Ok(Err(UploadError::InvalidPartOrder));
+        }
+        if bucket_row.zone.is_some()
+            && listed
+                .iter()
+                .enumerate()
+                .any(|(index, (number, _))| *number as usize != index + 1)
+        {
+            return Ok(Err(UploadError::NonConsecutiveParts));
         }
         let parts = self.trees.parts();
         let mut chosen = Vec::with_capacity(listed.len());
