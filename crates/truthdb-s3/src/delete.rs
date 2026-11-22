@@ -40,14 +40,9 @@ async fn delete_one(
     let (bucket_name, key_name) = (bucket.to_string(), key.to_string());
     crate::scope::object_as(state, operation, move |file| {
         file.transaction(|tx| {
-            let deleted = tx.delete_object(
-                &bucket_name,
-                &key_name,
-                which,
-                bypass,
-                now_ms(),
-                DROP_GRACE_MS,
-            )?;
+            let now = now_ms();
+            let deleted =
+                tx.delete_object(&bucket_name, &key_name, which, bypass, now, DROP_GRACE_MS)?;
             // A marker a delete makes is replicated where a rule asks for
             // it (not one lifecycle makes, nor a delete of a version).
             if let Ok(Deleted {
@@ -57,7 +52,7 @@ async fn delete_one(
             }) = &deleted
                 && which.is_none()
             {
-                tx.queue_marker_replication(&bucket_name, &key_name, *version)?;
+                tx.queue_marker_replication(&bucket_name, &key_name, *version, now)?;
             }
             Ok(deleted)
         })

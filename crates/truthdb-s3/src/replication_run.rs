@@ -28,6 +28,13 @@
 //! destination's owner and versioning as a replica does, and the
 //! configuration's creator may `s3:ReplicateDelete` there; it has no
 //! status, so one that cannot be made is dropped (its reason logged).
+//!
+//! Once a minute, each enabled rule whose destination has metrics (or
+//! replication time control) enabled has its replication metrics sampled
+//! into the metric history, by source bucket, destination and rule id:
+//! what it has queued (operations, and the bytes of its new replicas), how
+//! far behind its destination is (the age of the oldest of those), and how
+//! many of its operations failed since the last sample.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -39,12 +46,17 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use truthdb_core::storage::StorageError;
 use truthdb_object::{
-    BucketInfo, ObjFile, ObjectInfo, ObjectLock, Origin, QueuedReplication, RemoteBucket,
-    ReplicationConfig, ReplicationStatus, ReplicationWork, VersionSel, Versioning,
+    BucketInfo, MetricPoint, MetricSeries, ObjFile, ObjectInfo, ObjectLock, Origin,
+    QueuedReplication, RemoteBucket, ReplicationConfig, ReplicationStatus, ReplicationWork,
+    SeriesBy, Stats, VersionSel, Versioning,
 };
 
 use crate::authz::{Authz, Resource};
 use crate::batch_run::object;
+use crate::metric_history::{
+    BYTES_PENDING_REPLICATION, OPERATIONS_FAILED_REPLICATION, OPERATIONS_PENDING_REPLICATION,
+    REPLICATION_LATENCY,
+};
 use crate::objects::{DROP_GRACE_MS, now_ms};
 use crate::server::{Principal, S3State};
 
@@ -77,13 +89,21 @@ struct RemoteJob {
     headers: Vec<(String, String)>,
 }
 
-/// Writes replicas until `shutdown` turns true.
+/// Writes replicas until `shutdown` turns true; once a minute, the
+/// replication metrics of the rules that measure theirs.
 pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
     let mut stored_anew = false;
     let mut runner = Runner::default();
+    let mut metrics = Metrics::default();
     loop {
         if *shutdown.borrow() {
             return;
+        }
+        if !state.storage.is_standby() {
+            metrics
+                .sample(&state, now_ms())
+                .await
+                .unwrap_or_else(|err| eprintln!("replication metrics: {err}"));
         }
         if !stored_anew && !state.storage.is_standby() {
             stored_anew = store_xml_anew(&state)
@@ -104,6 +124,105 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
             }
         }
     }
+}
+
+/// The replication metrics: sampled once a minute, as S3 publishes them,
+/// for each enabled rule with metrics (or replication time control)
+/// enabled, into its series by source bucket, destination and rule id.
+#[derive(Default)]
+struct Metrics {
+    /// The minute last sampled.
+    minute: Option<u64>,
+    /// The failures each series had counted when it was last sampled.
+    failed: HashMap<MetricSeries, u64>,
+}
+
+/// One measured rule as sampled: its series, when its source bucket was
+/// made (ms), and its backlog then.
+struct Sample {
+    series: MetricSeries,
+    made_ms: u64,
+    operations: u64,
+    bytes: u64,
+    /// How far (s) its destination is behind: the age of the oldest of
+    /// what it has queued.
+    latency: u64,
+    failed: u64,
+}
+
+impl Metrics {
+    async fn sample(&mut self, state: &S3State, now: u64) -> Result<(), String> {
+        let minute = now / 60_000;
+        if self.minute == Some(minute) {
+            return Ok(());
+        }
+        let samples = object(state, move |file| measured(file, now)).await?;
+        self.minute = Some(minute);
+        let mut failed = HashMap::new();
+        for sample in samples {
+            // Failures since the last sample (none known yet: from now).
+            let new = self
+                .failed
+                .get(&sample.series)
+                .map_or(0, |before| sample.failed.saturating_sub(*before));
+            failed.insert(sample.series.clone(), sample.failed);
+            let mut point = MetricPoint::new();
+            let values = [
+                (REPLICATION_LATENCY, sample.latency),
+                (BYTES_PENDING_REPLICATION, sample.bytes),
+                (OPERATIONS_PENDING_REPLICATION, sample.operations),
+                (OPERATIONS_FAILED_REPLICATION, new),
+            ];
+            for (code, value) in values {
+                point.insert(code, Stats::of(value as f64));
+            }
+            state
+                .metric_recorder
+                .record_one(&sample.series, sample.made_ms, now / 1000, &point);
+        }
+        self.failed = failed;
+        Ok(())
+    }
+}
+
+/// The enabled rules that measure their replications, each with its
+/// backlog at `now`.
+fn measured(file: &mut ObjFile<'_>, now: u64) -> Result<Vec<Sample>, StorageError> {
+    let backlog = file.replication_backlog()?;
+    let mut samples = Vec::new();
+    for bucket in file.list_buckets()? {
+        let Some(config) = file.replication(&bucket.name)? else {
+            continue;
+        };
+        for rule in &config.rules {
+            if !rule.enabled || !rule.destination.measured() {
+                continue;
+            }
+            let destination = &rule.destination.bucket;
+            let found = backlog.iter().find(|queued| {
+                queued.bucket == bucket.name
+                    && &queued.destination == destination
+                    && queued.rule == rule.id
+            });
+            samples.push(Sample {
+                series: MetricSeries {
+                    bucket: bucket.name.clone(),
+                    by: SeriesBy::Replication {
+                        destination: destination.clone(),
+                        rule: rule.id.clone(),
+                    },
+                },
+                made_ms: bucket.created_ms,
+                operations: found.map_or(0, |found| found.operations),
+                bytes: found.map_or(0, |found| found.bytes),
+                latency: found
+                    .and_then(|found| found.oldest_ms)
+                    .map_or(0, |oldest| now.saturating_sub(oldest) / 1000),
+                failed: found.map_or(0, |found| found.failed),
+            });
+        }
+    }
+    Ok(samples)
 }
 
 /// Stores anew the configurations an earlier build stored as XML, as put
@@ -834,8 +953,9 @@ fn replicate_marker(
             "replication: the delete marker {}/{} version {} is not replicated to {}: {why}",
             queued.bucket, queued.key, queued.version, queued.destination
         );
+        // A failure of the rule's (a marker has no status to show it).
         return file
-            .transaction(|tx| tx.finish_replication(queued, None))
+            .transaction(|tx| tx.finish_replication(queued, Some(ReplicationStatus::Failed)))
             .map(|()| None);
     }
     let same_owner = file
@@ -1113,6 +1233,9 @@ mod tests {
                     storage_class: None,
                     owner_override: false,
                     owner: None,
+                    metrics: None,
+                    event_threshold: false,
+                    replication_time: None,
                 },
             }],
             account: me.into(),
@@ -1394,6 +1517,9 @@ mod tests {
                 storage_class: None,
                 owner_override: false,
                 owner: None,
+                metrics: None,
+                event_threshold: false,
+                replication_time: None,
             },
         };
         let config = |rules| ReplicationConfig {
@@ -1441,7 +1567,7 @@ mod tests {
                         .unwrap()
                         .version
                         .unwrap();
-                    tx.queue_marker_replication("src", key, marker)?;
+                    tx.queue_marker_replication("src", key, marker, 5)?;
                     Ok(marker)
                 })
                 .unwrap()
@@ -1542,6 +1668,9 @@ mod tests {
                                 storage_class: Some(StorageClass::StandardIa),
                                 owner_override: false,
                                 owner: None,
+                                metrics: None,
+                                event_threshold: false,
+                                replication_time: None,
                             },
                         }],
                         account: me.into(),
@@ -1822,6 +1951,9 @@ mod tests {
                 storage_class: None,
                 owner_override: false,
                 owner: None,
+                metrics: None,
+                event_threshold: false,
+                replication_time: None,
             },
         };
         ObjFile::new(&mut storage.lock())
@@ -1981,6 +2113,9 @@ mod tests {
                                 storage_class: None,
                                 owner_override: false,
                                 owner: Some(me.into()),
+                                metrics: None,
+                                event_threshold: false,
+                                replication_time: None,
                             },
                         }],
                         account: me.into(),

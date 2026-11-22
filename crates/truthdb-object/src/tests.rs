@@ -6835,6 +6835,9 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
                     storage_class: class,
                     owner_override: false,
                     owner: None,
+                    metrics: None,
+                    event_threshold: false,
+                    replication_time: None,
                 },
             };
             let mut off = rule("off", 9, "", None);
@@ -7130,6 +7133,159 @@ fn an_account_with_remote_buckets_is_not_dropped() {
 }
 
 #[test]
+fn a_rules_backlog_counts_what_it_queued_until_made_failed_or_dropped() {
+    use crate::{
+        ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
+        ReplicationStatus, StorageClass, Versioning,
+    };
+    let path = temp_path("replication-backlog");
+    let storage = create(&path);
+    let to = |bucket: &str, id: &str| ReplicationRule {
+        id: id.to_string(),
+        priority: 1,
+        enabled: true,
+        filter: ReplicationFilter::All,
+        replica_modifications: false,
+        delete_markers: false,
+        destination: ReplicationDestination {
+            bucket: bucket.to_string(),
+            account: None,
+            storage_class: None,
+            owner_override: false,
+            owner: None,
+            metrics: Some(true),
+            event_threshold: true,
+            replication_time: Some(false),
+        },
+    };
+    let config = ReplicationConfig {
+        role: "role".into(),
+        rules: vec![to("one", "r1"), to("two", "r2")],
+        account: DEFAULT_ACCOUNT.into(),
+        user: None,
+    };
+    // Format 5 keeps the monitoring settings; format 4 reads with none.
+    let encoded = config.encode();
+    assert_eq!(encoded[0], 5);
+    assert_eq!(ReplicationConfig::decode(&encoded).unwrap(), config);
+    let mut plain = to("one", "r1");
+    plain.destination.metrics = None;
+    plain.destination.event_threshold = false;
+    plain.destination.replication_time = None;
+    let single = ReplicationConfig {
+        rules: vec![plain],
+        ..config.clone()
+    };
+    let mut old = single.encode();
+    assert_eq!(old.pop(), Some(0));
+    old[0] = 4;
+    assert_eq!(ReplicationConfig::decode(&old).unwrap(), single);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["src", "one", "two"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+            }
+            tx.put_replication("src", &config)
+        })
+        .unwrap();
+    let backlog = || {
+        ObjFile::new(&mut storage.lock())
+            .replication_backlog()
+            .unwrap()
+            .into_iter()
+            .map(|rule| {
+                assert_eq!(rule.bucket, "src");
+                (
+                    rule.destination,
+                    rule.rule,
+                    rule.operations,
+                    rule.bytes,
+                    rule.oldest_ms,
+                    rule.failed,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let queue = || {
+        ObjFile::new(&mut storage.lock())
+            .replication_queue(None, 100)
+            .unwrap()
+    };
+    let take = |q: &crate::QueuedReplication, how: Option<ReplicationStatus>| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| match how {
+                Some(how) => tx.finish_replication(q, Some(how)),
+                None => tx.drop_replication(q),
+            })
+            .unwrap()
+    };
+    put_at(&storage, "src", "a", 10, StorageClass::Standard, T0);
+    put_at(&storage, "src", "b", 30, StorageClass::Standard, T0 + 7);
+    let queued = queue();
+    assert_eq!(queued.len(), 4);
+    assert_eq!(
+        (
+            queued[0].rule.as_str(),
+            queued[0].bytes,
+            queued[0].queued_ms
+        ),
+        ("r1", 10, T0)
+    );
+    assert_eq!(
+        backlog(),
+        [
+            ("one".into(), "r1".into(), 2, 40, Some(T0), 0),
+            ("two".into(), "r2".into(), 2, 40, Some(T0), 0)
+        ]
+    );
+    // Made, failed, dropped: off the backlog; the failure counted; the
+    // oldest is the next one queued.
+    take(&queued[0], Some(ReplicationStatus::Completed));
+    take(&queued[1], Some(ReplicationStatus::Failed));
+    take(&queued[3], None);
+    assert_eq!(
+        backlog(),
+        [
+            ("one".into(), "r1".into(), 1, 30, Some(T0 + 7), 0),
+            ("two".into(), "r2".into(), 0, 0, None, 1)
+        ]
+    );
+    // A rule with nothing queued and no failure has no row.
+    take(&queued[2], Some(ReplicationStatus::Completed));
+    assert_eq!(backlog(), [("two".into(), "r2".into(), 0, 0, None, 1)]);
+    // An entry an earlier build queued (no rule, size or time) reads and
+    // counts in no backlog.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let mut bytes = crate::codec::Writer::default();
+            bytes.u8(0);
+            bytes.str("src");
+            bytes.str("a");
+            bytes.u64(1);
+            bytes.str("one");
+            bytes.u8(0);
+            tx.trees.replication_queue().insert_unique(
+                tx.ctx,
+                &mut truthdb_core::relstore::ctx::OpMode::Txn(tx.txn),
+                &900u64.to_be_bytes(),
+                &bytes.0,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let earlier = queue().pop().unwrap();
+    assert_eq!(
+        (earlier.number, earlier.rule.as_str(), earlier.queued_ms),
+        (900, "", 0)
+    );
+    take(&earlier, Some(ReplicationStatus::Failed));
+    assert_eq!(backlog(), [("two".into(), "r2".into(), 0, 0, None, 1)]);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_delete_marker_is_queued_for_the_rules_that_replicate_them_and_kept_as_made() {
     use crate::{
         ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
@@ -7150,6 +7306,9 @@ fn a_delete_marker_is_queued_for_the_rules_that_replicate_them_and_kept_as_made(
             storage_class: None,
             owner_override: false,
             owner: None,
+            metrics: None,
+            event_threshold: false,
+            replication_time: None,
         },
     };
     let config = ReplicationConfig {
@@ -7162,20 +7321,19 @@ fn a_delete_marker_is_queued_for_the_rules_that_replicate_them_and_kept_as_made(
         account: DEFAULT_ACCOUNT.into(),
         user: None,
     };
-    // Stored as format 4; one stored as format 3 (no marker flag) reads
-    // with none.
+    // One stored as format 3 (no marker flag, no monitoring) reads with
+    // none; an unknown format does not.
     let encoded = config.encode();
-    assert_eq!(encoded[0], 4);
     assert_eq!(ReplicationConfig::decode(&encoded).unwrap(), config);
     let single = ReplicationConfig {
         rules: vec![to("plain", "", false)],
         ..config.clone()
     };
     let mut old = single.encode();
-    assert_eq!(old.pop(), Some(0));
+    assert_eq!((old.pop(), old.pop()), (Some(0), Some(0)));
     old[0] = 3;
     assert_eq!(ReplicationConfig::decode(&old).unwrap(), single);
-    old[0] = 5;
+    old[0] = 6;
     assert!(ReplicationConfig::decode(&old).is_err());
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
@@ -7192,7 +7350,7 @@ fn a_delete_marker_is_queued_for_the_rules_that_replicate_them_and_kept_as_made(
             let deleted = tx
                 .delete_object("src", "a", None, false, T0 + 5, 0)?
                 .unwrap();
-            tx.queue_marker_replication("src", "a", deleted.version.unwrap())?;
+            tx.queue_marker_replication("src", "a", deleted.version.unwrap(), T0)?;
             Ok(deleted.version.unwrap())
         })
         .unwrap();
@@ -7296,6 +7454,9 @@ fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
             storage_class: None,
             owner_override: false,
             owner: None,
+            metrics: None,
+            event_threshold: false,
+            replication_time: None,
         },
     };
     let config = |rules| ReplicationConfig {
@@ -7339,7 +7500,7 @@ fn a_version_replicated_again_is_pending_until_each_destination_has_it_again() {
             .object_version(bucket, key, VersionSel::Seq(version))
             .unwrap()
             .unwrap();
-        file.transaction(|tx| tx.replicate_again(bucket, key, &info))
+        file.transaction(|tx| tx.replicate_again(bucket, key, &info, T0))
             .unwrap()
     };
     // FAILED for one destination: queued again for both, PENDING until
@@ -7458,6 +7619,9 @@ fn a_version_replicated_to_several_destinations_is_completed_once_all_are_made()
             storage_class: None,
             owner_override: false,
             owner: None,
+            metrics: None,
+            event_threshold: false,
+            replication_time: None,
         },
     };
     ObjFile::new(&mut storage.lock())

@@ -591,7 +591,7 @@ impl ObjTxn<'_, '_> {
     ) -> Result<ObjectInfo, StorageError> {
         let info =
             self.insert_version_as(bucket, key, versioning, new, attrs, None, now_ms, grace_ms)?;
-        self.queue_replication(bucket, key, &info)?;
+        self.queue_replication(bucket, key, &info, now_ms)?;
         Ok(info)
     }
 
@@ -787,7 +787,7 @@ impl ObjTxn<'_, '_> {
             },
             now_ms,
         )?;
-        self.queue_metadata_replication(bucket, key, version, &attrs.tags)?;
+        self.queue_metadata_replication(bucket, key, version, &attrs.tags, now_ms)?;
         Ok(Ok((version, null_version)))
     }
 

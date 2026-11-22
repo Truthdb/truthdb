@@ -100,6 +100,9 @@ impl ExternalRowsets for S3Rowsets {
             "sys.dm_s3_remote_buckets" => {
                 return Some(open_remote_buckets(&self.core, name, args, caller));
             }
+            "sys.dm_s3_replication" => {
+                return Some(open_replication(&self.core, name, args, caller));
+            }
             "sys.dm_s3_batch_jobs" => return Some(open_batch_jobs(&self.core, name, args, caller)),
             "sys.dm_s3_bucket_usage" => {
                 return Some(open_bucket_usage(&self.core, name, args, caller));
@@ -661,6 +664,77 @@ impl ExternalStream for RemoteBucketStream {
                         "SYSTEM"
                     }),
                     datetime(remote.created_ms),
+                ]
+            })
+            .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.dm_s3_replication`: one row per replication rule that has queued
+/// anything (by source bucket, destination and rule id): what it has queued
+/// (operations, and the bytes of its new replicas), since when, how far
+/// behind its destination is (s), and how many of its operations failed.
+fn open_replication(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            nvarchar("source_bucket", 63),
+            nvarchar("destination_bucket", 63),
+            nvarchar("rule_id", 255),
+            bigint("pending_operations"),
+            bigint("pending_bytes"),
+            datetime2("oldest_pending"),
+            bigint("lag_seconds"),
+            bigint("failed_operations"),
+        ],
+        rows: Box::new(ReplicationStream {
+            core: Arc::clone(core),
+            done: false,
+        }),
+    })
+}
+
+struct ReplicationStream {
+    core: Arc<Storage>,
+    done: bool,
+}
+
+impl ExternalStream for ReplicationStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let mut guard = self.core.lock();
+        let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+        let rows: Vec<Vec<Datum>> = file
+            .replication_backlog()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|rule| {
+                vec![
+                    text(&rule.bucket),
+                    text(&rule.destination),
+                    text(&rule.rule),
+                    Datum::BigInt(rule.operations as i64),
+                    Datum::BigInt(rule.bytes as i64),
+                    rule.oldest_ms.map_or(Datum::Null, datetime),
+                    Datum::BigInt(
+                        rule.oldest_ms
+                            .map_or(0, |oldest| now.saturating_sub(oldest) / 1000)
+                            as i64,
+                    ),
+                    Datum::BigInt(rule.failed as i64),
                 ]
             })
             .collect();

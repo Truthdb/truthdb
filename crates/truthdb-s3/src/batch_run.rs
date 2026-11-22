@@ -1997,7 +1997,7 @@ fn run_one(
                 .map_err(|err| object_error(err, &bucket, &key)),
             // Queued: the replications are made (and their status kept) as
             // the bucket's are.
-            Ok(Planned::Replicate(info)) => match tx.replicate_again(&bucket, &key, &info)? {
+            Ok(Planned::Replicate(info)) => match tx.replicate_again(&bucket, &key, &info, now)? {
                 true => Ok(()),
                 false => Err(S3Error::new(
                     400,

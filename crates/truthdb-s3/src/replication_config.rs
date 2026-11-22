@@ -11,8 +11,9 @@
 //! owner enforced ownership every bucket here has. Rules filter by key
 //! prefix. What later replication steps build is refused rather than
 //! accepted and ignored: tag filters, rules without a Filter (whose delete
-//! markers replicate), several destinations, KMS encryption, replication
-//! time and metrics, and existing-object replication. Delete-marker
+//! markers replicate), several destinations, KMS encryption, and
+//! existing-object replication. Replication metrics and time control are
+//! kept per destination (see `replication_run`). Delete-marker
 //! replication is refused for a rule that filters by tags, as S3 refuses
 //! it.
 //!
@@ -113,9 +114,39 @@ fn destination(element: &Element) -> Result<Destination, S3Error> {
             "Replication with KMS keys (EncryptionConfiguration)",
         ));
     }
-    if element.one("ReplicationTime")?.is_some() || element.one("Metrics")?.is_some() {
-        return Err(not_yet("Replication Time Control and replication metrics"));
-    }
+    // Metrics, and replication time control (which S3 takes only with a
+    // Metrics block); a time of 15 minutes is the only one S3 offers.
+    let fifteen = |value: &Element| -> Result<(), S3Error> {
+        value.only(&["Minutes"])?;
+        match value.text_of("Minutes")? {
+            None | Some("15") => Ok(()),
+            Some(_) => Err(invalid("Minutes can only be 15")),
+        }
+    };
+    let (metrics, event_threshold) = match element.one("Metrics")? {
+        None => (None, false),
+        Some(metrics) => {
+            metrics.only(&["Status", "EventThreshold"])?;
+            let threshold = metrics.one("EventThreshold")?;
+            if let Some(threshold) = threshold {
+                fifteen(threshold)?;
+            }
+            (Some(status(metrics)?), threshold.is_some())
+        }
+    };
+    let replication_time = match element.one("ReplicationTime")? {
+        None => None,
+        Some(time) => {
+            time.only(&["Status", "Time"])?;
+            fifteen(time.one("Time")?.ok_or_else(malformed)?)?;
+            if metrics.is_none() {
+                return Err(S3Error::invalid_request(
+                    "ReplicationTime must be specified together with a Metrics block",
+                ));
+            }
+            Some(status(time)?)
+        }
+    };
     let storage_class = element
         .text_of("StorageClass")?
         .map(|name| crate::objects::storage_class(Some(name)))
@@ -127,6 +158,9 @@ fn destination(element: &Element) -> Result<Destination, S3Error> {
         storage_class,
         owner_override,
         owner: None,
+        metrics,
+        event_threshold,
+        replication_time,
     })
 }
 
@@ -377,6 +411,21 @@ pub fn render(config: &ReplicationConfig) -> String {
             out.push_str(
                 "<AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>",
             );
+        }
+        let on = |enabled: bool| if enabled { "Enabled" } else { "Disabled" };
+        if let Some(enabled) = destination.replication_time {
+            out.push_str(&format!(
+                "<ReplicationTime><Status>{}</Status><Time><Minutes>15</Minutes></Time>\
+                 </ReplicationTime>",
+                on(enabled)
+            ));
+        }
+        if let Some(enabled) = destination.metrics {
+            out.push_str(&format!("<Metrics><Status>{}</Status>", on(enabled)));
+            if destination.event_threshold {
+                out.push_str("<EventThreshold><Minutes>15</Minutes></EventThreshold>");
+            }
+            out.push_str("</Metrics>");
         }
         out.push_str("</Destination></Rule>");
     }
@@ -663,6 +712,9 @@ mod tests {
                     storage_class: Some(StorageClass::StandardIa),
                     owner_override: false,
                     owner: None,
+                    metrics: None,
+                    event_threshold: false,
+                    replication_time: None,
                 },
             }
         );
@@ -870,15 +922,32 @@ mod tests {
                  <ReplicaKmsKeyID>k</ReplicaKmsKeyID></EncryptionConfiguration>",
                 unbuilt.clone(),
             ),
+            // Replication time control only with Metrics, with its Time,
+            // of 15 minutes; a threshold of 15 minutes.
             (
-                "<Bucket>arn:aws:s3:::copies</Bucket><Metrics><Status>Enabled</Status>\
-                 </Metrics>",
-                unbuilt.clone(),
+                "<Bucket>arn:aws:s3:::copies</Bucket><ReplicationTime><Status>Enabled\
+                 </Status><Time><Minutes>15</Minutes></Time></ReplicationTime>",
+                request.clone(),
             ),
             (
                 "<Bucket>arn:aws:s3:::copies</Bucket><ReplicationTime><Status>Enabled\
-                 </Status></ReplicationTime>",
-                unbuilt.clone(),
+                 </Status></ReplicationTime><Metrics><Status>Enabled</Status></Metrics>",
+                malformed.clone(),
+            ),
+            (
+                "<Bucket>arn:aws:s3:::copies</Bucket><ReplicationTime><Status>Enabled\
+                 </Status><Time><Minutes>30</Minutes></Time></ReplicationTime>\
+                 <Metrics><Status>Enabled</Status></Metrics>",
+                invalid.clone(),
+            ),
+            (
+                "<Bucket>arn:aws:s3:::copies</Bucket><Metrics><Status>Enabled</Status>\
+                 <EventThreshold><Minutes>5</Minutes></EventThreshold></Metrics>",
+                invalid.clone(),
+            ),
+            (
+                "<Bucket>arn:aws:s3:::copies</Bucket><Metrics></Metrics>",
+                malformed.clone(),
             ),
         ] {
             assert_eq!(
@@ -886,6 +955,47 @@ mod tests {
                 expected,
                 "{destination}"
             );
+        }
+        // Metrics and replication time control read and render back alike;
+        // time control turns the metrics on.
+        let monitored = |monitoring: &str| {
+            config(&format!(
+                "<Rule><Status>Enabled</Status><Priority>1</Priority><Filter/>\
+                 <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+                 <Destination><Bucket>arn:aws:s3:::copies</Bucket>{monitoring}</Destination>\
+                 </Rule>"
+            ))
+            .unwrap()
+        };
+        for (monitoring, measured, timed) in [
+            ("<Metrics><Status>Enabled</Status></Metrics>", true, false),
+            ("<Metrics><Status>Disabled</Status></Metrics>", false, false),
+            (
+                "<ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time>\
+                 </ReplicationTime><Metrics><Status>Disabled</Status><EventThreshold>\
+                 <Minutes>15</Minutes></EventThreshold></Metrics>",
+                true,
+                true,
+            ),
+            (
+                "<ReplicationTime><Status>Disabled</Status><Time><Minutes>15</Minutes></Time>\
+                 </ReplicationTime><Metrics><Status>Enabled</Status></Metrics>",
+                true,
+                false,
+            ),
+            ("", false, false),
+        ] {
+            let parsed = monitored(monitoring);
+            let destination = &parsed.rules[0].destination;
+            assert_eq!(
+                (destination.measured(), destination.timed()),
+                (measured, timed),
+                "{monitoring}"
+            );
+            assert!(
+                render(&parsed).contains(&format!("copies</Bucket>{monitoring}</Destination>"))
+            );
+            assert_eq!(parse(render(&parsed).as_bytes()), Ok(parsed));
         }
         // Delete-marker replication: read and rendered back for a rule by
         // prefix (or of every key); refused for one that filters by tags,

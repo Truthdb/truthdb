@@ -36,16 +36,17 @@ use crate::codec::{Reader, Writer, corrupt};
 use crate::documents::BUCKET_REPLICATION;
 use crate::objects::{NewVersion, ObjectError, ObjectInfo, version_key};
 use crate::{
-    ObjFile, ObjTxn, ObjectAttrs, ObjectLock, REPLICATION_QUEUE_TREE, REPLICATION_STATUS_TREE,
-    StorageClass, Versioning, next_counter,
+    ObjFile, ObjTxn, ObjectAttrs, ObjectLock, REPLICATION_BACKLOG_TREE, REPLICATION_QUEUE_TREE,
+    REPLICATION_STATUS_TREE, StorageClass, Versioning, next_counter,
 };
 
 /// META key of the next queue entry's number.
 const NEXT_REPLICATION_KEY: &[u8] = b"next_replication";
 /// The configuration's stored form: 1 has no owner override nor
 /// destination owner, 2 filters by prefix only, 3 has tag filters and
-/// replica modification sync, 4 delete marker replication.
-const FORMAT: u8 = 4;
+/// replica modification sync, 4 delete marker replication, 5 replication
+/// metrics and time control.
+const FORMAT: u8 = 5;
 
 /// A bucket's replication configuration (as PutBucketReplication sets it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +145,24 @@ pub struct ReplicationDestination {
     /// stored before it was kept (its destination must be the source
     /// owner's).
     pub owner: Option<String>,
+    /// `Metrics` `Status` as given (none: no Metrics), and whether it gave
+    /// an `EventThreshold`; `ReplicationTime` `Status` as given.
+    pub metrics: Option<bool>,
+    pub event_threshold: bool,
+    pub replication_time: Option<bool>,
+}
+
+impl ReplicationDestination {
+    /// Whether its replications are measured: with metrics enabled, or
+    /// replication time control (which turns them on).
+    pub fn measured(&self) -> bool {
+        self.metrics == Some(true) || self.timed()
+    }
+
+    /// Whether replication time control (S3 RTC) is enabled.
+    pub fn timed(&self) -> bool {
+        self.replication_time == Some(true)
+    }
 }
 
 impl ReplicationConfig {
@@ -213,6 +232,12 @@ impl ReplicationConfig {
                 }
             }
             out.u8(rule.delete_markers as u8);
+            let flag = |on: bool, bit: u8| if on { 1u8 << bit } else { 0 };
+            out.u8(flag(destination.metrics.is_some(), 0)
+                | flag(destination.metrics == Some(true), 1)
+                | flag(destination.event_threshold, 2)
+                | flag(destination.replication_time.is_some(), 3)
+                | flag(destination.replication_time == Some(true), 4));
         }
         out.0
     }
@@ -265,6 +290,13 @@ impl ReplicationConfig {
                 false => None,
             };
             let delete_markers = format >= 4 && input.present()?;
+            let monitoring = if format >= 5 { input.u8()? } else { 0 };
+            if monitoring >> 5 != 0 {
+                return Err(input.corrupt());
+            }
+            let bit = |bit: u8| monitoring & (1 << bit) != 0;
+            let metrics = bit(0).then_some(bit(1));
+            let replication_time = bit(3).then_some(bit(4));
             rules.push(ReplicationRule {
                 id,
                 priority,
@@ -278,6 +310,9 @@ impl ReplicationConfig {
                     storage_class,
                     owner_override,
                     owner,
+                    metrics,
+                    event_threshold: bit(2),
+                    replication_time,
                 },
             });
         }
@@ -462,6 +497,12 @@ pub struct QueuedReplication {
     pub destination: String,
     /// The replica's class (none: the source version's).
     pub storage_class: Option<StorageClass>,
+    /// The id of the rule it was queued by, the bytes it sends (a new
+    /// replica's size; none for other work), and when it was queued (ms).
+    /// An entry queued by an earlier build has none of these.
+    pub rule: String,
+    pub bytes: u64,
+    pub queued_ms: u64,
 }
 
 impl QueuedReplication {
@@ -477,6 +518,9 @@ impl QueuedReplication {
         out.u64(self.version);
         out.str(&self.destination);
         out.u8(self.storage_class.map_or(0, |class| 1 + class.code()));
+        out.str(&self.rule);
+        out.u64(self.bytes);
+        out.u64(self.queued_ms);
         out.0
     }
 
@@ -488,7 +532,7 @@ impl QueuedReplication {
             2 => ReplicationWork::DeleteMarker,
             _ => return Err(input.corrupt()),
         };
-        let queued = QueuedReplication {
+        let mut queued = QueuedReplication {
             number,
             work,
             bucket: input.str()?,
@@ -500,12 +544,78 @@ impl QueuedReplication {
                 code @ 1..=8 => Some(StorageClass::from_code(code - 1)),
                 _ => return Err(input.corrupt()),
             },
+            rule: String::new(),
+            bytes: 0,
+            queued_ms: 0,
         };
+        if !input.rest().is_empty() {
+            queued.rule = input.str()?;
+            queued.bytes = input.u64()?;
+            queued.queued_ms = input.u64()?;
+        }
         if !input.rest().is_empty() {
             return Err(input.corrupt());
         }
         Ok(queued)
     }
+}
+
+/// What a rule has queued (operations, and the bytes of its new replicas)
+/// and how many of its operations failed since it was first counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BacklogCounts {
+    operations: u64,
+    bytes: u64,
+    failed: u64,
+}
+
+impl BacklogCounts {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Writer::default();
+        out.u64(self.operations);
+        out.u64(self.bytes);
+        out.u64(self.failed);
+        out.0
+    }
+
+    fn decode(row: &[u8]) -> Result<Self, StorageError> {
+        let mut input = Reader::new(row, "replication backlog");
+        let counts = BacklogCounts {
+            operations: input.u64()?,
+            bytes: input.u64()?,
+            failed: input.u64()?,
+        };
+        if !input.rest().is_empty() {
+            return Err(input.corrupt());
+        }
+        Ok(counts)
+    }
+}
+
+fn backlog_key(bucket: &str, destination: &str, rule: &str) -> Vec<u8> {
+    [
+        bucket.as_bytes(),
+        &[0],
+        destination.as_bytes(),
+        &[0],
+        rule.as_bytes(),
+    ]
+    .concat()
+}
+
+/// One rule's replication backlog: what it has queued from `bucket` to
+/// `destination` (operations, and the bytes of the new replicas among
+/// them), when the oldest of those was queued (ms), and how many of its
+/// operations failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationBacklog {
+    pub bucket: String,
+    pub destination: String,
+    pub rule: String,
+    pub operations: u64,
+    pub bytes: u64,
+    pub oldest_ms: Option<u64>,
+    pub failed: u64,
 }
 
 impl ObjTxn<'_, '_> {
@@ -611,14 +721,75 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
-    fn enqueue(&mut self, mut queued: QueuedReplication) -> Result<(), StorageError> {
-        queued.number = next_counter(self, NEXT_REPLICATION_KEY)?;
+    /// Queues `work` on version `version` of `bucket`'s `key` (sending
+    /// `bytes`) to the destination of `rule`, at `now_ms`; it counts in the
+    /// rule's backlog until taken off the queue.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue(
+        &mut self,
+        work: ReplicationWork,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        rule: &ReplicationRule,
+        bytes: u64,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let queued = QueuedReplication {
+            number: next_counter(self, NEXT_REPLICATION_KEY)?,
+            work,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version,
+            destination: rule.destination.bucket.clone(),
+            storage_class: match work {
+                ReplicationWork::Create => rule.destination.storage_class,
+                _ => None,
+            },
+            rule: rule.id.clone(),
+            bytes,
+            queued_ms: now_ms,
+        };
         self.trees.replication_queue().insert_unique(
             self.ctx,
             &mut OpMode::Txn(self.txn),
             &queued.number.to_be_bytes(),
             &queued.encode(),
         )?;
+        self.count_backlog(&queued, true, false)
+    }
+
+    /// Counts `queued` in its rule's backlog: one more (`added`) or one
+    /// fewer, and, taken off as FAILED (`failed`), one more failure. An
+    /// entry of an earlier build (no queue time) is in none.
+    fn count_backlog(
+        &mut self,
+        queued: &QueuedReplication,
+        added: bool,
+        failed: bool,
+    ) -> Result<(), StorageError> {
+        if queued.queued_ms == 0 {
+            return Ok(());
+        }
+        let tree = self.trees.replication_backlog();
+        let row_key = backlog_key(&queued.bucket, &queued.destination, &queued.rule);
+        let mut counts = match tree.get(self.ctx, &row_key)? {
+            Some(row) => BacklogCounts::decode(&row)?,
+            None => BacklogCounts::default(),
+        };
+        if added {
+            counts.operations += 1;
+            counts.bytes += queued.bytes;
+        } else {
+            counts.operations = counts.operations.saturating_sub(1);
+            counts.bytes = counts.bytes.saturating_sub(queued.bytes);
+        }
+        counts.failed += u64::from(failed);
+        let mode = &mut OpMode::Txn(self.txn);
+        tree.delete(self.ctx, mode, &row_key)?;
+        if counts != BacklogCounts::default() {
+            tree.insert_unique(self.ctx, mode, &row_key, &counts.encode())?;
+        }
         Ok(())
     }
 
@@ -630,6 +801,7 @@ impl ObjTxn<'_, '_> {
         bucket: &str,
         key: &str,
         info: &ObjectInfo,
+        now_ms: u64,
     ) -> Result<(), StorageError> {
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(());
@@ -644,15 +816,15 @@ impl ObjTxn<'_, '_> {
         };
         self.set_status_row(bucket, key, info.version, &StatusRow::Source(tally))?;
         for rule in rules {
-            self.enqueue(QueuedReplication {
-                number: 0,
-                work: ReplicationWork::Create,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version: info.version,
-                destination: rule.destination.bucket.clone(),
-                storage_class: rule.destination.storage_class,
-            })?;
+            self.enqueue(
+                ReplicationWork::Create,
+                bucket,
+                key,
+                info.version,
+                rule,
+                info.size,
+                now_ms,
+            )?;
         }
         Ok(())
     }
@@ -665,21 +837,22 @@ impl ObjTxn<'_, '_> {
         bucket: &str,
         key: &str,
         version: u64,
+        now_ms: u64,
     ) -> Result<(), StorageError> {
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(());
         };
         for rule in config.rules_for(key, &[]) {
             if rule.delete_markers {
-                self.enqueue(QueuedReplication {
-                    number: 0,
-                    work: ReplicationWork::DeleteMarker,
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                self.enqueue(
+                    ReplicationWork::DeleteMarker,
+                    bucket,
+                    key,
                     version,
-                    destination: rule.destination.bucket.clone(),
-                    storage_class: None,
-                })?;
+                    rule,
+                    0,
+                    now_ms,
+                )?;
             }
         }
         Ok(())
@@ -730,6 +903,7 @@ impl ObjTxn<'_, '_> {
         bucket: &str,
         key: &str,
         info: &ObjectInfo,
+        now_ms: u64,
     ) -> Result<bool, StorageError> {
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(false);
@@ -758,15 +932,15 @@ impl ObjTxn<'_, '_> {
             }
         }
         for rule in rules {
-            self.enqueue(QueuedReplication {
-                number: 0,
-                work: ReplicationWork::Create,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version: info.version,
-                destination: rule.destination.bucket.clone(),
-                storage_class: rule.destination.storage_class,
-            })?;
+            self.enqueue(
+                ReplicationWork::Create,
+                bucket,
+                key,
+                info.version,
+                rule,
+                info.size,
+                now_ms,
+            )?;
         }
         Ok(true)
     }
@@ -781,6 +955,7 @@ impl ObjTxn<'_, '_> {
         key: &str,
         version: u64,
         tags: &[(String, String)],
+        now_ms: u64,
     ) -> Result<(), StorageError> {
         // A source version sends to the destinations holding (or about to
         // hold) its replica, whatever another destination did: one may
@@ -796,15 +971,15 @@ impl ObjTxn<'_, '_> {
                 None => false,
             };
             if sent {
-                self.enqueue(QueuedReplication {
-                    number: 0,
-                    work: ReplicationWork::Metadata,
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                self.enqueue(
+                    ReplicationWork::Metadata,
+                    bucket,
+                    key,
                     version,
-                    destination: rule.destination.bucket.clone(),
-                    storage_class: None,
-                })?;
+                    rule,
+                    0,
+                    now_ms,
+                )?;
             }
         }
         Ok(())
@@ -823,6 +998,7 @@ impl ObjTxn<'_, '_> {
             &mut OpMode::Txn(self.txn),
             &queued.number.to_be_bytes(),
         )?;
+        self.count_backlog(queued, false, status == Some(ReplicationStatus::Failed))?;
         let Some(status) = status else {
             return Ok(());
         };
@@ -845,6 +1021,7 @@ impl ObjTxn<'_, '_> {
             &mut OpMode::Txn(self.txn),
             &queued.number.to_be_bytes(),
         )?;
+        self.count_backlog(queued, false, false)?;
         if queued.work != ReplicationWork::Create {
             return Ok(());
         }
@@ -910,6 +1087,65 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
+    /// Every rule's backlog, by source bucket, destination and rule id: the
+    /// oldest queued of each is the first of its in the queue (the queue is
+    /// in the order things were queued), read only as far as needed.
+    pub fn replication_backlog(&mut self) -> Result<Vec<ReplicationBacklog>, StorageError> {
+        let Some(tree) = self.existing_tree(REPLICATION_BACKLOG_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let mut backlog = Vec::new();
+        for (row_key, row) in tree.scan_range(&mut self.core.page_ctx(0), None, None)? {
+            let mut parts = row_key.splitn(3, |byte| *byte == 0);
+            let mut part = || {
+                String::from_utf8(parts.next().unwrap_or_default().to_vec())
+                    .map_err(|_| corrupt("replication backlog key"))
+            };
+            let (bucket, destination, rule) = (part()?, part()?, part()?);
+            let counts = BacklogCounts::decode(&row)?;
+            backlog.push(ReplicationBacklog {
+                bucket,
+                destination,
+                rule,
+                operations: counts.operations,
+                bytes: counts.bytes,
+                oldest_ms: None,
+                failed: counts.failed,
+            });
+        }
+        let mut left = backlog.iter().filter(|rule| rule.operations > 0).count();
+        let mut after = None;
+        while left > 0 {
+            let page = self.replication_queue(after, 1024)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            after = Some(last.number);
+            for queued in &page {
+                if queued.queued_ms == 0 {
+                    continue;
+                }
+                if let Some(rule) = backlog.iter_mut().find(|rule| {
+                    rule.oldest_ms.is_none()
+                        && rule.operations > 0
+                        && (
+                            rule.bucket.as_str(),
+                            rule.destination.as_str(),
+                            rule.rule.as_str(),
+                        ) == (
+                            queued.bucket.as_str(),
+                            queued.destination.as_str(),
+                            queued.rule.as_str(),
+                        )
+                }) {
+                    rule.oldest_ms = Some(queued.queued_ms);
+                    left -= 1;
+                }
+            }
+        }
+        Ok(backlog)
+    }
+
     /// The bucket's replication configuration, if it has one.
     pub fn replication(&mut self, bucket: &str) -> Result<Option<ReplicationConfig>, StorageError> {
         Ok(self
