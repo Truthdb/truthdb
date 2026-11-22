@@ -241,6 +241,7 @@ fn data_event(
         }
         (true, Some("legal-hold")) => by("GetObjectLegalHold", Some("PutObjectLegalHold"), None)?,
         (true, Some("restore")) if *method == Method::POST => "RestoreObject",
+        (true, Some("attributes")) if *method == Method::GET => "GetObjectAttributes",
         (true, _) => return None,
     };
     Some((name, bucket, key))

@@ -5058,6 +5058,19 @@ fn customer_provided_keys_encrypt_objects_only_their_key_reads() {
     let (_, (status, reply)) = call("GET", "/vault/o", "", &[], b"");
     assert_eq!(status, 400, "{reply}");
     assert!(reply.contains("InvalidRequest"), "{reply}");
+    // Its attributes too: its size, the plaintext's.
+    let size = [("x-amz-object-attributes", "ObjectSize")];
+    let (_, (status, reply)) = call("GET", "/vault/o", "attributes", &size, b"");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("InvalidRequest"), "{reply}");
+    let mut with_key = header_refs(&key_a);
+    with_key.extend_from_slice(&size);
+    let (_, (status, reply)) = call("GET", "/vault/o", "attributes", &with_key, b"");
+    assert_eq!(status, 200, "{reply}");
+    assert!(
+        reply.contains(&format!("<ObjectSize>{}</ObjectSize>", body.len())),
+        "{reply}"
+    );
     assert_eq!(
         call("GET", "/vault/o", "", &header_refs(&key_b), b"").1.0,
         403
@@ -12206,6 +12219,136 @@ refused(lambda: s3.create_multipart_upload(Bucket="mpsums", Key="x", ChecksumAlg
 made = s3.create_multipart_upload(Bucket="mpsums", Key="mixed", ChecksumAlgorithm="CRC32")
 refused(lambda: s3.upload_part(Bucket="mpsums", Key="mixed", UploadId=made["UploadId"], PartNumber=1,
     Body=last, ChecksumAlgorithm="SHA256"), "InvalidRequest")
+print("ok")
+"#;
+
+#[test]
+fn object_attributes_are_given_as_s3_gives_them() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    let script = server.dir.join("object_attributes.py");
+    std::fs::write(&script, OBJECT_ATTRIBUTES_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const OBJECT_ATTRIBUTES_SCRIPT: &str = r#"
+import sys, base64, hashlib, json, os, zlib
+import boto3, botocore.config, botocore.exceptions
+port, key, secret = sys.argv[1:4]
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+b64 = lambda raw: base64.b64encode(raw).decode()
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+s3.create_bucket(Bucket="attrs")
+s3.put_bucket_versioning(Bucket="attrs", VersioningConfiguration={"Status": "Enabled"})
+ALL = ["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"]
+attributes = lambda key, names=ALL, **extra: s3.get_object_attributes(
+    Bucket="attrs", Key=key, ObjectAttributes=names, **extra)
+# A plain object: its ETag unquoted, its checksum, its size; STANDARD and
+# its (no) parts unsaid.
+put = s3.put_object(Bucket="attrs", Key="small", Body=b"hello", ChecksumAlgorithm="SHA256")
+got = attributes("small")
+assert got["ETag"] == put["ETag"].strip('"'), got
+assert got["Checksum"] == {"ChecksumSHA256": b64(hashlib.sha256(b"hello").digest()),
+    "ChecksumType": "FULL_OBJECT"}, got
+assert got["ObjectSize"] == 5 and "StorageClass" not in got and "ObjectParts" not in got, got
+assert got["VersionId"] == put["VersionId"] and "LastModified" in got, got
+# Only what is asked for.
+got = attributes("small", ["ObjectSize"])
+assert "ETag" not in got and "Checksum" not in got and got["ObjectSize"] == 5, got
+s3.put_object(Bucket="attrs", Key="cold", Body=b"x", StorageClass="STANDARD_IA")
+assert attributes("cold", ["StorageClass"])["StorageClass"] == "STANDARD_IA"
+# An older version, by its id.
+s3.put_object(Bucket="attrs", Key="small", Body=b"hello again")
+assert attributes("small", ["ObjectSize"], VersionId=put["VersionId"])["ObjectSize"] == 5
+# A multipart object: its parts, paged, each with its checksum.
+datas = [os.urandom(5 * 1024 * 1024), os.urandom(5 * 1024 * 1024), b"the last part"]
+made = s3.create_multipart_upload(Bucket="attrs", Key="big", ChecksumAlgorithm="CRC32",
+    ChecksumType="FULL_OBJECT")
+listed = []
+for number, data in enumerate(datas, 1):
+    sent = s3.upload_part(Bucket="attrs", Key="big", UploadId=made["UploadId"], PartNumber=number,
+        Body=data, ChecksumAlgorithm="CRC32")
+    listed.append({"PartNumber": number, "ETag": sent["ETag"], "ChecksumCRC32": sent["ChecksumCRC32"]})
+s3.complete_multipart_upload(Bucket="attrs", Key="big", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed}, ChecksumType="FULL_OBJECT")
+crc = lambda data: b64(zlib.crc32(data).to_bytes(4, "big"))
+parts = attributes("big")["ObjectParts"]
+assert parts["TotalPartsCount"] == 3 and parts["IsTruncated"] is False, parts
+assert [(part["PartNumber"], part["Size"], part["ChecksumCRC32"]) for part in parts["Parts"]] == [
+    (n, len(data), crc(data)) for n, data in enumerate(datas, 1)], parts
+first = attributes("big", ["ObjectParts"], MaxParts=2)["ObjectParts"]
+assert first["IsTruncated"] is True and first["NextPartNumberMarker"] == 2, first
+assert [part["PartNumber"] for part in first["Parts"]] == [1, 2], first
+rest = attributes("big", ["ObjectParts"], MaxParts=2, PartNumberMarker=2)["ObjectParts"]
+assert rest["IsTruncated"] is False and [part["PartNumber"] for part in rest["Parts"]] == [3], rest
+assert attributes("big", ["ObjectSize"])["ObjectSize"] == sum(map(len, datas))
+whole_page = attributes("big", ["ObjectParts"], MaxParts=3)["ObjectParts"]
+assert whole_page["IsTruncated"] is False and len(whole_page["Parts"]) == 3, whole_page
+# A multipart object with no checksum of its own (its upload asked for
+# none; its parts have the SDK's CRC32s): its part count, no parts.
+made = s3.create_multipart_upload(Bucket="attrs", Key="unsummed")
+listed = []
+for number, data in enumerate(datas[1:], 1):
+    sent = s3.upload_part(Bucket="attrs", Key="unsummed", UploadId=made["UploadId"],
+        PartNumber=number, Body=data)
+    listed.append({"PartNumber": number, "ETag": sent["ETag"]})
+s3.complete_multipart_upload(Bucket="attrs", Key="unsummed", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed})
+got = attributes("unsummed")
+assert "Checksum" not in got and got["ObjectParts"]["TotalPartsCount"] == 2, got
+assert "Parts" not in got["ObjectParts"], got
+# Refused: an attribute S3 does not name; a key not there; a key whose
+# newest version is a delete marker.
+refused(lambda: attributes("small", ["Size"]), "InvalidArgument")
+refused(lambda: attributes("missing"), "NoSuchKey")
+s3.delete_object(Bucket="attrs", Key="cold")
+refused(lambda: attributes("cold"), "NoSuchKey")
+# Conditions, as on a GET (a client of its own sends each header).
+def sending(name, value):
+    client = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+    def add(request, **_):
+        request.headers[name] = value
+    client.meta.events.register("before-sign.s3.GetObjectAttributes", add)
+    return lambda: client.get_object_attributes(Bucket="attrs", Key="big", ObjectAttributes=["ETag"])
+big_etag = s3.head_object(Bucket="attrs", Key="big")["ETag"]
+refused(sending("If-Match", '"0000"'), "PreconditionFailed")
+refused(sending("If-None-Match", big_etag), "304")
+assert sending("If-Match", big_etag)()["ETag"] == big_etag.strip('"')
+# Both actions are needed: the object's read, and its attributes'.
+s3.put_object(Bucket="attrs", Key="no-attributes", Body=b"x")
+s3.put_object(Bucket="attrs", Key="no-read", Body=b"x")
+s3.put_bucket_policy(Bucket="attrs", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObjectAttributes",
+     "Resource": "arn:aws:s3:::attrs/no-attributes"},
+    {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject",
+     "Resource": "arn:aws:s3:::attrs/no-read"}]}))
+refused(lambda: attributes("no-attributes"), "AccessDenied")
+refused(lambda: attributes("no-read"), "AccessDenied")
+assert s3.get_object(Bucket="attrs", Key="no-attributes")["Body"].read() == b"x"
+assert attributes("small", ["ObjectSize"])["ObjectSize"] == 11
 print("ok")
 "#;
 

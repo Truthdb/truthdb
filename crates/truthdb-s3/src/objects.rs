@@ -888,27 +888,55 @@ fn part_span(
     if info.parts == 0 {
         return Ok(if number == 1 { Ok(None) } else { Err(()) });
     }
-    let layout = file.body_layout(info.body)?;
-    if number as usize > layout.len() {
+    let sizes = part_sizes(file, info)?;
+    if number as usize > sizes.len() {
         return Ok(Err(()));
     }
+    let index = number as usize - 1;
+    Ok(Ok(Some((sizes[..index].iter().sum(), sizes[index]))))
+}
+
+/// The error of a read that finds delete marker `info`: the key is gone
+/// when it is the newest version; a marker named by its version id cannot
+/// be read.
+pub(crate) fn delete_marker_error(
+    which: VersionSel,
+    info: &ObjectInfo,
+    bucket: &str,
+    key: &str,
+) -> S3Error {
+    let err = if which == VersionSel::Latest {
+        object_error(ObjectError::NoSuchKey, bucket, key)
+    } else {
+        S3Error::new(
+            405,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        )
+        .with_header("last-modified", http_date(info.mtime_ms))
+    };
+    err.with_header("x-amz-delete-marker", "true").with_header(
+        "x-amz-version-id",
+        truthdb_object::version_id(info.version, info.null_version),
+    )
+}
+
+/// The plaintext sizes of a multipart version's parts, in order.
+pub(crate) fn part_sizes(
+    file: &mut ObjFile<'_>,
+    info: &ObjectInfo,
+) -> Result<Vec<u64>, StorageError> {
     // A part under a customer-provided key is stored encrypted: its
     // plaintext is shorter.
-    let mut first = 0;
-    for (index, &(_, _, stored)) in layout.iter().enumerate() {
-        let len = if info.attrs.customer_key.is_some() {
-            crate::ssec::plain_len(stored).ok_or_else(|| {
+    file.body_layout(info.body)?
+        .iter()
+        .map(|&(_, _, stored)| match info.attrs.customer_key {
+            Some(_) => crate::ssec::plain_len(stored).ok_or_else(|| {
                 StorageError::InvalidFile(format!("body {} has a corrupt part", info.body))
-            })?
-        } else {
-            stored
-        };
-        if index + 1 == number as usize {
-            return Ok(Ok(Some((first, len))));
-        }
-        first += len;
-    }
-    unreachable!("the part number is within the layout")
+            }),
+            None => Ok(stored),
+        })
+        .collect()
 }
 
 /// The `response-*` query parameters of a GET or HEAD: header values that
@@ -1111,22 +1139,7 @@ pub(crate) async fn read_object(
         *field = Some(value.clone());
     }
     if info.delete_marker {
-        // The newest version is a delete marker: the key is gone. A marker
-        // named by its version id cannot be read.
-        let err = if which == VersionSel::Latest {
-            object_error(ObjectError::NoSuchKey, &bucket, &key)
-        } else {
-            S3Error::new(
-                405,
-                "MethodNotAllowed",
-                "The specified method is not allowed against this resource.",
-            )
-            .with_header("last-modified", http_date(info.mtime_ms))
-        };
-        return Err(err.with_header("x-amz-delete-marker", "true").with_header(
-            "x-amz-version-id",
-            truthdb_object::version_id(info.version, info.null_version),
-        ));
+        return Err(delete_marker_error(which, &info, &bucket, &key));
     }
     if !head_only && truthdb_object::unreadable(info.storage_class, restore) {
         return Err(crate::restore::invalid_object_state());

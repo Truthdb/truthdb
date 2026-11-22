@@ -114,7 +114,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "accelerate",
     "analytics",
     "annotation",
-    "attributes",
     "intelligent-tiering",
     "metadataAnnotationTable",
     "metadataConfiguration",
@@ -132,6 +131,7 @@ const UNIMPLEMENTED: &[&str] = &[
 /// targets.
 const SUBRESOURCES: &[&str] = &[
     "acl",
+    "attributes",
     "cors",
     "delete",
     "encryption",
@@ -902,6 +902,22 @@ async fn route(
             );
             authz.check(action, Object(&bucket, &key))?;
             crate::tagging::get_tagging(state, request, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::GET) if has_param(&request, "attributes") => {
+            // Both: the object's read, and its attributes'.
+            authz.check(
+                versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
+                Object(&bucket, &key),
+            )?;
+            authz.check(
+                versioned(
+                    &request,
+                    "s3:GetObjectAttributes",
+                    "s3:GetObjectVersionAttributes",
+                ),
+                Object(&bucket, &key),
+            )?;
+            crate::attributes::get_object_attributes(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::DELETE) if has_param(&request, "tagging") => {
             let action = versioned(
