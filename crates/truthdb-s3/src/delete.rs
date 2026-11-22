@@ -7,6 +7,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use truthdb_object::{Deleted, ObjectError, VersionSel, version_id};
 
+use crate::conditional::Condition;
 use crate::error::{S3Error, escape};
 use crate::objects::{object_error, version_sel};
 use crate::server::{Authenticated, Body, S3State, full, read_body};
@@ -28,7 +29,8 @@ fn now_ms() -> u64 {
 }
 
 /// Deletes `key` (a version of it with `which`) as S3 operation
-/// `operation`; `bypass` lifts Object Lock's GOVERNANCE retention.
+/// `operation`, if `condition` (on its current version) holds; `bypass`
+/// lifts Object Lock's GOVERNANCE retention.
 async fn delete_one(
     state: &S3State,
     operation: &str,
@@ -36,10 +38,20 @@ async fn delete_one(
     key: &str,
     which: Option<VersionSel>,
     bypass: bool,
+    condition: Option<Condition>,
 ) -> Result<Deleted, S3Error> {
     let (bucket_name, key_name) = (bucket.to_string(), key.to_string());
     crate::scope::object_as(state, operation, move |file| {
         file.transaction(|tx| {
+            if let Some(condition) = &condition {
+                let current = match tx.current_etag(&bucket_name, &key_name)? {
+                    Ok(current) => current,
+                    Err(err) => return Ok(Err(object_error(err, &bucket_name, &key_name))),
+                };
+                if let Err(err) = condition.check_delete(current.as_ref().map(Option::as_deref)) {
+                    return Ok(Err(err));
+                }
+            }
             let now = now_ms();
             let deleted =
                 tx.delete_object(&bucket_name, &key_name, which, bypass, now, DROP_GRACE_MS)?;
@@ -54,10 +66,10 @@ async fn delete_one(
             {
                 tx.queue_marker_replication(&bucket_name, &key_name, *version, now)?;
             }
-            Ok(deleted)
+            Ok(Ok(deleted))
         })
     })
-    .await?
+    .await??
     .map_err(|err| object_error(err, bucket, key))
 }
 
@@ -77,7 +89,18 @@ pub async fn delete_object(
         authz,
         crate::authz::Resource::Object(&bucket, &key),
     );
-    let deleted = delete_one(state, "DeleteObject", &bucket, &key, which, bypass).await?;
+    let condition = Condition::of_delete(request.headers())?;
+    reads_to_compare(authz, condition.as_ref(), &bucket, &key)?;
+    let deleted = delete_one(
+        state,
+        "DeleteObject",
+        &bucket,
+        &key,
+        which,
+        bypass,
+        condition,
+    )
+    .await?;
     let mut response = Response::builder().status(StatusCode::NO_CONTENT);
     if let Some(version) = deleted.version {
         response = response.header(
@@ -91,10 +114,28 @@ pub async fn delete_object(
     Ok(response.body(full(Bytes::new())).expect("a valid response"))
 }
 
+/// A delete compared with an ETag reads the object: it needs
+/// `s3:GetObject` too, as S3 asks (`*` does not).
+fn reads_to_compare(
+    authz: &crate::authz::Authz,
+    condition: Option<&Condition>,
+    bucket: &str,
+    key: &str,
+) -> Result<(), S3Error> {
+    match condition.and_then(|condition| condition.if_match.as_deref()) {
+        Some(wanted) if wanted.trim() != "*" => {
+            authz.check("s3:GetObject", crate::authz::Resource::Object(bucket, key))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// One `<Object>` of a DeleteObjects request.
 struct ToDelete {
     key: String,
     version: Option<String>,
+    /// Its `ETag`: deleted only if its current version has it.
+    etag: Option<String>,
 }
 
 fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
@@ -110,7 +151,8 @@ fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
     let mut seen_root = false;
     let mut objects = Vec::new();
     let mut path: Vec<Vec<u8>> = Vec::new();
-    let (mut key, mut version): (Option<String>, Option<String>) = (None, None);
+    let (mut key, mut version, mut etag): (Option<String>, Option<String>, Option<String>) =
+        (None, None, None);
     let mut buf = Vec::new();
     loop {
         let event = reader.read_event_into(&mut buf).map_err(|_| malformed())?;
@@ -129,16 +171,17 @@ fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
                 (None, b"Delete") => !std::mem::replace(&mut seen_root, true),
                 (Some(b"Delete"), b"Quiet") => quiet.replace(String::new()).is_none(),
                 (Some(b"Delete"), b"Object") => {
-                    (key, version) = (None, None);
+                    (key, version, etag) = (None, None, None);
                     true
                 }
                 (Some(b"Object"), b"Key") => key.replace(String::new()).is_none(),
                 (Some(b"Object"), b"VersionId") => version.replace(String::new()).is_none(),
-                // Conditional deletes are not implemented: refused rather
-                // than ignored.
-                (Some(b"Object"), b"ETag" | b"LastModifiedTime" | b"Size") => {
+                (Some(b"Object"), b"ETag") => etag.replace(String::new()).is_none(),
+                // Only directory buckets take these: refused rather than
+                // ignored.
+                (Some(b"Object"), b"LastModifiedTime" | b"Size") => {
                     return Err(S3Error::not_implemented(
-                        "conditional deletes in DeleteObjects are not implemented",
+                        "LastModifiedTime and Size in DeleteObjects are for directory buckets, which are not implemented",
                     ));
                 }
                 _ => false,
@@ -157,6 +200,7 @@ fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
                 objects.push(ToDelete {
                     key,
                     version: version.take(),
+                    etag: etag.take(),
                 });
             }
             path.pop();
@@ -174,6 +218,7 @@ fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
             match path.last().map(Vec::as_slice) {
                 Some(b"Key") => key.get_or_insert_default().push_str(&text),
                 Some(b"VersionId") => version.get_or_insert_default().push_str(&text),
+                Some(b"ETag") => etag.get_or_insert_default().push_str(&text),
                 Some(b"Quiet") => quiet.get_or_insert_default().push_str(&text),
                 _ if text.trim().is_empty() => {}
                 _ => return Err(malformed()),
@@ -281,10 +326,32 @@ pub async fn delete_objects(
             Some(VersionSel::Latest) => {}
         }
         let resource = crate::authz::Resource::Object(&bucket, &object.key);
-        let outcome = match authz.check_with(action, resource, &context) {
+        // Its own ETag is its `s3:if-match`, as a policy requiring
+        // conditional deletes tests it.
+        match &object.etag {
+            Some(etag) => context.set("s3:if-match", vec![etag.clone()]),
+            None => context.remove("s3:if-match"),
+        }
+        let condition = object.etag.clone().map(|etag| Condition {
+            if_match: Some(etag),
+            if_none_match: false,
+        });
+        let outcome = match authz
+            .check_with(action, resource, &context)
+            .and_then(|()| reads_to_compare(authz, condition.as_ref(), &bucket, &object.key))
+        {
             Ok(()) => {
                 let bypass = crate::object_lock::bypasses(&headers, authz, resource);
-                delete_one(state, "DeleteObjects", &bucket, &object.key, which, bypass).await
+                delete_one(
+                    state,
+                    "DeleteObjects",
+                    &bucket,
+                    &object.key,
+                    which,
+                    bypass,
+                    condition,
+                )
+                .await
             }
             Err(err) => Err(err),
         };
@@ -368,8 +435,14 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
+        // An object's ETag is kept; the directory buckets' conditions are
+        // refused.
+        let (_, objects) =
+            parse_delete(b"<Delete><Object><Key>a</Key><ETag>\"x\"</ETag></Object></Delete>")
+                .unwrap();
+        assert_eq!(objects[0].etag.as_deref(), Some("\"x\""));
         assert_eq!(
-            parse_delete(b"<Delete><Object><Key>a</Key><ETag>x</ETag></Object></Delete>")
+            parse_delete(b"<Delete><Object><Key>a</Key><Size>1</Size></Object></Delete>")
                 .err()
                 .map(|err| err.code),
             Some("NotImplemented")

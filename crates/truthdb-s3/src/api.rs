@@ -195,6 +195,20 @@ pub(crate) fn plain(request: &Request<Incoming>, allowed: &[&str]) -> bool {
         .any(|name| !allowed.contains(name) && has_param(request, name))
 }
 
+/// `authz` with a write's conditional keys: `s3:if-match` and
+/// `s3:if-none-match` (its headers', when given) and
+/// `s3:ObjectCreationOperation` (whether it makes an object: S3 counts
+/// CreateMultipartUpload, UploadPart and UploadPartCopy as not).
+fn creating(
+    authz: &crate::authz::Authz,
+    request: &Request<Incoming>,
+    makes_object: bool,
+) -> crate::authz::Authz {
+    let mut keys = crate::conditional::Condition::keys(request.headers());
+    keys.push(("s3:ObjectCreationOperation", makes_object.to_string()));
+    authz.with_keys(&keys)
+}
+
 /// Whether every query parameter of `request` is one a plain write takes:
 /// those in `allowed`, `x-id`, or `x-amz-*` (a presigned URL's, and headers
 /// carried in the query). A write naming anything else, such as an S3
@@ -848,6 +862,7 @@ async fn route(
         (Target::Object(bucket, key), Method::POST)
             if has_param(&request, "uploads") && plain(&request, &["uploads"]) =>
         {
+            let authz = &creating(authz, &request, false);
             let lock = object_lock_headers(&request, authz, &bucket, &key)?;
             authz.check_storing(
                 "s3:PutObject",
@@ -866,7 +881,7 @@ async fn route(
         (Target::Object(bucket, key), Method::POST)
             if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>
         {
-            authz.check("s3:PutObject", Object(&bucket, &key))?;
+            creating(authz, &request, true).check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::complete_upload(state, request, auth, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) if has_param(&request, "tagging") => {
@@ -902,6 +917,8 @@ async fn route(
             // A query versionId is ignored: the source's is in its header.
             if copying && plain_write(&request, &["uploadId", "partNumber", "versionId"]) =>
         {
+            // UploadPartCopy makes no object; CopyObject does.
+            let authz = &creating(authz, &request, !has_param(&request, "uploadId"));
             // A copy stores the header's tags only when told to replace the
             // source's.
             let replaces_tags = request
@@ -961,7 +978,7 @@ async fn route(
             if has_param(&request, "uploadId")
                 && plain_write(&request, &["uploadId", "partNumber"]) =>
         {
-            authz.check("s3:PutObject", Object(&bucket, &key))?;
+            creating(authz, &request, false).check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::upload_part(state, request, auth, bucket, key).await
         }
         (Target::Object(bucket, key), Method::GET)
@@ -977,6 +994,7 @@ async fn route(
             crate::multipart::abort_upload(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) if plain_write(&request, &[]) => {
+            let authz = &creating(authz, &request, true);
             let lock = object_lock_headers(&request, authz, &bucket, &key)?;
             authz.check_storing(
                 "s3:PutObject",
@@ -1021,6 +1039,9 @@ async fn route(
             .await
         }
         (Target::Object(bucket, key), Method::DELETE) if plain_write(&request, &["versionId"]) => {
+            // A conditional delete's `s3:if-match`, as a policy requiring
+            // them tests it.
+            let authz = &authz.with_keys(&crate::conditional::Condition::keys(request.headers()));
             authz.check(
                 versioned(&request, "s3:DeleteObject", "s3:DeleteObjectVersion"),
                 Object(&bucket, &key),

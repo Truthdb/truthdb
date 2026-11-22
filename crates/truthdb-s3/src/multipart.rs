@@ -365,6 +365,7 @@ pub async fn complete_upload(
     let params = query_params(request.uri().query().unwrap_or(""));
     let upload = upload_id(&params)?;
     check_upload(state, upload, &bucket, &key).await?;
+    let condition = crate::conditional::Condition::of_write(request.headers())?;
     let body = read_body(request, auth, MAX_COMPLETE_BODY).await?;
     let listed = parse_complete(&body)?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
@@ -373,6 +374,18 @@ pub async fn complete_upload(
             let now = now_ms();
             let (_, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
             let completed = file.transaction(|tx| {
+                // In the completion's own transaction: an upload in progress
+                // is no version, so what was written meanwhile counts. One
+                // that fails leaves the upload as it was.
+                if let Some(condition) = &condition {
+                    let current = match tx.current_etag(&bucket_name, &key_name)? {
+                        Ok(current) => current.flatten(),
+                        Err(err) => return Ok(Err(object_error(err, &bucket_name, &key_name))),
+                    };
+                    if let Err(err) = condition.check(current.as_deref()) {
+                        return Ok(Err(err));
+                    }
+                }
                 let completed = tx.complete_upload(upload, &listed, now, DROP_GRACE_MS)?;
                 // The object has the lock its upload asked for; without a
                 // retention, the bucket's default one, from now.
@@ -383,12 +396,12 @@ pub async fn complete_upload(
                         tx.set_lock(&bucket_name, &key_name, info.version, &lock)?;
                     }
                 }
-                Ok(completed)
+                Ok(Ok(completed))
             })?;
             Ok((completed, versioning_of(file, &bucket_name)?))
         })
         .await?;
-    let info = completed.map_err(|err| upload_error(err, &bucket, &key))?;
+    let info = completed?.map_err(|err| upload_error(err, &bucket, &key))?;
     let mut response = xml(format!(
         "<CompleteMultipartUploadResult xmlns=\"{XMLNS}\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
         escape(&bucket),
