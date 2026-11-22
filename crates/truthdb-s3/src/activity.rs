@@ -86,8 +86,9 @@ pub(crate) struct Call {
     sub: Option<&'static str>,
     /// A copy's source object (its bucket and key).
     source: Option<(String, String)>,
-    /// Signed for S3 Express (a directory bucket's): its event source is
-    /// `s3express.amazonaws.com`, as AWS's directory bucket events show.
+    /// On a directory bucket (or ListDirectoryBuckets): its event source is
+    /// `s3express.amazonaws.com` and its resources S3 Express's, as AWS
+    /// records a directory bucket's events.
     express: bool,
     host: Option<String>,
     user_agent: Option<String>,
@@ -133,7 +134,7 @@ impl Call {
                     };
                     (name, None)
                 }
-                Target::Bucket(bucket) => (bucket_event(request, method)?, Some(bucket)),
+                Target::Bucket(bucket) => (bucket_event(request, method, &bucket)?, Some(bucket)),
                 _ => return None,
             }
         };
@@ -179,6 +180,11 @@ impl Call {
                 .map(str::to_string)
         };
         let connection = request.extensions().get::<Connection>();
+        // Only a directory bucket's name has its suffix.
+        let express = match &bucket {
+            Some(bucket) => bucket.ends_with(crate::directory::SUFFIX),
+            None => crate::server::request_service(request).as_deref() == Some("s3express"),
+        };
         Call {
             name,
             read_only: ["Get", "List", "Head"]
@@ -189,7 +195,7 @@ impl Call {
             data,
             sub: subresource(request),
             source: None,
-            express: crate::server::request_service(request).as_deref() == Some("s3express"),
+            express,
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
@@ -221,6 +227,8 @@ fn data_event(
     let name = match (key.is_some(), subresource(request)) {
         (false, None) => match *method {
             Method::HEAD => "HeadBucket",
+            // A directory bucket's only listing.
+            Method::GET if bucket.ends_with(crate::directory::SUFFIX) => "ListObjectsV2",
             Method::GET => "ListObjects",
             _ => return None,
         },
@@ -263,7 +271,11 @@ fn data_event(
 }
 
 /// The event name of a request on a bucket, if it is a management event.
-fn bucket_event(request: &hyper::Request<Incoming>, method: &Method) -> Option<&'static str> {
+fn bucket_event(
+    request: &hyper::Request<Incoming>,
+    method: &Method,
+    bucket: &str,
+) -> Option<&'static str> {
     let by_method =
         |get: &'static str, put: &'static str, delete: Option<&'static str>| match *method {
             Method::GET => Some(get),
@@ -299,6 +311,10 @@ fn bucket_event(request: &hyper::Request<Incoming>, method: &Method) -> Option<&
             Some("DeleteBucketInventoryConfiguration"),
         ),
         Some("location") if *method == Method::GET => Some("GetBucketLocation"),
+        // A management event of a directory bucket, as AWS lists it.
+        Some("uploads") if *method == Method::GET && bucket.ends_with(crate::directory::SUFFIX) => {
+            Some("ListMultipartUploads")
+        }
         Some("logging") => by_method("GetBucketLogging", "PutBucketLogging", None),
         Some("metrics") if *method == Method::GET && !has_param(request, "id") => {
             Some("ListBucketMetricsConfigurations")
@@ -470,46 +486,67 @@ fn record(
         // A name no bucket can have (a refused call's) made printable and
         // cut short.
         let bucket = truncated(&printable(bucket), 255).to_string();
-        let mut resources = vec![json!({
-            "accountId": owner.unwrap_or(account),
-            "type": "AWS::S3::Bucket",
-            "ARN": format!("arn:aws:s3:::{bucket}"),
-        })];
-        // A data event's object (its whole key: data events go to trails'
-        // files, not activity rows), or, for one on the bucket, the prefix
-        // of its objects; and a copy's source object.
-        match &call.key {
-            Some(key) => {
-                // At most S3's key length (a refused call's may be longer).
-                let key = truncated(key, MAX_KEY);
+        // A directory bucket's, as AWS records them: the bucket's S3 Express
+        // ARN, and its objects as a prefix of it.
+        if call.express {
+            let arn = crate::directory::arn(&state.region, owner.unwrap_or(account), &bucket);
+            let mut resources = vec![json!({
+                "accountId": owner.unwrap_or(account),
+                "type": "AWS::S3Express::DirectoryBucket",
+                "ARN": arn,
+            })];
+            if call.data {
                 resources.insert(
                     0,
-                    json!({ "type": "AWS::S3::Object", "ARN": format!("arn:aws:s3:::{bucket}/{key}") }),
+                    json!({ "type": "AWS::S3Express::Object", "ARNPrefix": format!("{arn}/") }),
                 );
-                if fit == Fit::Whole {
-                    record["requestParameters"]["key"] = json!(key);
-                }
             }
-            None if call.data => resources.insert(
-                0,
-                json!({ "type": "AWS::S3::Object", "ARNPrefix": format!("arn:aws:s3:::{bucket}/") }),
-            ),
-            None => {}
+            if let (Some(key), Fit::Whole) = (&call.key, fit) {
+                record["requestParameters"]["key"] = json!(truncated(key, MAX_KEY));
+            }
+            record["resources"] = json!(resources);
+        } else {
+            let mut resources = vec![json!({
+                "accountId": owner.unwrap_or(account),
+                "type": "AWS::S3::Bucket",
+                "ARN": format!("arn:aws:s3:::{bucket}"),
+            })];
+            // A data event's object (its whole key: data events go to trails'
+            // files, not activity rows), or, for one on the bucket, the prefix
+            // of its objects; and a copy's source object.
+            match &call.key {
+                Some(key) => {
+                    // At most S3's key length (a refused call's may be longer).
+                    let key = truncated(key, MAX_KEY);
+                    resources.insert(
+                        0,
+                        json!({ "type": "AWS::S3::Object", "ARN": format!("arn:aws:s3:::{bucket}/{key}") }),
+                    );
+                    if fit == Fit::Whole {
+                        record["requestParameters"]["key"] = json!(key);
+                    }
+                }
+                None if call.data => resources.insert(
+                    0,
+                    json!({ "type": "AWS::S3::Object", "ARNPrefix": format!("arn:aws:s3:::{bucket}/") }),
+                ),
+                None => {}
+            }
+            if let Some((source_bucket, source_key)) = &call.source {
+                resources.insert(
+                    1,
+                    json!({
+                        "type": "AWS::S3::Object",
+                        "ARN": format!(
+                            "arn:aws:s3:::{}/{}",
+                            truncated(&printable(source_bucket), 255),
+                            truncated(source_key, MAX_KEY)
+                        ),
+                    }),
+                );
+            }
+            record["resources"] = json!(resources);
         }
-        if let Some((source_bucket, source_key)) = &call.source {
-            resources.insert(
-                1,
-                json!({
-                    "type": "AWS::S3::Object",
-                    "ARN": format!(
-                        "arn:aws:s3:::{}/{}",
-                        truncated(&printable(source_bucket), 255),
-                        truncated(source_key, MAX_KEY)
-                    ),
-                }),
-            );
-        }
-        record["resources"] = json!(resources);
     }
     if let Some((code, message)) = error {
         record["errorCode"] = json!(code);

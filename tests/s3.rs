@@ -17782,7 +17782,7 @@ fn directory_buckets_are_made_listed_and_limited_as_s3_express_has_them() {
 }
 
 const DIRECTORY_BUCKETS_SCRIPT: &str = r#"
-import sys, json, time, urllib.request, urllib.error
+import sys, gzip, json, time, urllib.request, urllib.error
 import boto3, botocore.config, botocore.exceptions
 port, account, key, secret, reader_key, reader_secret = sys.argv[1:7]
 def client(access, secret_key, express):
@@ -17837,6 +17837,20 @@ headers = d.head_bucket(Bucket=B)["ResponseMetadata"]["HTTPHeaders"]
 assert (headers["x-amz-bucket-location-type"], headers["x-amz-bucket-location-name"],
     headers["x-amz-bucket-arn"], headers["x-amz-access-point-alias"]) == (
     "AvailabilityZone", "use1-az4", arn, "false"), headers
+# Trails: S3 Express's objects by an advanced selector of their type, and
+# not by a basic selector of S3's.
+trail = boto3.client("cloudtrail", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret)
+s3.create_bucket(Bucket="trail-logs")
+trail.create_trail(Name="express", S3BucketName="trail-logs", S3KeyPrefix="express")
+trail.put_event_selectors(TrailName="express", AdvancedEventSelectors=[{"Name": "x", "FieldSelectors": [
+    {"Field": "eventCategory", "Equals": ["Data"]},
+    {"Field": "resources.type", "Equals": ["AWS::S3Express::Object"]}]}])
+trail.create_trail(Name="basic", S3BucketName="trail-logs", S3KeyPrefix="basic")
+trail.put_event_selectors(TrailName="basic", EventSelectors=[{"ReadWriteType": "All",
+    "IncludeManagementEvents": False, "DataResources": [{"Type": "AWS::S3::Object", "Values": ["arn:aws:s3"]}]}])
+for name in ["express", "basic"]:
+    trail.start_logging(Name=name)
 # Objects: EXPRESS_ONEZONE, the only class; null, the only version.
 d.put_object(Bucket=B, Key="dir/a", Body=b"one")
 d.put_object(Bucket=B, Key="dir/sub/b", Body=b"two", StorageClass="EXPRESS_ONEZONE")
@@ -17928,10 +17942,8 @@ for k in ["dir/a", "dir/big"]:
     d.delete_object(Bucket=B, Key=k)
 d.delete_bucket(Bucket=B)
 assert [b["Name"] for b in d.list_directory_buckets()["Buckets"]] == ["more--use1-az4--x-s3"]
-# Recorded in CloudTrail, as S3 Express's (signed for it), whatever the
-# bucket: no signing service keeps a request out of the trail.
-trail = boto3.client("cloudtrail", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
-    aws_access_key_id=key, aws_secret_access_key=secret)
+# Recorded in CloudTrail as S3 Express's: no signing service keeps a
+# request out of the trail.
 deadline = time.time() + 30
 while True:
     events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateBucket"}])["Events"]
@@ -17945,5 +17957,30 @@ assert json.loads(made[0]["CloudTrailEvent"])["eventSource"] == "s3express.amazo
 assert made[0]["EventSource"] == "s3express.amazonaws.com", made
 general = [e for e in events if json.loads(e["CloudTrailEvent"])["requestParameters"].get("bucketName") == "general"]
 assert general and general[0]["EventSource"] == "s3.amazonaws.com", events
+made_record = json.loads(made[0]["CloudTrailEvent"])
+assert made_record["resources"] == [{"accountId": account, "type": "AWS::S3Express::DirectoryBucket",
+    "ARN": arn}], made_record
+uploads = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
+    "AttributeValue": "ListMultipartUploads"}])["Events"]
+assert uploads and uploads[0]["EventSource"] == "s3express.amazonaws.com", uploads
+def records(prefix):
+    out = []
+    for o in s3.list_objects_v2(Bucket="trail-logs", Prefix=prefix).get("Contents", []):
+        out += json.loads(gzip.decompress(s3.get_object(Bucket="trail-logs", Key=o["Key"])["Body"].read()))["Records"]
+    return out
+deadline = time.time() + 30
+while not any(r["eventName"] == "GetObject" for r in records("express")):
+    assert time.time() < deadline, records("express")
+    time.sleep(0.5)
+time.sleep(2.5)
+express = records("express")
+assert {r["eventSource"] for r in express} == {"s3express.amazonaws.com"}, express
+got = next(r for r in express if r["eventName"] == "GetObject")
+assert got["resources"] == [{"type": "AWS::S3Express::Object", "ARNPrefix": arn + "/"},
+    {"accountId": account, "type": "AWS::S3Express::DirectoryBucket", "ARN": arn}], got
+assert got["requestParameters"]["key"] == "dir/a", got
+assert "ListObjectsV2" in {r["eventName"] for r in express}, express
+basic = records("basic")
+assert basic and not [r for r in basic if r["requestParameters"].get("bucketName") == B], basic
 print("ok")
 "#;
