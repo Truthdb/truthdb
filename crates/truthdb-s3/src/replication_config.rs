@@ -183,6 +183,10 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
     if !id.is_ascii() {
         return Err(invalid("Rule ID must not contain non-ASCII characters"));
     }
+    // Kept in keys its parts are separated in by control characters.
+    if id.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(invalid("Rule ID must not contain control characters"));
+    }
     let enabled = status(element)?;
     // A rule without a Filter (the earlier schema, with an optional rule
     // Prefix) replicates delete markers.
@@ -280,6 +284,12 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
         ));
     }
     let destination = destination(element.one("Destination")?.ok_or_else(malformed)?)?;
+    // Its metrics are by its ID (CloudWatch's RuleId), which must be given.
+    if destination.measured() && id.is_empty() {
+        return Err(invalid(
+            "A rule with replication metrics or time control enabled needs an ID",
+        ));
+    }
     Ok(ReplicationRule {
         id,
         priority,
@@ -960,7 +970,7 @@ mod tests {
         // time control turns the metrics on.
         let monitored = |monitoring: &str| {
             config(&format!(
-                "<Rule><Status>Enabled</Status><Priority>1</Priority><Filter/>\
+                "<Rule><ID>m</ID><Status>Enabled</Status><Priority>1</Priority><Filter/>\
                  <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
                  <Destination><Bucket>arn:aws:s3:::copies</Bucket>{monitoring}</Destination>\
                  </Rule>"
@@ -997,6 +1007,23 @@ mod tests {
             );
             assert_eq!(parse(render(&parsed).as_bytes()), Ok(parsed));
         }
+        // A measured rule needs an ID (its metrics' RuleId); an ID has no
+        // control characters.
+        let measured = |id: &str| {
+            format!(
+                "<Rule>{id}<Status>Enabled</Status><Priority>1</Priority><Filter/>\
+                 <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+                 <Destination><Bucket>arn:aws:s3:::copies</Bucket><Metrics><Status>Enabled\
+                 </Status></Metrics></Destination></Rule>"
+            )
+        };
+        assert_eq!(code(&measured("")), invalid);
+        assert_eq!(code(&measured("<ID>a&#9;b</ID>")), invalid);
+        assert!(config(&measured("<ID>ab</ID>")).is_ok());
+        assert!(
+            config(&rule_with("<Filter/>")).is_ok(),
+            "an unmeasured rule needs none"
+        );
         // Delete-marker replication: read and rendered back for a rule by
         // prefix (or of every key); refused for one that filters by tags,
         // as S3 replicates no markers for those.

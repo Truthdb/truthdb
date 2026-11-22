@@ -36,8 +36,8 @@ use crate::codec::{Reader, Writer, corrupt};
 use crate::documents::BUCKET_REPLICATION;
 use crate::objects::{NewVersion, ObjectError, ObjectInfo, version_key};
 use crate::{
-    ObjFile, ObjTxn, ObjectAttrs, ObjectLock, REPLICATION_BACKLOG_TREE, REPLICATION_QUEUE_TREE,
-    REPLICATION_STATUS_TREE, StorageClass, Versioning, next_counter,
+    ObjFile, ObjTxn, ObjectAttrs, ObjectLock, REPLICATION_BACKLOG_TREE, REPLICATION_BY_RULE_TREE,
+    REPLICATION_QUEUE_TREE, REPLICATION_STATUS_TREE, StorageClass, Versioning, next_counter,
 };
 
 /// META key of the next queue entry's number.
@@ -759,6 +759,15 @@ impl ObjTxn<'_, '_> {
         self.count_backlog(&queued, true, false)
     }
 
+    /// The key of `queued` in its rule's queue: its rule's backlog key, 0,
+    /// and its number (so a rule's first is its oldest).
+    fn by_rule_key(queued: &QueuedReplication) -> Vec<u8> {
+        let mut key = backlog_key(&queued.bucket, &queued.destination, &queued.rule);
+        key.push(0);
+        key.extend_from_slice(&queued.number.to_be_bytes());
+        key
+    }
+
     /// Counts `queued` in its rule's backlog: one more (`added`) or one
     /// fewer, and, taken off as FAILED (`failed`), one more failure. An
     /// entry of an earlier build (no queue time) is in none.
@@ -770,6 +779,21 @@ impl ObjTxn<'_, '_> {
     ) -> Result<(), StorageError> {
         if queued.queued_ms == 0 {
             return Ok(());
+        }
+        let by_rule = self.trees.replication_by_rule();
+        let index_key = Self::by_rule_key(queued);
+        match added {
+            true => {
+                by_rule.insert_unique(
+                    self.ctx,
+                    &mut OpMode::Txn(self.txn),
+                    &index_key,
+                    &queued.queued_ms.to_be_bytes(),
+                )?;
+            }
+            false => {
+                by_rule.delete(self.ctx, &mut OpMode::Txn(self.txn), &index_key)?;
+            }
         }
         let tree = self.trees.replication_backlog();
         let row_key = backlog_key(&queued.bucket, &queued.destination, &queued.rule);
@@ -993,12 +1017,14 @@ impl ObjTxn<'_, '_> {
         queued: &QueuedReplication,
         status: Option<ReplicationStatus>,
     ) -> Result<(), StorageError> {
-        self.trees.replication_queue().delete(
+        let removed = self.trees.replication_queue().delete(
             self.ctx,
             &mut OpMode::Txn(self.txn),
             &queued.number.to_be_bytes(),
         )?;
-        self.count_backlog(queued, false, status == Some(ReplicationStatus::Failed))?;
+        if removed.is_some() {
+            self.count_backlog(queued, false, status == Some(ReplicationStatus::Failed))?;
+        }
         let Some(status) = status else {
             return Ok(());
         };
@@ -1016,12 +1042,14 @@ impl ObjTxn<'_, '_> {
     /// version's tally (a version no destination is left for has no
     /// status).
     pub fn drop_replication(&mut self, queued: &QueuedReplication) -> Result<(), StorageError> {
-        self.trees.replication_queue().delete(
+        let removed = self.trees.replication_queue().delete(
             self.ctx,
             &mut OpMode::Txn(self.txn),
             &queued.number.to_be_bytes(),
         )?;
-        self.count_backlog(queued, false, false)?;
+        if removed.is_some() {
+            self.count_backlog(queued, false, false)?;
+        }
         if queued.work != ReplicationWork::Create {
             return Ok(());
         }
@@ -1087,9 +1115,8 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
-    /// Every rule's backlog, by source bucket, destination and rule id: the
-    /// oldest queued of each is the first of its in the queue (the queue is
-    /// in the order things were queued), read only as far as needed.
+    /// Every rule's backlog, by source bucket, destination and rule id, with
+    /// the oldest it has queued (one read of its queue by rule).
     pub fn replication_backlog(&mut self) -> Result<Vec<ReplicationBacklog>, StorageError> {
         let Some(tree) = self.existing_tree(REPLICATION_BACKLOG_TREE)? else {
             return Ok(Vec::new());
@@ -1113,33 +1140,25 @@ impl ObjFile<'_> {
                 failed: counts.failed,
             });
         }
-        let mut left = backlog.iter().filter(|rule| rule.operations > 0).count();
-        let mut after = None;
-        while left > 0 {
-            let page = self.replication_queue(after, 1024)?;
-            let Some(last) = page.last() else {
-                break;
-            };
-            after = Some(last.number);
-            for queued in &page {
-                if queued.queued_ms == 0 {
-                    continue;
-                }
-                if let Some(rule) = backlog.iter_mut().find(|rule| {
-                    rule.oldest_ms.is_none()
-                        && rule.operations > 0
-                        && (
-                            rule.bucket.as_str(),
-                            rule.destination.as_str(),
-                            rule.rule.as_str(),
-                        ) == (
-                            queued.bucket.as_str(),
-                            queued.destination.as_str(),
-                            queued.rule.as_str(),
-                        )
-                }) {
-                    rule.oldest_ms = Some(queued.queued_ms);
-                    left -= 1;
+        // A rule's oldest: the first of its queue.
+        if let Some(by_rule) = self.existing_tree(REPLICATION_BY_RULE_TREE)? {
+            for rule in backlog.iter_mut().filter(|rule| rule.operations > 0) {
+                let mut lower = backlog_key(&rule.bucket, &rule.destination, &rule.rule);
+                lower.push(0);
+                let mut upper = lower.clone();
+                *upper.last_mut().expect("not empty") = 1;
+                let first = by_rule.scan_range_limit(
+                    &mut self.core.page_ctx(0),
+                    Some(&lower),
+                    Some(&upper),
+                    1,
+                )?;
+                if let Some((_, row)) = first.first() {
+                    let at: [u8; 8] = row
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| corrupt("replication by rule"))?;
+                    rule.oldest_ms = Some(u64::from_be_bytes(at));
                 }
             }
         }

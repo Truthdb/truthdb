@@ -89,21 +89,17 @@ struct RemoteJob {
     headers: Vec<(String, String)>,
 }
 
-/// Writes replicas until `shutdown` turns true; once a minute, the
-/// replication metrics of the rules that measure theirs.
+/// Writes replicas until `shutdown` turns true; beside it, once a minute,
+/// samples the replication metrics of the rules that measure theirs (on its
+/// own, so a long send holds no sample back).
 pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
+    let sampler = tokio::spawn(sample_metrics(Arc::clone(&state), shutdown.clone()));
+    let _sampler_ends = StopOnDrop(sampler.abort_handle());
     let mut stored_anew = false;
     let mut runner = Runner::default();
-    let mut metrics = Metrics::default();
     loop {
         if *shutdown.borrow() {
             return;
-        }
-        if !state.storage.is_standby() {
-            metrics
-                .sample(&state, now_ms())
-                .await
-                .unwrap_or_else(|err| eprintln!("replication metrics: {err}"));
         }
         if !stored_anew && !state.storage.is_standby() {
             stored_anew = store_xml_anew(&state)
@@ -122,6 +118,27 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
                 _ = tokio::time::sleep(IDLE) => {}
                 _ = shutdown.changed() => {}
             }
+        }
+    }
+}
+
+/// Samples the replication metrics until `shutdown` turns true (a standby
+/// samples none).
+async fn sample_metrics(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
+    let mut metrics = Metrics::default();
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if !state.storage.is_standby() {
+            metrics
+                .sample(&state, now_ms())
+                .await
+                .unwrap_or_else(|err| eprintln!("replication metrics: {err}"));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(IDLE) => {}
+            _ = shutdown.changed() => {}
         }
     }
 }
@@ -188,39 +205,46 @@ impl Metrics {
 /// The enabled rules that measure their replications, each with its
 /// backlog at `now`.
 fn measured(file: &mut ObjFile<'_>, now: u64) -> Result<Vec<Sample>, StorageError> {
-    let backlog = file.replication_backlog()?;
-    let mut samples = Vec::new();
+    let mut rules = Vec::new();
     for bucket in file.list_buckets()? {
         let Some(config) = file.replication(&bucket.name)? else {
             continue;
         };
-        for rule in &config.rules {
-            if !rule.enabled || !rule.destination.measured() {
-                continue;
+        for rule in config.rules {
+            if rule.enabled && rule.destination.measured() {
+                rules.push((bucket.clone(), rule));
             }
-            let destination = &rule.destination.bucket;
-            let found = backlog.iter().find(|queued| {
-                queued.bucket == bucket.name
-                    && &queued.destination == destination
-                    && queued.rule == rule.id
-            });
-            samples.push(Sample {
-                series: MetricSeries {
-                    bucket: bucket.name.clone(),
-                    by: SeriesBy::Replication {
-                        destination: destination.clone(),
-                        rule: rule.id.clone(),
-                    },
-                },
-                made_ms: bucket.created_ms,
-                operations: found.map_or(0, |found| found.operations),
-                bytes: found.map_or(0, |found| found.bytes),
-                latency: found
-                    .and_then(|found| found.oldest_ms)
-                    .map_or(0, |oldest| now.saturating_sub(oldest) / 1000),
-                failed: found.map_or(0, |found| found.failed),
-            });
         }
+    }
+    // The backlogs, read only when a rule measures its own.
+    if rules.is_empty() {
+        return Ok(Vec::new());
+    }
+    let backlog = file.replication_backlog()?;
+    let mut samples = Vec::new();
+    for (bucket, rule) in &rules {
+        let destination = &rule.destination.bucket;
+        let found = backlog.iter().find(|queued| {
+            queued.bucket == bucket.name
+                && &queued.destination == destination
+                && queued.rule == rule.id
+        });
+        samples.push(Sample {
+            series: MetricSeries {
+                bucket: bucket.name.clone(),
+                by: SeriesBy::Replication {
+                    destination: destination.clone(),
+                    rule: rule.id.clone(),
+                },
+            },
+            made_ms: bucket.created_ms,
+            operations: found.map_or(0, |found| found.operations),
+            bytes: found.map_or(0, |found| found.bytes),
+            latency: found
+                .and_then(|found| found.oldest_ms)
+                .map_or(0, |oldest| now.saturating_sub(oldest) / 1000),
+            failed: found.map_or(0, |found| found.failed),
+        });
     }
     Ok(samples)
 }
