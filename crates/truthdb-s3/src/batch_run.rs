@@ -1698,8 +1698,9 @@ async fn release(state: &S3State, body: u64) -> Result<(), String> {
 
 /// The checksum of `info`'s bytes (its body's `layout`), of `algorithm`:
 /// of the whole object, or (composite) of a multipart object's parts'
-/// checksums. AWS states none for a composite checksum of an object of one
-/// part: its whole one is given, as S3 keeps a PUT's.
+/// checksums (even of one part: `-1`). AWS states none for a composite
+/// checksum of an object not uploaded in parts: its whole one is given, as
+/// S3 keeps a PUT's.
 async fn compute_checksum(
     state: &S3State,
     info: &ObjectInfo,
