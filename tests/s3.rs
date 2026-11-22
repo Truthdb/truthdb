@@ -13384,7 +13384,9 @@ refused(lambda: s3.put_object_lock_configuration(Bucket="relocking",
 put("source", rule(Filter={"Tag": {"Key": "a", "Value": "b"}}))
 s3.delete_bucket_replication(Bucket="source")
 refused(lambda: put("source", rule(DeleteMarkerReplication={"Status": "Enabled"})), "NotImplemented")
-refused(lambda: put("source", rule(), dict(rule("locked-copies"), ID="two")), "NotImplemented")
+# Several destinations are accepted.
+put("source", rule(), dict(rule("locked-copies"), ID="two"))
+s3.delete_bucket_replication(Bucket="source")
 # Kept as given and read back.
 rules = [
     rule(ID="logs", Priority=2, Filter={"Prefix": "logs/"},
@@ -14021,6 +14023,69 @@ time.sleep(2)
 assert tags("dst", "docs/team", team) == {"team": "a", "seen": "3"}
 versions = lambda b: len(s3.list_object_versions(Bucket=b, Prefix="docs/team")["Versions"])
 assert versions("src") == 1 and versions("dst") == 1
+print("ok")
+"#;
+
+#[test]
+fn a_version_is_replicated_to_each_destination_and_completed_once_all_have_it() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "fanout");
+    let script = server.dir.join("several_destinations.py");
+    std::fs::write(&script, SEVERAL_DESTINATIONS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &account, &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const SEVERAL_DESTINATIONS_SCRIPT: &str = r#"
+import sys, time
+import boto3, botocore.config
+port, account, key, secret = sys.argv[1:5]
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+def status(k, v):
+    return s3.head_object(Bucket="src", Key=k, VersionId=v).get("ReplicationStatus")
+def wait(test, what):
+    deadline = time.time() + 30
+    while not test():
+        assert time.time() < deadline, what
+        time.sleep(0.1)
+for bucket in ["src", "east", "west"]:
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+def rule(destination, priority, **extra):
+    return dict({"ID": destination, "Priority": priority, "Status": "Enabled", "Filter": {},
+        "DeleteMarkerReplication": {"Status": "Disabled"},
+        "Destination": {"Bucket": f"arn:aws:s3:::{destination}"}}, **extra)
+s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={
+    "Role": f"arn:aws:iam::{account}:role/replication",
+    "Rules": [rule("east", 1), rule("west", 2)]})
+assert [r["Destination"]["Bucket"] for r in
+    s3.get_bucket_replication(Bucket="src")["ReplicationConfiguration"]["Rules"]] == [
+    "arn:aws:s3:::east", "arn:aws:s3:::west"]
+both = s3.put_object(Bucket="src", Key="both", Body=b"b")["VersionId"]
+wait(lambda: status("both", both) == "COMPLETED", "completed once both have it")
+for bucket in ["east", "west"]:
+    assert s3.head_object(Bucket=bucket, Key="both", VersionId=both)["ReplicationStatus"] == "REPLICA"
+# One destination cannot take it: FAILED, the other has it.
+s3.put_bucket_versioning(Bucket="west", VersioningConfiguration={"Status": "Suspended"})
+half = s3.put_object(Bucket="src", Key="half", Body=b"h")["VersionId"]
+wait(lambda: status("half", half) == "FAILED", "failed for one")
+assert s3.head_object(Bucket="east", Key="half", VersionId=half)["ReplicationStatus"] == "REPLICA"
 print("ok")
 "#;
 
