@@ -14509,6 +14509,196 @@ print("ok")
 "#;
 
 #[test]
+fn changed_or_stopped_rules_drop_their_queued_work_and_keep_what_was_made() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "changing");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    let versioning = |bucket: &str, status: &str| {
+        let body =
+            format!("<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>");
+        assert_eq!(
+            call("PUT", bucket, "versioning", &[], body.as_bytes()).1.0,
+            200
+        );
+    };
+    for bucket in ["/src", "/dst", "/broken"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+        versioning(bucket, "Enabled");
+    }
+    // A bucket on a service that is down: what is queued for it waits.
+    let made = native(
+        server.native_port,
+        &format!("s3 create remote bucket stuck-far {account} http://127.0.0.1:1 us-east-1 k s"),
+    );
+    assert_eq!(made["remote_bucket"], "stuck-far", "{made}");
+    let rule = |id: &str, destination: &str, priority: u32, status: &str| {
+        format!(
+            "<Rule><ID>{id}</ID><Priority>{priority}</Priority><Status>{status}</Status><Filter/>\
+             <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+             <Destination><Bucket>arn:aws:s3:::{destination}</Bucket></Destination></Rule>"
+        )
+    };
+    let put_config = |rules: &str| {
+        let body = format!(
+            "<ReplicationConfiguration><Role>arn:aws:iam::{account}:role/r</Role>{rules}\
+             </ReplicationConfiguration>"
+        );
+        let md5 = content_md5(body.as_bytes());
+        let (_, (status, answer)) = call(
+            "PUT",
+            "/src",
+            "replication",
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+        );
+        assert_eq!(status, 200, "{answer}");
+    };
+    let put = |path: &str| {
+        let (head, (status, _)) = call("PUT", path, "", &[], b"body");
+        assert_eq!(status, 200);
+        response_header(&head, "x-amz-version-id").unwrap()
+    };
+    let status = |bucket: &str, key: &str, version: &str| {
+        let (head, (code, _)) = call(
+            "HEAD",
+            &format!("/{bucket}/{key}"),
+            &format!("versionId={version}"),
+            &[],
+            b"",
+        );
+        assert_eq!(code, 200, "{bucket}/{key}");
+        response_header(&head, "x-amz-replication-status")
+    };
+    // A replica's status there, once it is there.
+    let replica = |key: &str, version: &str| {
+        let (head, (code, _)) = call(
+            "HEAD",
+            &format!("/dst/{key}"),
+            &format!("versionId={version}"),
+            &[],
+            b"",
+        );
+        (code == 200)
+            .then(|| response_header(&head, "x-amz-replication-status"))
+            .flatten()
+    };
+    let wait_status = |key: &str, version: &str, want: Option<&str>| {
+        let deadline = Instant::now() + DEADLINE;
+        while status("src", key, version).as_deref() != want {
+            assert!(
+                Instant::now() < deadline,
+                "{key} never {want:?}: {:?}",
+                status("src", key, version)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let pending_far = || {
+        sql_rows(
+            server.native_port,
+            "SELECT pending_operations FROM sys.dm_s3_replication \
+             WHERE destination_bucket = 'stuck-far'",
+        )
+    };
+    // To here and to the stuck bucket: PENDING while the stuck one waits.
+    put_config(&format!(
+        "{}{}",
+        rule("here", "dst", 1, "Enabled"),
+        rule("there", "stuck-far", 2, "Enabled")
+    ));
+    let a = put("/src/a");
+    let deadline = Instant::now() + DEADLINE;
+    while replica("a", &a).is_none_or(|got| got != "REPLICA") {
+        assert!(Instant::now() < deadline, "a never reached dst");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(status("src", "a", &a).as_deref(), Some("PENDING"));
+    assert_eq!(pending_far(), [vec!["1".to_string()]]);
+    // Its rule set to Disabled mid-queue: its work goes, and the version is
+    // COMPLETED by what was made.
+    put_config(&format!(
+        "{}{}",
+        rule("here", "dst", 1, "Enabled"),
+        rule("there", "stuck-far", 2, "Disabled")
+    ));
+    wait_status("a", &a, Some("COMPLETED"));
+    assert!(pending_far().is_empty(), "{:?}", pending_far());
+    // Replaced by a configuration without it: the same.
+    put_config(&format!(
+        "{}{}",
+        rule("here", "dst", 1, "Enabled"),
+        rule("there", "stuck-far", 2, "Enabled")
+    ));
+    let b = put("/src/b");
+    while pending_far().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    put_config(&rule("here", "dst", 1, "Enabled"));
+    wait_status("b", &b, Some("COMPLETED"));
+    assert!(pending_far().is_empty());
+    // A FAILED version stays FAILED.
+    put_config(&format!(
+        "{}{}",
+        rule("here", "dst", 1, "Enabled"),
+        rule("bad", "broken", 2, "Enabled")
+    ));
+    versioning("/broken", "Suspended");
+    let c = put("/src/c");
+    wait_status("c", &c, Some("FAILED"));
+    // Deleted mid-queue: the stuck bucket's work goes, a version with no
+    // destination left has no status; what was made stays, as do the
+    // statuses recorded.
+    versioning("/broken", "Enabled");
+    put_config(&format!(
+        "{}{}",
+        rule("here", "dst", 1, "Enabled"),
+        rule("there", "stuck-far", 2, "Enabled")
+    ));
+    let d = put("/src/d");
+    wait_status("d", &d, Some("PENDING"));
+    let deadline = Instant::now() + DEADLINE;
+    while replica("d", &d).is_none_or(|got| got != "REPLICA") {
+        assert!(Instant::now() < deadline, "d never reached dst");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(call("DELETE", "/src", "replication", &[], b"").1.0, 204);
+    wait_status("d", &d, Some("COMPLETED"));
+    assert!(pending_far().is_empty());
+    for (name, version, want) in [
+        ("a", &a, "COMPLETED"),
+        ("b", &b, "COMPLETED"),
+        ("c", &c, "FAILED"),
+    ] {
+        assert_eq!(
+            status("src", name, version).as_deref(),
+            Some(want),
+            "{name}"
+        );
+    }
+    for (name, version) in [("a", &a), ("b", &b), ("c", &c), ("d", &d)] {
+        assert_eq!(
+            status("dst", name, version).as_deref(),
+            Some("REPLICA"),
+            "{name}: the replica stays"
+        );
+    }
+    let e = put("/src/e");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(status("src", "e", &e), None, "nothing replicates any more");
+}
+
+#[test]
 fn replication_events_are_sent_for_the_rules_that_measure_them() {
     let server = start_server();
     let (account, key, secret) = account_with_key(&server, "eventful");
