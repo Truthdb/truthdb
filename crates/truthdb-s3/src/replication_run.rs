@@ -627,10 +627,13 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
     }
 }
 
+/// How a reason another service gave starts.
+const REMOTE_REFUSED: &str = "the remote service answered: ";
+
 /// A service's error, as a reason a replica was not sent.
 fn service(err: truthdb_s3client::Error) -> Fail {
     match err.permanent() {
-        true => Fail::Lasting(err.to_string()),
+        true => Fail::Lasting(format!("{REMOTE_REFUSED}{err}")),
         false => Fail::Passing(err.to_string()),
     }
 }
@@ -815,7 +818,10 @@ fn refused(
 /// The `failureReason` S3 names in a replication event for why a
 /// replication failed here (its log message).
 fn failure_reason(why: &str) -> &'static str {
-    if why.contains("does not exist") {
+    // Another service's refusal: its own words are not read.
+    if why.starts_with(REMOTE_REFUSED) {
+        "DstPutObjectNotPermitted"
+    } else if why.contains("does not exist") {
         "DstBucketNotFound"
     } else if why.contains("versioning") {
         "DstBucketUnversioned"
@@ -1610,6 +1616,17 @@ mod tests {
             ),
         ] {
             assert_eq!(failure_reason(why), reason, "{why}");
+        }
+        // Another service's words are not read for a reason.
+        for why in [
+            "versioning is not enabled",
+            "the bucket does not exist",
+            "tried",
+        ] {
+            assert_eq!(
+                failure_reason(&format!("{REMOTE_REFUSED}{why}")),
+                "DstPutObjectNotPermitted"
+            );
         }
     }
 

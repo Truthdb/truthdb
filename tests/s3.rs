@@ -14654,6 +14654,13 @@ fn replication_events_are_sent_for_the_rules_that_measure_them() {
             .unwrap_or_else(|| panic!("no {name} in {events:?}"))
     };
     let failed = named("Replication:OperationFailedReplication");
+    // S3's own events, made by no request.
+    for event in &events {
+        assert_eq!(
+            event["userIdentity"]["principalId"], "s3.amazonaws.com",
+            "{event}"
+        );
+    }
     assert_eq!(failed["s3"]["object"]["key"], "doc");
     assert_eq!(failed["s3"]["object"]["versionId"], version.as_str());
     let data = &failed["replicationEventData"];

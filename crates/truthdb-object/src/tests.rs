@@ -7200,9 +7200,18 @@ fn replication_events_are_journalled_for_the_rules_that_measure_them() {
             .filter(|q| q.key == key)
             .collect::<Vec<_>>()
     };
+    // Made in a transaction for some request: the events are S3's own all
+    // the same (no request is theirs).
     let finish = |q: &crate::QueuedReplication, how, why: Option<&str>, at| {
-        ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.finish_replication(q, Some(how), why, at))
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        file.set_origin(crate::Origin {
+            operation: "Replicate".into(),
+            request_id: "replication-1".into(),
+            account: Some("111122223333".into()),
+            ..crate::Origin::default()
+        });
+        file.transaction(|tx| tx.finish_replication(q, Some(how), why, at))
             .unwrap()
     };
     put_at(&storage, "src", "a", 10, StorageClass::Standard, T0);
@@ -7285,6 +7294,15 @@ fn replication_events_are_journalled_for_the_rules_that_measure_them() {
     assert_eq!(told.len(), 5, "{told:?}");
     assert_eq!(told[4].0, "s3:Replication:OperationNotTracked");
     assert_eq!(told[4].1["replicationRuleId"], "to-measured");
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .journal(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.notice.is_some())
+            .all(|record| record.origin.unwrap_or_default() == crate::Origin::default()),
+        "no notice has a request"
+    );
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

@@ -873,14 +873,18 @@ impl ObjTxn<'_, '_> {
             data["failureReason"] = serde_json::json!(reason);
         }
         let detail = serde_json::json!({ "replicationEventData": data }).to_string();
-        self.note_event(
+        // S3's own event, whatever request this transaction was made for.
+        let origin = self.origin.take();
+        let noted = self.note_event(
             &queued.bucket,
             &queued.key,
             queued.version,
             event,
             Some(detail),
             now_ms,
-        )
+        );
+        self.origin = origin;
+        noted
     }
 
     /// Journals `s3:Replication:OperationMissedThreshold` for each new
@@ -909,9 +913,12 @@ impl ObjTxn<'_, '_> {
             for (index_key, index_row) in
                 by_rule.scan_range_limit(self.ctx, Some(&lower), Some(&upper), limit)?
             {
-                let (at, timed) = index_row.split_at(8);
-                let queued_ms =
-                    u64::from_be_bytes(at.try_into().map_err(|_| corrupt("replication by rule"))?);
+                let queued_ms = index_row
+                    .get(..8)
+                    .and_then(|at| at.try_into().ok())
+                    .map(u64::from_be_bytes)
+                    .ok_or_else(|| corrupt("replication by rule"))?;
+                let timed = &index_row[8..];
                 // Past it once it waited longer.
                 if now_ms.saturating_sub(queued_ms) <= REPLICATION_THRESHOLD_MS {
                     break;
