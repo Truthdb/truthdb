@@ -12073,14 +12073,16 @@ fn every_read_sees_the_writes_acknowledged_before_it() {
     );
 
     // Overwritten while being read: each read is the old object or the new
-    // one, whole.
-    let size = 256 * 1024;
+    // one, whole. The object spans several segments, so a read takes
+    // several lock holds (its body leased meanwhile).
+    let size = 3 * 1024 * 1024 + 17;
     let (a, b) = (vec![b'a'; size], vec![b'b'; size]);
     assert_eq!(call(port, "PUT", "/seen/swap", "", &[], &a).1.0, 200);
     let writer = {
         let (key, secret, a, b) = (key.clone(), secret.clone(), a.clone(), b.clone());
         std::thread::spawn(move || {
-            for n in 0..30 {
+            // b, a, b, ...: 31 writes, the last of b's.
+            for n in 0..31 {
                 let body = if n % 2 == 0 { &b } else { &a };
                 let (_, (status, _)) = send_with(
                     port,
@@ -12096,23 +12098,29 @@ fn every_read_sees_the_writes_acknowledged_before_it() {
             }
         })
     };
-    let mut reads = 0;
-    while !writer.is_finished() || reads < 10 {
+    let (mut overlapped, mut seen) = (0, std::collections::HashSet::new());
+    while !writer.is_finished() {
         let (_, (status, body)) = call(port, "GET", "/seen/swap", "", &[], b"");
         assert_eq!(status, 200);
+        let first = body.as_bytes().first().copied();
         assert!(
-            body.len() == size
-                && (body.bytes().all(|byte| byte == b'a') || body.bytes().all(|byte| byte == b'b')),
+            body.len() == size && body.bytes().all(|byte| Some(byte) == first),
             "a read saw a mixed or partial object ({} bytes)",
             body.len()
         );
-        reads += 1;
+        seen.insert(first);
+        overlapped += 1;
     }
     writer.join().unwrap();
-    // The last write acknowledged (30 writes, the last of a's) is the one read.
+    assert!(overlapped > 0, "no read overlapped the writes");
+    assert!(
+        seen.contains(&Some(b'b')),
+        "no read saw an overwrite: {seen:?} in {overlapped} reads"
+    );
+    // The last write acknowledged is the one read after.
     assert_eq!(
         call(port, "GET", "/seen/swap", "", &[], b"").1.1.as_bytes(),
-        a.as_slice()
+        b.as_slice()
     );
 
     // What was acknowledged outlives a kill -9.
