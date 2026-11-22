@@ -11942,6 +11942,197 @@ print("ok")
 }
 
 #[test]
+fn every_read_sees_the_writes_acknowledged_before_it() {
+    let (mut server, key, secret) = server_with_key();
+    // Every call on a connection of its own.
+    let call =
+        |port: u16, method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+            send_with(port, method, path, query, extra, body, &key, Some(&secret))
+        };
+    let port = server.s3_port;
+    assert_eq!(call(port, "PUT", "/seen", "", &[], b"").1.0, 200);
+    let listed = |port: u16, prefix: &str| {
+        call(
+            port,
+            "GET",
+            "/seen",
+            &format!("list-type=2&prefix={prefix}"),
+            &[],
+            b"",
+        )
+        .1
+        .1
+    };
+    // A write, then at once a read of it, a HEAD and a listing.
+    for n in 0..50 {
+        let (path, body) = (format!("/seen/new{n:02}"), format!("value {n}"));
+        assert_eq!(call(port, "PUT", &path, "", &[], body.as_bytes()).1.0, 200);
+        assert_eq!(
+            call(port, "GET", &path, "", &[], b"").1,
+            (200, body.clone())
+        );
+        assert_eq!(call(port, "HEAD", &path, "", &[], b"").1.0, 200);
+        assert!(listed(port, &format!("new{n:02}")).contains(&format!("<Key>new{n:02}</Key>")));
+        // Overwritten: the new data; deleted: gone, and not listed.
+        let newer = format!("newer {n}");
+        assert_eq!(call(port, "PUT", &path, "", &[], newer.as_bytes()).1.0, 200);
+        assert_eq!(call(port, "GET", &path, "", &[], b"").1, (200, newer));
+        assert_eq!(call(port, "DELETE", &path, "", &[], b"").1.0, 204);
+        assert_eq!(call(port, "GET", &path, "", &[], b"").1.0, 404);
+        assert!(!listed(port, &format!("new{n:02}")).contains("<Key>"));
+    }
+    // Tags and metadata are read as written.
+    assert_eq!(
+        call(
+            port,
+            "PUT",
+            "/seen/meta",
+            "",
+            &[("x-amz-meta-note", "one")],
+            b"m"
+        )
+        .1
+        .0,
+        200
+    );
+    let tagging = b"<Tagging><TagSet><Tag><Key>t</Key><Value>1</Value></Tag></TagSet></Tagging>";
+    assert_eq!(
+        call(port, "PUT", "/seen/meta", "tagging", &[], tagging).1.0,
+        200
+    );
+    assert!(
+        call(port, "GET", "/seen/meta", "tagging", &[], b"")
+            .1
+            .1
+            .contains("<Value>1</Value>")
+    );
+    let replaced = [
+        ("x-amz-copy-source", "/seen/meta"),
+        ("x-amz-metadata-directive", "REPLACE"),
+        ("x-amz-meta-note", "two"),
+    ];
+    assert_eq!(call(port, "PUT", "/seen/meta", "", &replaced, b"").1.0, 200);
+    let (head, _) = call(port, "HEAD", "/seen/meta", "", &[], b"");
+    assert_eq!(
+        response_header(&head, "x-amz-meta-note").as_deref(),
+        Some("two")
+    );
+    // A multipart upload, once complete.
+    let (_, (_, created)) = call(port, "POST", "/seen/parts", "uploads", &[], b"");
+    let upload = xml_value(&created, "UploadId");
+    let (part_head, _) = call(
+        port,
+        "PUT",
+        "/seen/parts",
+        &format!("partNumber=1&uploadId={upload}"),
+        &[],
+        b"whole",
+    );
+    let etag = response_header(&part_head, "etag").unwrap();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    );
+    assert_eq!(
+        call(
+            port,
+            "POST",
+            "/seen/parts",
+            &format!("uploadId={upload}"),
+            &[],
+            complete.as_bytes()
+        )
+        .1
+        .0,
+        200
+    );
+    assert_eq!(
+        call(port, "GET", "/seen/parts", "", &[], b"").1,
+        (200, "whole".to_string())
+    );
+    assert!(listed(port, "parts").contains("<Key>parts</Key>"));
+    // A bucket's configuration too (S3's is eventually consistent): a
+    // write right after versioning is enabled has a version; a bucket
+    // deleted is not listed.
+    let versioning = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(
+        call(port, "PUT", "/seen", "versioning", &[], versioning)
+            .1
+            .0,
+        200
+    );
+    let (head, _) = call(port, "PUT", "/seen/versioned", "", &[], b"v");
+    assert!(response_header(&head, "x-amz-version-id").is_some_and(|id| id != "null"));
+    assert_eq!(call(port, "PUT", "/fleeting", "", &[], b"").1.0, 200);
+    assert_eq!(call(port, "DELETE", "/fleeting", "", &[], b"").1.0, 204);
+    assert!(
+        !call(port, "GET", "/", "", &[], b"")
+            .1
+            .1
+            .contains("<Name>fleeting</Name>")
+    );
+
+    // Overwritten while being read: each read is the old object or the new
+    // one, whole.
+    let size = 256 * 1024;
+    let (a, b) = (vec![b'a'; size], vec![b'b'; size]);
+    assert_eq!(call(port, "PUT", "/seen/swap", "", &[], &a).1.0, 200);
+    let writer = {
+        let (key, secret, a, b) = (key.clone(), secret.clone(), a.clone(), b.clone());
+        std::thread::spawn(move || {
+            for n in 0..30 {
+                let body = if n % 2 == 0 { &b } else { &a };
+                let (_, (status, _)) = send_with(
+                    port,
+                    "PUT",
+                    "/seen/swap",
+                    "",
+                    &[],
+                    body,
+                    &key,
+                    Some(&secret),
+                );
+                assert_eq!(status, 200);
+            }
+        })
+    };
+    let mut reads = 0;
+    while !writer.is_finished() || reads < 10 {
+        let (_, (status, body)) = call(port, "GET", "/seen/swap", "", &[], b"");
+        assert_eq!(status, 200);
+        assert!(
+            body.len() == size
+                && (body.bytes().all(|byte| byte == b'a') || body.bytes().all(|byte| byte == b'b')),
+            "a read saw a mixed or partial object ({} bytes)",
+            body.len()
+        );
+        reads += 1;
+    }
+    writer.join().unwrap();
+    // The last write acknowledged (30 writes, the last of a's) is the one read.
+    assert_eq!(
+        call(port, "GET", "/seen/swap", "", &[], b"").1.1.as_bytes(),
+        a.as_slice()
+    );
+
+    // What was acknowledged outlives a kill -9.
+    for n in 0..20 {
+        let path = format!("/seen/durable{n:02}");
+        assert_eq!(call(port, "PUT", &path, "", &[], path.as_bytes()).1.0, 200);
+    }
+    crash_and_restart(&mut server);
+    let port = server.s3_port;
+    for n in 0..20 {
+        let path = format!("/seen/durable{n:02}");
+        assert_eq!(
+            call(port, "GET", &path, "", &[], b"").1,
+            (200, path.clone())
+        );
+    }
+    assert_eq!(listed(port, "durable").matches("<Key>").count(), 20);
+}
+
+#[test]
 fn writes_and_deletes_hold_to_their_conditions() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
