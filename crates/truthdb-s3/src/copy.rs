@@ -366,6 +366,15 @@ async fn copy_whole(
             if let (Ok(copied), Some(lock)) = (&copied, &shared_lock) {
                 tx.set_lock(&dst_bucket, &dst_key, copied.version, lock)?;
             }
+            // A copy sharing a multipart source's parts has their checksums.
+            if let Ok(copied) = &copied
+                && source.parts > 0
+            {
+                tx.copy_part_checksums(
+                    (&src_bucket, &src_key, source.version),
+                    (&dst_bucket, &dst_key, copied.version),
+                )?;
+            }
             Ok(Ok(copied))
         })?;
         let copied = match copied {

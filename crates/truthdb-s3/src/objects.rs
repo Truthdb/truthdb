@@ -1064,10 +1064,17 @@ pub(crate) async fn read_object(
                 }
                 _ => None,
             };
-            // The part asked for, as plaintext bytes.
+            // The part asked for, as plaintext bytes, and its checksum (a
+            // multipart version's).
             let span = match (&found, part) {
                 (Ok(info), Some(number)) if !info.delete_marker => part_span(file, info, number)?,
                 _ => Ok(None),
+            };
+            let part_checksum = match (&found, part) {
+                (Ok(info), Some(number)) if !info.delete_marker && info.parts > 0 => {
+                    file.part_checksum(&lookup_bucket, &lookup_key, info.version, number as u16)?
+                }
+                _ => None,
             };
             // An archived version not restored is not read, nor a part that is
             // not there: no lease.
@@ -1086,7 +1093,7 @@ pub(crate) async fn read_object(
                 restore,
                 expiration,
                 replication,
-                span,
+                (span, part_checksum),
             ))
         })
         .await?;
@@ -1125,6 +1132,7 @@ pub(crate) async fn read_object(
         return Err(crate::restore::invalid_object_state());
     }
     // No lease was taken for a part that is not there.
+    let (span, part_checksum) = span;
     let span = span.map_err(|()| {
         S3Error::new(
             400,
@@ -1220,14 +1228,22 @@ pub(crate) async fn read_object(
         lock_visible.legal_hold,
     )
     .header("content-length", len.to_string());
-    // Its checksum, when asked for, on a read of the whole object (a range
-    // or a part is not what it was computed over).
-    if range.is_none()
-        && span.is_none()
-        && header(headers, "x-amz-checksum-mode").is_some_and(|mode| mode == "ENABLED")
-        && let Some(checksum) = &info.attrs.checksum
-    {
-        builder = with_checksum(builder, checksum);
+    // Its checksum, when asked for, on a read of the whole object; or a
+    // part's, on a read of that part (a range is neither).
+    if header(headers, "x-amz-checksum-mode").is_some_and(|mode| mode == "ENABLED") {
+        if range.is_none()
+            && span.is_none()
+            && let Some(checksum) = &info.attrs.checksum
+        {
+            builder = with_checksum(builder, checksum);
+        } else if span.is_some()
+            && let Some(checksum) = &part_checksum
+        {
+            builder = builder.header(
+                format!("x-amz-checksum-{}", checksum.algorithm.to_ascii_lowercase()),
+                &checksum.value,
+            );
+        }
     }
     if let Some((first, last)) = range {
         builder = builder.header(

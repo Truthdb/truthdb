@@ -12024,6 +12024,13 @@ assert (done["ChecksumCRC32"], done["ChecksumType"]) == (crc32, "FULL_OBJECT"), 
 head = s3.head_object(Bucket="mpsums", Key="crc", ChecksumMode="ENABLED")
 assert (head["ChecksumCRC32"], head["ChecksumType"]) == (crc32, "FULL_OBJECT"), head
 assert s3.get_object(Bucket="mpsums", Key="crc", ChecksumMode="ENABLED")["Body"].read() == whole
+# A part, read by its number, has its own checksum (with the mode asked).
+part_one = s3.get_object(Bucket="mpsums", Key="crc", PartNumber=1, ChecksumMode="ENABLED")
+assert part_one["ChecksumCRC32"] == b64(zlib.crc32(first).to_bytes(4, "big")), part_one
+assert part_one["Body"].read() == first
+part_two = s3.head_object(Bucket="mpsums", Key="crc", PartNumber=2, ChecksumMode="ENABLED")
+assert part_two["ChecksumCRC32"] == b64(zlib.crc32(last).to_bytes(4, "big")), part_two
+assert "ChecksumCRC32" not in s3.head_object(Bucket="mpsums", Key="crc", PartNumber=2)
 # COMPOSITE SHA256: the SHA-256 of the parts' SHA-256s, with their count.
 made, listed = upload(s3, "sha", [first, last], ChecksumAlgorithm="SHA256")
 assert made["ChecksumType"] == "COMPOSITE", made
@@ -12032,6 +12039,13 @@ done = s3.complete_multipart_upload(Bucket="mpsums", Key="sha", UploadId=made["U
 composite = b64(hashlib.sha256(hashlib.sha256(first).digest() + hashlib.sha256(last).digest()).digest()) + "-2"
 assert (done["ChecksumSHA256"], done["ChecksumType"]) == (composite, "COMPOSITE"), done
 assert s3.head_object(Bucket="mpsums", Key="sha", ChecksumMode="ENABLED")["ChecksumSHA256"] == composite
+assert s3.head_object(Bucket="mpsums", Key="sha", PartNumber=2,
+    ChecksumMode="ENABLED")["ChecksumSHA256"] == b64(hashlib.sha256(last).digest())
+# A copy sharing a multipart object's parts (its checksum is whole) keeps
+# their checksums too.
+s3.copy_object(Bucket="mpsums", Key="crc-copy", CopySource={"Bucket": "mpsums", "Key": "crc"})
+assert s3.head_object(Bucket="mpsums", Key="crc-copy", PartNumber=1,
+    ChecksumMode="ENABLED")["ChecksumCRC32"] == b64(zlib.crc32(first).to_bytes(4, "big"))
 # None asked for: the parts' CRC64NVME make the object's, of the whole.
 made, listed = upload(bare, "plain", [first, last])
 done = bare.complete_multipart_upload(Bucket="mpsums", Key="plain", UploadId=made["UploadId"],

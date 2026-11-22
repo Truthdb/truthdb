@@ -1036,6 +1036,104 @@ fn a_deleted_object_is_gone_and_its_body_collected() {
 }
 
 #[test]
+fn a_multipart_versions_part_checksums_are_kept_by_place_copied_and_removed_with_it() {
+    use crate::{MIN_PART_BYTES, ObjectAttrs, StoredChecksum, VersionSel, Versioning};
+    let path = temp_path("part-checksums");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["bkt", "other"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, now())?.unwrap();
+                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+    let upload = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_upload(
+                "bkt",
+                "k",
+                &ObjectAttrs::default(),
+                crate::StorageClass::Standard,
+                now(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let sum = |value: &str| StoredChecksum {
+        algorithm: "CRC32".to_string(),
+        full_object: true,
+        value: value.to_string(),
+    };
+    let send_part = |number: u32, data: &[u8], checksum: Option<StoredChecksum>| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, data, now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        let sent = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.upload_part(upload, number, &sealed, checksum, now(), 0))
+            .unwrap()
+            .unwrap();
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        sent.md5
+    };
+    // Parts 2 and 5 of the upload are the object's first and second.
+    let big = MIN_PART_BYTES as usize;
+    let first = send_part(2, &bytes(1, big), Some(sum("AAAAAQ==")));
+    let second = send_part(5, &bytes(2, 10), Some(sum("AAAAAg==")));
+    let info = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.complete_upload(upload, &[(2, first), (5, second)], None, now(), 0))
+        .unwrap()
+        .unwrap();
+    let part = |bucket: &str, version: u64, place: u16| {
+        ObjFile::new(&mut storage.lock())
+            .part_checksum(bucket, "k", version, place)
+            .unwrap()
+    };
+    assert_eq!(part("bkt", info.version, 1), Some(sum("AAAAAQ==")));
+    assert_eq!(part("bkt", info.version, 2), Some(sum("AAAAAg==")));
+    assert_eq!(part("bkt", info.version, 3), None);
+    // A copy (or replica) sharing its parts gets their checksums.
+    let copied = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let source = info.clone();
+            let copied = tx
+                .copy_object(
+                    "other",
+                    "k",
+                    &source,
+                    &source.attrs,
+                    source.storage_class,
+                    now(),
+                    0,
+                )?
+                .unwrap();
+            tx.copy_part_checksums(("bkt", "k", info.version), ("other", "k", copied.version))?;
+            Ok(copied)
+        })
+        .unwrap();
+    assert_eq!(part("other", copied.version, 2), Some(sum("AAAAAg==")));
+    // Removed with its version; the copy's stay.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.delete_object(
+                "bkt",
+                "k",
+                Some(VersionSel::Seq(info.version)),
+                false,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(part("bkt", info.version, 1), None);
+    assert_eq!(part("other", copied.version, 1), Some(sum("AAAAAQ==")));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
     use crate::{MIN_PART_BYTES, ObjectAttrs, UploadError, VersionSel};
     let path = temp_path("multipart");

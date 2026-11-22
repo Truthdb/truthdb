@@ -2023,6 +2023,14 @@ fn run_one(
                     if let Some(lock) = &lock {
                         tx.set_lock(&to, &target, copied.version, lock)?;
                     }
+                    // It shares a multipart source's parts, and their
+                    // checksums.
+                    if source.parts > 0 {
+                        tx.copy_part_checksums(
+                            (&bucket, &key, source.version),
+                            (&to, &target, copied.version),
+                        )?;
+                    }
                     Ok(())
                 }
                 Err(err) => Err(object_error(err, &to, &target)),
