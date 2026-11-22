@@ -12045,6 +12045,24 @@ assert listed[0].get("ChecksumCRC32"), listed
 done = s3.complete_multipart_upload(Bucket="mpsums", Key="sdkparts", UploadId=made["UploadId"],
     MultipartUpload={"Parts": listed})
 assert not any(name.startswith("ChecksumCRC64") for name in done), done
+# A part copied with UploadPartCopy keeps no checksum yet: the object gets
+# none, and a whole-object checksum sent with the completion is not held
+# against it; a type S3 does not name is refused.
+made = s3.create_multipart_upload(Bucket="mpsums", Key="copied", ChecksumAlgorithm="CRC32",
+    ChecksumType="FULL_OBJECT")
+s3.put_object(Bucket="mpsums", Key="source", Body=first)
+copied = s3.upload_part_copy(Bucket="mpsums", Key="copied", UploadId=made["UploadId"], PartNumber=1,
+    CopySource={"Bucket": "mpsums", "Key": "source"})["CopyPartResult"]
+tail = s3.upload_part(Bucket="mpsums", Key="copied", UploadId=made["UploadId"], PartNumber=2,
+    Body=last, ChecksumAlgorithm="CRC32")
+assert "ChecksumType" not in tail, tail
+parts = {"Parts": [{"PartNumber": 1, "ETag": copied["ETag"]},
+    {"PartNumber": 2, "ETag": tail["ETag"], "ChecksumCRC32": tail["ChecksumCRC32"]}]}
+refused(lambda: s3.complete_multipart_upload(Bucket="mpsums", Key="copied", UploadId=made["UploadId"],
+    MultipartUpload=parts, ChecksumType="PARTLY"), "InvalidRequest")
+done = s3.complete_multipart_upload(Bucket="mpsums", Key="copied", UploadId=made["UploadId"],
+    MultipartUpload=parts, ChecksumCRC32=crc32, ChecksumType="FULL_OBJECT")
+assert "ChecksumCRC32" not in done, done
 # Refused: a full-object SHA256; a part of another algorithm than its upload's.
 refused(lambda: s3.create_multipart_upload(Bucket="mpsums", Key="x", ChecksumAlgorithm="SHA256",
     ChecksumType="FULL_OBJECT"), "InvalidRequest")

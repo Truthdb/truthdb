@@ -224,12 +224,14 @@ pub async fn upload_part(
     let etag: String = info.md5.iter().map(|b| format!("{b:02x}")).collect();
     Ok(crate::ssec::with_echo(
         crate::sse::with_header(
-            crate::objects::with_checksum(
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("etag", format!("\"{etag}\"")),
-                &checksum,
-            ),
+            // Its checksum (S3's UploadPart answer has no type).
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("etag", format!("\"{etag}\""))
+                .header(
+                    format!("x-amz-checksum-{}", checksum.algorithm.to_ascii_lowercase()),
+                    &checksum.value,
+                ),
             state.storage.is_encrypted() && customer_key.is_none(),
         ),
         customer_key.as_ref(),
@@ -270,18 +272,6 @@ pub async fn list_parts(
             last.number
         ));
     }
-    // The upload's checksum algorithm and type, when it asked for one.
-    if let Some(asked) = &asked {
-        body.push_str(&format!(
-            "<ChecksumAlgorithm>{}</ChecksumAlgorithm><ChecksumType>{}</ChecksumType>",
-            asked.algorithm,
-            if asked.full_object {
-                "FULL_OBJECT"
-            } else {
-                "COMPOSITE"
-            }
-        ));
-    }
     for part in &parts {
         let checksum = part
             .checksum
@@ -303,9 +293,23 @@ pub async fn list_parts(
         ));
     }
     body.push_str(&format!(
-        "<StorageClass>{}</StorageClass></ListPartsResult>",
+        "<StorageClass>{}</StorageClass>",
         info.storage_class.as_str()
     ));
+    // The upload's checksum algorithm and type, when it asked for one (after
+    // its class, as S3's schema has them).
+    if let Some(asked) = &asked {
+        body.push_str(&format!(
+            "<ChecksumAlgorithm>{}</ChecksumAlgorithm><ChecksumType>{}</ChecksumType>",
+            asked.algorithm,
+            if asked.full_object {
+                "FULL_OBJECT"
+            } else {
+                "COMPOSITE"
+            }
+        ));
+    }
+    body.push_str("</ListPartsResult>");
     Ok(xml(body))
 }
 
@@ -489,9 +493,20 @@ pub async fn complete_upload(
                 }
             }
             let full_object = asked.as_ref().is_none_or(|asked| asked.full_object);
-            if asked_type.as_deref().is_some_and(|asked_type| {
-                (asked_type == "FULL_OBJECT") != full_object
-            }) {
+            let sent_type = match asked_type.as_deref().map(str::trim) {
+                None => None,
+                Some("FULL_OBJECT") => Some(true),
+                Some("COMPOSITE") => Some(false),
+                Some(other) => {
+                    return Ok((
+                        Err(S3Error::invalid_request(format!(
+                            "The checksum type {other} is not valid"
+                        ))),
+                        versioning,
+                    ));
+                }
+            };
+            if sent_type.is_some_and(|sent| sent != full_object) {
                 return Ok((
                     Err(S3Error::bad_digest(
                         "The checksum type does not match the one the upload was created with",
@@ -502,14 +517,14 @@ pub async fn complete_upload(
             let checksum = (parts.len() == listed.len())
                 .then(|| crate::part_checksums::of_object(asked.as_ref(), &parts))
                 .flatten();
-            // A whole-object checksum sent with it is checked (one for an
-            // upload that asked for none is not, as S3 neither checks nor
-            // keeps it).
-            if let (Some(asked), Some((algorithm, value))) = (&asked, &whole)
+            // A whole-object checksum sent with it is checked against the
+            // object's (one for an upload that asked for none is not, as S3
+            // neither checks nor keeps it; nor one when the object's cannot be
+            // made, a part having none).
+            if let (Some(asked), Some((algorithm, value)), Some(checksum)) =
+                (&asked, &whole, &checksum)
                 && asked.full_object
-                && checksum
-                    .as_ref()
-                    .is_none_or(|checksum| checksum.algorithm != *algorithm || checksum.value != *value)
+                && (checksum.algorithm != *algorithm || checksum.value != *value)
             {
                 return Ok((
                     Err(S3Error::bad_digest(format!(
