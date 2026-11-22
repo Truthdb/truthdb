@@ -59,6 +59,12 @@ pub(crate) enum Operation {
     /// Replicate each object again, to the destinations its bucket's
     /// replication rules name for it (Batch Replication).
     Replicate,
+    /// Compute each object's checksum, of `algorithm` (as S3 names it), of
+    /// the whole object or of its parts (composite), into the report.
+    ComputeChecksum {
+        algorithm: String,
+        full_object: bool,
+    },
 }
 
 /// A LambdaInvoke: the function (a topic name, and the account its ARN
@@ -120,6 +126,7 @@ impl Operation {
             Operation::LegalHold(_) => "S3PutObjectLegalHold",
             Operation::Lambda(_) => "LambdaInvoke",
             Operation::Replicate => "S3ReplicateObject",
+            Operation::ComputeChecksum { .. } => "S3ComputeObjectChecksum",
         }
     }
 }
@@ -687,6 +694,28 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
         "S3ReplicateObject" => {
             chosen.only(&[])?;
             Ok(Operation::Replicate)
+        }
+        // AWS states no defaults: CRC64NVME (its default checksum) of the
+        // whole object.
+        "S3ComputeObjectChecksum" => {
+            chosen.only(&["ChecksumAlgorithm", "ChecksumType"])?;
+            let algorithm = crate::part_checksums::computed(
+                chosen.text_of("ChecksumAlgorithm")?.unwrap_or("CRC64NVME"),
+            )?;
+            let full_object = match chosen.text_of("ChecksumType")? {
+                None | Some("FULL_OBJECT") => true,
+                Some("COMPOSITE") => false,
+                Some(_) => return Err(invalid("ChecksumType is FULL_OBJECT or COMPOSITE")),
+            };
+            if !full_object && algorithm == "CRC64NVME" {
+                return Err(invalid(
+                    "The COMPOSITE checksum type cannot be used with the CRC64NVME checksum algorithm",
+                ));
+            }
+            Ok(Operation::ComputeChecksum {
+                algorithm,
+                full_object,
+            })
         }
         "S3PutObjectLegalHold" => {
             chosen.only(&["LegalHold"])?;
@@ -1559,9 +1588,53 @@ mod tests {
             "InvalidRequest"
         );
         assert_eq!(
-            code(request("<S3ComputeObjectChecksum/>", MANIFEST, REPORT)),
+            code(request("<S3UpdateObjectEncryption/>", MANIFEST, REPORT)),
             "NotImplemented"
         );
+        // A checksum: CRC64NVME of the whole object unless asked otherwise;
+        // CRC64NVME is never composite; an algorithm S3 names but not built
+        // here is not implemented, one it does not name is invalid.
+        let checksum = |inner: &str| {
+            parsed(&request(
+                &format!("<S3ComputeObjectChecksum>{inner}</S3ComputeObjectChecksum>"),
+                MANIFEST,
+                REPORT,
+            ))
+            .map(|spec| spec.operation)
+        };
+        assert_eq!(
+            checksum("").unwrap(),
+            Operation::ComputeChecksum {
+                algorithm: "CRC64NVME".into(),
+                full_object: true
+            }
+        );
+        assert_eq!(
+            checksum("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm><ChecksumType>COMPOSITE</ChecksumType>")
+                .unwrap(),
+            Operation::ComputeChecksum {
+                algorithm: "SHA256".into(),
+                full_object: false
+            }
+        );
+        let code_of = |inner: &str| checksum(inner).unwrap_err().code;
+        assert_eq!(
+            code_of("<ChecksumType>COMPOSITE</ChecksumType>"),
+            "InvalidRequest"
+        );
+        assert_eq!(
+            code_of("<ChecksumType>PARTS</ChecksumType>"),
+            "InvalidRequest"
+        );
+        assert_eq!(
+            code_of("<ChecksumAlgorithm>MD5</ChecksumAlgorithm>"),
+            "NotImplemented"
+        );
+        assert_eq!(
+            code_of("<ChecksumAlgorithm>CRC16</ChecksumAlgorithm>"),
+            "InvalidRequest"
+        );
+        assert_eq!(code_of("<Other/>"), "MalformedXML");
         let no_fields = MANIFEST.replace("<member>Bucket</member>", "");
         assert_eq!(code(request(tagging, &no_fields, REPORT)), "InvalidRequest");
         let no_etag = MANIFEST.replace("<ETag>\"abc\"</ETag>", "");

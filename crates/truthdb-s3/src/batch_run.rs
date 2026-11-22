@@ -19,11 +19,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use tokio::sync::watch;
 use truthdb_core::storage::StorageError;
 use truthdb_object::{
     BodyWriter, Job, JobResult, JobStatus, ListAfter, ObjFile, ObjectAttrs, ObjectInfo, ObjectLock,
-    Origin, SealedBody, StorageClass, VersionSel, time::iso8601,
+    Origin, PartInfo, SealedBody, StorageClass, StoredChecksum, VersionSel, time::iso8601,
 };
 
 use crate::authz::{Authz, Resource};
@@ -126,9 +127,10 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-/// The LambdaInvoke jobs whose invocations are under way, each in a task of
-/// its own (so a slow endpoint holds up only its own job): the runner does
-/// nothing else with them meanwhile.
+/// The LambdaInvoke jobs whose invocations are under way, and the
+/// S3ComputeObjectChecksum jobs whose checksums are, each in a task of its
+/// own (so a slow endpoint, or a large object, holds up only its own job):
+/// the runner does nothing else with them meanwhile.
 #[derive(Default, Clone)]
 struct Invoking(Arc<std::sync::Mutex<InvokingSets>>);
 
@@ -1069,6 +1071,8 @@ enum Planned {
     Retention(VersionSel, truthdb_object::RetentionChange, bool),
     LegalHold(VersionSel, bool),
     Replicate(Box<ObjectInfo>),
+    /// A version whose checksum is computed (outside the lock).
+    Checksum(Box<ObjectInfo>),
     Copy {
         source: Box<ObjectInfo>,
         bucket: String,
@@ -1219,6 +1223,33 @@ fn plan(
                 Err(err) => Err(object_error(err, bucket, key)),
             });
         }
+        Operation::ComputeChecksum { .. } => {
+            let read = if versioned {
+                "s3:GetObjectVersion"
+            } else {
+                "s3:GetObject"
+            };
+            if let Err(err) = authz.check(read, object) {
+                return Ok(Err(err));
+            }
+            let info = match file.head_object(bucket, key, which)? {
+                Ok(info) => info,
+                Err(err) => return Ok(Err(object_error(err, bucket, key))),
+            };
+            // A delete marker named by its version id has no bytes.
+            if info.delete_marker {
+                return Ok(Err(crate::objects::delete_marker_error(
+                    which, &info, bucket, key,
+                )));
+            }
+            // As AWS: an object under a customer-provided key is not read.
+            if info.attrs.customer_key.is_some() {
+                return Ok(Err(S3Error::invalid_request(
+                    "SSE-C encryption type is not supported for this operation",
+                )));
+            }
+            return Ok(Ok(Planned::Checksum(Box::new(info))));
+        }
         // Invoked outside the lock, not planned here.
         Operation::Lambda(_) => {
             return Ok(Err(S3Error::internal("a LambdaInvoke task is not planned")));
@@ -1347,7 +1378,8 @@ fn cut(text: &str, max: usize) -> String {
 /// Runs up to [`TASKS_PER_STEP`] tasks of Active job `number`: the lines
 /// of its CSV manifest, or the objects its generated one lists. A
 /// LambdaInvoke job's tasks invoke their function outside the storage lock
-/// (see [`run_invocations`]).
+/// (see [`run_invocations`]), and an S3ComputeObjectChecksum job's read
+/// their objects outside it (see [`run_checksums`]).
 async fn run_tasks(
     state: &Arc<S3State>,
     number: u64,
@@ -1356,7 +1388,7 @@ async fn run_tasks(
 ) -> Result<Ran, String> {
     let now = now_ms();
     let delays = state.restore_delays;
-    let lambda = object(state, move |file| {
+    let outside = object(state, move |file| {
         let Some(job) = file.job(number)? else {
             return Ok(None);
         };
@@ -1376,8 +1408,19 @@ async fn run_tasks(
             finish_failed(file, number, "AccessDenied", CREATOR_GONE)?;
             return Ok(None);
         }
-        if let Operation::Lambda(lambda) = &spec.operation {
-            return Ok(Some((job, (**lambda).clone(), spec.report.clone())));
+        match &spec.operation {
+            Operation::Lambda(lambda) => {
+                let outside = Outside::Lambda((**lambda).clone());
+                return Ok(Some((job, outside, spec.report.clone())));
+            }
+            Operation::ComputeChecksum {
+                algorithm,
+                full_object,
+            } => {
+                let outside = Outside::Checksum(algorithm.clone(), *full_object);
+                return Ok(Some((job, outside, spec.report.clone())));
+            }
+            _ => {}
         }
         file.set_origin(Origin {
             operation: match spec.operation {
@@ -1388,7 +1431,7 @@ async fn run_tasks(
                 Operation::Retention { .. } => "PutObjectRetention",
                 Operation::LegalHold(_) => "PutObjectLegalHold",
                 Operation::Replicate => "ReplicateObject",
-                Operation::Lambda(_) => "",
+                Operation::Lambda(_) | Operation::ComputeChecksum { .. } => "",
             }
             .to_string(),
             request_id: job.id(),
@@ -1422,14 +1465,21 @@ async fn run_tasks(
         Ok(None)
     })
     .await?;
-    // Invoked in a task of its own, when a place is free.
-    if let Some((job, lambda, report)) = lambda {
+    // Invoked (or computed) in a task of its own, when a place is free.
+    if let Some((job, outside, report)) = outside {
         if !invoking.take(number) {
             return Ok(Ran::NoPlace);
         }
         let (state, poster, invoking) = (Arc::clone(state), poster.cloned(), invoking.clone());
         tokio::spawn(async move {
-            let outcome = run_invocations(&state, poster.as_deref(), job, lambda, report).await;
+            let outcome = match outside {
+                Outside::Lambda(lambda) => {
+                    run_invocations(&state, poster.as_deref(), job, lambda, report).await
+                }
+                Outside::Checksum(algorithm, full_object) => {
+                    run_checksums(&state, job, algorithm, full_object, report).await
+                }
+            };
             if let Err(err) = &outcome {
                 eprintln!("batch operations: job {number}: {err}");
             }
@@ -1438,6 +1488,298 @@ async fn run_tasks(
         return Ok(Ran::Invoking);
     }
     Ok(Ran::Here)
+}
+
+/// What a job's tasks do outside the storage lock.
+enum Outside {
+    Lambda(LambdaSpec),
+    /// The algorithm, and whether of the whole object.
+    Checksum(String, bool),
+}
+
+/// Checksum tasks a step computes at most, and how long a step starts new
+/// ones (as [`INVOCATION_STEP_BUDGET`]).
+const CHECKSUMS_PER_STEP: usize = 16;
+const CHECKSUM_STEP_BUDGET: Duration = Duration::from_secs(60);
+
+/// A step of an S3ComputeObjectChecksum job: its next tasks planned (each
+/// authorized as the creator's GET, its version found, its body leased) in
+/// one lock hold, each object's bytes read and its checksum computed
+/// outside it, then their results recorded in order, each with the job's
+/// place. Nothing but the report changes: a crash before the record
+/// computes them again.
+async fn run_checksums(
+    state: &S3State,
+    job: Job,
+    algorithm: String,
+    full_object: bool,
+    report: Option<crate::batch::ReportSpec>,
+) -> Result<(), String> {
+    let number = job.number;
+    let now = now_ms();
+    let delays = state.restore_delays;
+    let who = creator(&job);
+    let taken = object(state, move |file| {
+        let Some(job) = file.job(number)? else {
+            return Ok(None);
+        };
+        if job.status != JobStatus::Active {
+            return Ok(None);
+        }
+        let Some(spec) = job_spec(file, &job)? else {
+            return Ok(None);
+        };
+        match next_items(file, &job, &spec, CHECKSUMS_PER_STEP)? {
+            Next::Complete(cursor) => {
+                complete(file, number, cursor)?;
+                Ok(None)
+            }
+            Next::Failed(code, reason) => {
+                finish_failed(file, number, code, &reason)?;
+                Ok(None)
+            }
+            Next::Items(items) => {
+                let mut planned = Vec::new();
+                for item in items {
+                    let task = match item.object {
+                        None => None,
+                        Some(Err((text, why))) => Some(Err(JobResult {
+                            bucket: cut(&text, MAX_RESULT_TEXT),
+                            key: String::new(),
+                            version_id: String::new(),
+                            succeeded: false,
+                            http_status: 400,
+                            error_code: "InvalidRequest".to_string(),
+                            message: cut(&why, MAX_RESULT_TEXT),
+                        })),
+                        Some(Ok((bucket, key, version))) => {
+                            let found = plan(
+                                file,
+                                delays,
+                                &who,
+                                &spec.operation,
+                                &bucket,
+                                &key,
+                                version.as_deref(),
+                                now,
+                            )?;
+                            let found = match found {
+                                Ok(Planned::Checksum(info)) => {
+                                    let layout = file.body_layout(info.body)?;
+                                    file.take_lease(info.body)?;
+                                    Ok((info, layout))
+                                }
+                                Ok(_) => Err(S3Error::internal("not a checksum task")),
+                                Err(err) => Err(err),
+                            };
+                            Some(Ok(((bucket, key, version.unwrap_or_default()), found)))
+                        }
+                    };
+                    planned.push((item.start, item.end, task));
+                }
+                Ok(Some(planned))
+            }
+        }
+    })
+    .await?;
+    let Some(planned) = taken else {
+        return Ok(());
+    };
+    let mut results = Vec::new();
+    let began = std::time::Instant::now();
+    let mut stopped = false;
+    for (start, end, task) in planned {
+        // Past the budget none starts (the first always does); the leases
+        // taken for the rest are given back.
+        stopped |= began.elapsed() >= CHECKSUM_STEP_BUDGET && !results.is_empty();
+        let result = match task {
+            None => None,
+            Some(Err(result)) => Some(result),
+            Some(Ok(((bucket, key, version_id), found))) => {
+                let outcome = match found {
+                    Err(err) => Err(err),
+                    Ok((info, _)) if stopped => {
+                        release(state, info.body).await?;
+                        continue;
+                    }
+                    Ok((info, layout)) => {
+                        let computed =
+                            compute_checksum(state, &info, layout, &algorithm, full_object).await;
+                        release(state, info.body).await?;
+                        computed.map(|checksum| checksum_message(&checksum, &info.etag()))
+                    }
+                };
+                Some(JobResult {
+                    bucket: cut(&bucket, MAX_RESULT_TEXT),
+                    key: cut(&key, MAX_RESULT_KEY),
+                    version_id: cut(&version_id, MAX_RESULT_TEXT),
+                    succeeded: outcome.is_ok(),
+                    http_status: outcome.as_ref().map_or_else(|err| err.status, |_| 200),
+                    error_code: outcome
+                        .as_ref()
+                        .err()
+                        .map(|err| err.code.to_string())
+                        .unwrap_or_default(),
+                    // A checksum's is at most 269 bytes (a composite SHA256 of
+                    // 10,000 parts): kept whole, its row still fits a cell (its
+                    // bucket exists, so its name is at most 63 bytes).
+                    message: match outcome {
+                        Ok(message) => message,
+                        Err(err) => cut(&err.message, MAX_RESULT_TEXT),
+                    },
+                })
+            }
+        };
+        if stopped {
+            continue;
+        }
+        results.push((start, end, result));
+    }
+    object(state, move |file| {
+        for (start, end, result) in results {
+            let result = result.map(|result| {
+                let kept = report
+                    .as_ref()
+                    .is_some_and(|report| !report.failed_only || !result.succeeded);
+                (result, kept)
+            });
+            if moved(file.transaction(|tx| advance(tx, number, start, end, result)))? {
+                break;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Gives back the lease a checksum task took on `body`.
+async fn release(state: &S3State, body: u64) -> Result<(), String> {
+    object(state, move |file| {
+        file.release_lease(body);
+        Ok(())
+    })
+    .await
+}
+
+/// The checksum of `info`'s bytes (its body's `layout`), of `algorithm`:
+/// of the whole object, or (composite) of a multipart object's parts'
+/// checksums. AWS states none for a composite checksum of an object of one
+/// part: its whole one is given, as S3 keeps a PUT's.
+async fn compute_checksum(
+    state: &S3State,
+    info: &ObjectInfo,
+    layout: Vec<(u64, u64, u64)>,
+    algorithm: &str,
+    full_object: bool,
+) -> Result<StoredChecksum, S3Error> {
+    let sizes: Vec<u64> = match full_object || info.parts == 0 {
+        true => vec![info.size],
+        false => layout.iter().map(|&(_, _, stored)| stored).collect(),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let engine = state.engine.clone();
+    let size = info.size;
+    let reader = tokio::spawn(async move {
+        crate::objects::stream_plaintext(&engine, &layout, None, 0, size, &tx).await
+    });
+    // Each part's checksum, as a part of an upload keeps it.
+    let mut parts: Vec<PartInfo> = Vec::new();
+    let mut part = crate::payload::Checksum::of_algorithm(algorithm)?;
+    let mut left = sizes[0];
+    let mut read = 0u64;
+    let done_part = |part: crate::payload::Checksum, parts: &mut Vec<PartInfo>| {
+        let number = parts.len() as u32 + 1;
+        parts.push(PartInfo {
+            number,
+            body: 0,
+            size: sizes[parts.len()],
+            md5: [0; 16],
+            mtime_ms: 0,
+            checksum: Some(StoredChecksum {
+                algorithm: algorithm.to_string(),
+                full_object: true,
+                value: part.finish(),
+            }),
+        });
+    };
+    while let Some(chunk) = rx.recv().await {
+        read += chunk.len() as u64;
+        let mut rest = &chunk[..];
+        while !rest.is_empty() {
+            if left == 0 && parts.len() + 1 < sizes.len() {
+                done_part(
+                    std::mem::replace(
+                        &mut part,
+                        crate::payload::Checksum::of_algorithm(algorithm)?,
+                    ),
+                    &mut parts,
+                );
+                left = sizes[parts.len()];
+                continue;
+            }
+            let take = rest.len().min(left as usize);
+            part.update(&rest[..take]);
+            left -= take as u64;
+            rest = &rest[take..];
+        }
+    }
+    let complete = reader
+        .await
+        .map_err(|err| S3Error::internal(err.to_string()))?;
+    if !complete || read != size {
+        return Err(S3Error::internal(format!(
+            "the object (body {}) could not be read whole",
+            info.body
+        )));
+    }
+    // The last part, and any empty ones after it.
+    done_part(part, &mut parts);
+    while parts.len() < sizes.len() {
+        done_part(
+            crate::payload::Checksum::of_algorithm(algorithm)?,
+            &mut parts,
+        );
+    }
+    if sizes.len() == 1 {
+        return Ok(parts.remove(0).checksum.expect("a part's checksum"));
+    }
+    let asked = StoredChecksum {
+        algorithm: algorithm.to_string(),
+        full_object: false,
+        value: String::new(),
+    };
+    crate::part_checksums::of_object(Some(&asked), &parts)
+        .ok_or_else(|| S3Error::internal("the parts' checksums do not make a composite one"))
+}
+
+/// A checksum task's result message, as AWS's report gives it: the value
+/// (base64, and hex), the object's ETag (unquoted), the algorithm and type.
+fn checksum_message(checksum: &StoredChecksum, etag: &str) -> String {
+    let (raw, parts) = match checksum.value.split_once('-') {
+        Some((raw, parts)) => (raw, Some(parts)),
+        None => (checksum.value.as_str(), None),
+    };
+    let mut hex: String = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .unwrap_or_default()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    if let Some(parts) = parts {
+        hex.push('-');
+        hex.push_str(parts);
+    }
+    format!(
+        "{{\"checksum_base64\":\"{}\",\"etag\":\"{}\",\"checksumAlgorithm\":\"{}\",\"checksumType\":\"{}\",\"checksum_hex\":\"{hex}\"}}",
+        checksum.value,
+        etag.trim_matches('"'),
+        checksum.algorithm,
+        if checksum.full_object {
+            "FULL_OBJECT"
+        } else {
+            "COMPOSITE"
+        }
+    )
 }
 
 /// LambdaInvoke tasks a step invokes at most, and the times one is tried
@@ -2011,6 +2353,9 @@ fn run_one(
                     "No replication rule of the bucket replicates the object",
                 )),
             },
+            Ok(Planned::Checksum(_)) => Err(S3Error::internal(
+                "a checksum task is computed outside the lock",
+            )),
             Ok(Planned::Copy {
                 source,
                 bucket: to,

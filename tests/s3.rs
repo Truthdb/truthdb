@@ -9761,6 +9761,201 @@ fn a_batch_copy_of_a_multipart_object_onto_itself_keeps_its_part_checksums() {
 }
 
 #[test]
+fn batch_checksum_jobs_report_each_objects_checksum() {
+    use base64::Engine as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let sha256 = |data: &[u8]| {
+        ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .to_vec()
+    };
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02X}")).collect() };
+    // TLS: one object is under a customer-provided key.
+    let server = start_server_tls(false, true);
+    let (account, key, secret) = account_with_key(&server, "summer");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        let mut headers = vec![("x-amz-account-id", account.as_str())];
+        headers.extend_from_slice(extra);
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            &headers,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/src", "/reports"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+    }
+    let enabled = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(call("PUT", "/src", "versioning", &[], enabled).1.0, 200);
+    let (head, (status, _)) = call("PUT", "/src/small", "", &[], b"hello");
+    assert_eq!(status, 200);
+    let small_etag = response_header(&head, "etag").unwrap();
+    // A multipart object, its parts sent with no checksum (each is given
+    // its CRC64NVME, the object its whole one).
+    let (_, (_, made)) = call("POST", "/src/big", "uploads", &[], b"");
+    let upload = xml_value(&made, "UploadId");
+    let parts = [vec![3u8; 5 << 20], b"the last part".to_vec()];
+    let mut listed = String::new();
+    for (number, data) in parts.iter().enumerate() {
+        let number = number + 1;
+        let query = format!("partNumber={number}&uploadId={upload}");
+        let (head, (status, _)) = call("PUT", "/src/big", &query, &[], data);
+        assert_eq!(status, 200);
+        let etag = response_header(&head, "etag").unwrap();
+        listed.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    let complete = format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>");
+    let query = format!("uploadId={upload}");
+    let (_, (status, done)) = call("POST", "/src/big", &query, &[], complete.as_bytes());
+    assert_eq!(status, 200, "{done}");
+    let (head, _) = call(
+        "HEAD",
+        "/src/big",
+        "",
+        &[("x-amz-checksum-mode", "ENABLED")],
+        b"",
+    );
+    let big_etag = response_header(&head, "etag").unwrap();
+    let big_crc = response_header(&head, "x-amz-checksum-crc64nvme").expect("its CRC64NVME");
+    let customer = customer_headers("x-amz-", [7u8; 32]);
+    assert_eq!(
+        call("PUT", "/src/sealed", "", &header_refs(&customer), b"s")
+            .1
+            .0,
+        200
+    );
+    assert_eq!(call("PUT", "/src/gone", "", &[], b"g").1.0, 200);
+    let (head, _) = call("DELETE", "/src/gone", "", &[], b"");
+    let marker = response_header(&head, "x-amz-version-id").unwrap();
+    // One the job's creator may not read.
+    assert_eq!(call("PUT", "/src/denied", "", &[], b"d").1.0, 200);
+    let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\
+                  \"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::src/denied\"}]}";
+    assert_eq!(
+        call("PUT", "/src", "policy", &[], policy.as_bytes()).1.0,
+        204
+    );
+    let put_manifest = |name: &str, lines: &str| {
+        let (head, (status, _)) = call(
+            "PUT",
+            &format!("/src/lists/{name}"),
+            "",
+            &[],
+            lines.as_bytes(),
+        );
+        assert_eq!(status, 200);
+        response_header(&head, "etag").unwrap()
+    };
+    // Runs `operation` on the manifest's objects: the report's rows.
+    let run = |token: &str, operation: &str, manifest: &str, versions: bool| {
+        let etag = put_manifest(&format!("{token}.csv"), manifest);
+        let mut body = create_job_body(token, operation, &format!("lists/{token}.csv"), &etag, "");
+        if versions {
+            body = body.replace(
+                "<member>Key</member></Fields>",
+                "<member>Key</member><member>VersionId</member></Fields>",
+            );
+        }
+        let (_, (status, answer)) = call("POST", "/v20180820/jobs", "", &[], body.as_bytes());
+        assert_eq!(status, 200, "{answer}");
+        let job = xml_value(&answer, "JobId");
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let (_, (_, described)) = call("GET", &format!("/v20180820/jobs/{job}"), "", &[], b"");
+            if xml_value(&described, "Status") == "Complete" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the job never ended: {described}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (_, (_, listed)) = call(
+            "GET",
+            "/reports",
+            &format!("list-type=2&prefix=rep/job-{job}/results/"),
+            &[],
+            b"",
+        );
+        let mut rows = String::new();
+        for part in listed.split("<Key>").skip(1) {
+            let name = part.split("</Key>").next().unwrap();
+            rows.push_str(&call("GET", &format!("/reports/{name}"), "", &[], b"").1.1);
+        }
+        rows
+    };
+    // The record S3 reports, quoted as a CSV field.
+    let record = |value: &str, hex: &str, etag: &str, algorithm: &str, kind: &str| {
+        let json = format!(
+            "{{\"checksum_base64\":\"{value}\",\"etag\":\"{}\",\"checksumAlgorithm\":\"{algorithm}\",\"checksumType\":\"{kind}\",\"checksum_hex\":\"{hex}\"}}",
+            etag.trim_matches('"')
+        );
+        format!("\"{}\"", json.replace('"', "\"\""))
+    };
+    // Composite SHA256: of the parts' SHA256s; one part's is its whole.
+    let composite = "<S3ComputeObjectChecksum><ChecksumAlgorithm>SHA256</ChecksumAlgorithm>\
+                     <ChecksumType>COMPOSITE</ChecksumType></S3ComputeObjectChecksum>";
+    let rows = run(
+        "sums-1",
+        composite,
+        "src,small\nsrc,big\nsrc,sealed\nsrc,missing\nsrc,gone\nsrc,denied\n",
+        false,
+    );
+    let small = sha256(b"hello");
+    let joined = [sha256(&parts[0]), sha256(&parts[1])].concat();
+    let whole = sha256(&joined);
+    for line in [
+        format!(
+            "src,small,,succeeded,200,,{}",
+            record(&b64(&small), &hex(&small), &small_etag, "SHA256", "FULL_OBJECT")
+        ),
+        format!(
+            "src,big,,succeeded,200,,{}",
+            record(
+                &format!("{}-2", b64(&whole)),
+                &format!("{}-2", hex(&whole)),
+                &big_etag,
+                "SHA256",
+                "COMPOSITE"
+            )
+        ),
+        "src,sealed,,failed,400,InvalidRequest,SSE-C encryption type is not supported for this operation".to_string(),
+        "src,missing,,failed,404,NoSuchKey,".to_string(),
+        "src,gone,,failed,404,NoSuchKey,".to_string(),
+        "src,denied,,failed,403,AccessDenied,".to_string(),
+    ] {
+        assert!(rows.contains(&line), "{line}\nnot in\n{rows}");
+    }
+    // None asked for: CRC64NVME of the whole object, the one it keeps.
+    let rows = run("sums-2", "<S3ComputeObjectChecksum/>", "src,big\n", false);
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&big_crc)
+        .unwrap();
+    let line = format!(
+        "src,big,,succeeded,200,,{}",
+        record(&big_crc, &hex(&raw), &big_etag, "CRC64NVME", "FULL_OBJECT")
+    );
+    assert!(rows.contains(&line), "{line}\nnot in\n{rows}");
+    // A delete marker named by its version id has no bytes.
+    let rows = run(
+        "sums-3",
+        "<S3ComputeObjectChecksum/>",
+        &format!("src,gone,{marker}\n"),
+        true,
+    );
+    let line = format!("src,gone,{marker},failed,405,MethodNotAllowed,");
+    assert!(rows.contains(&line), "{line}\nnot in\n{rows}");
+}
+
+#[test]
 fn batch_replication_replicates_again_what_a_manifest_or_its_filters_name_across_a_crash() {
     let mut server = start_server();
     let (account, key, secret) = account_with_key(&server, "rebatch");
