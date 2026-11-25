@@ -49,6 +49,7 @@ pub use truthdb_sigv4 as sigv4;
 pub mod session;
 pub mod sse;
 pub mod ssec;
+pub mod tables;
 pub mod tagging;
 pub mod trails;
 pub use truthdb_object::time;

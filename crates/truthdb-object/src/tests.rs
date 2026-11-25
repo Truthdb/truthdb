@@ -8368,3 +8368,187 @@ fn an_append_grows_an_object_by_a_part_and_keeps_it_whole() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_table_catalog_keeps_buckets_namespaces_and_tables_with_a_versioned_pointer() {
+    use crate::{TableError, TableInfo};
+    let path = temp_path("tables");
+    let storage = create(&path);
+    let tx = |op: &dyn Fn(
+        &mut crate::ObjTxn<'_, '_>,
+    ) -> Result<Result<(), TableError>, StorageError>| {
+        ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
+    };
+    let at = ("111122223333", "warehouse");
+    assert_eq!(
+        tx(&|tx| tx.create_table_bucket(at.0, at.1, "b-id", 1)),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.create_table_bucket(at.0, at.1, "b-id2", 1)),
+        Err(TableError::Exists)
+    );
+    // Another account's of the same name is its own.
+    assert_eq!(
+        tx(&|tx| tx.create_table_bucket("444455556666", at.1, "o-id", 1)),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.create_namespace(("111122223333", "none"), "sales", "n", ("me", 1))),
+        Err(TableError::NoSuchTableBucket)
+    );
+    assert_eq!(
+        tx(&|tx| tx.create_namespace(at, "sales", "n-id", ("me", 2))),
+        Ok(())
+    );
+    let table = |namespace: &str, name: &str, id: &str| TableInfo {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        id: id.to_string(),
+        created_ms: 3,
+        created_by: "me".to_string(),
+        modified_ms: 3,
+        modified_by: "me".to_string(),
+        metadata_location: None,
+        version_token: "v1".to_string(),
+        warehouse_location: format!("s3://{id}--table-s3"),
+    };
+    assert_eq!(
+        tx(&|tx| tx.create_table(at, &table("other", "t", "x"))),
+        Err(TableError::NoSuchNamespace)
+    );
+    assert_eq!(
+        tx(&|tx| tx.create_table(at, &table("sales", "orders", "t-1"))),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.create_table(at, &table("sales", "orders", "t-2"))),
+        Err(TableError::Exists)
+    );
+    // Not empty: neither the bucket nor the namespace go.
+    assert_eq!(
+        tx(&|tx| tx.delete_namespace(at, "sales")),
+        Err(TableError::NotEmpty)
+    );
+    assert_eq!(
+        tx(&|tx| tx.delete_table_bucket(at.0, at.1)),
+        Err(TableError::NotEmpty)
+    );
+    let read = |namespace: &str, name: &str| {
+        ObjFile::new(&mut storage.lock())
+            .table(at, (namespace, name))
+            .unwrap()
+    };
+    // The pointer: swapped only from its current token.
+    let swap_of = |id: &'static str, token: &'static str, next: &'static str| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.update_metadata_location(
+                    at,
+                    ("sales", "orders", id),
+                    (token, next),
+                    "s3://t-1--table-s3/metadata/00001.metadata.json",
+                    ("me", 4),
+                )
+            })
+            .unwrap()
+            .map(|table| table.version_token)
+    };
+    let swap = |token, next| swap_of("t-1", token, next);
+    // Another table's id (one made since at the name): not it.
+    assert_eq!(swap_of("t-0", "v1", "v2"), Err(TableError::NoSuchTable));
+    assert_eq!(swap("v0", "v2"), Err(TableError::VersionMismatch));
+    assert_eq!(swap("v1", "v2"), Ok("v2".to_string()));
+    assert_eq!(
+        read("sales", "orders")
+            .unwrap()
+            .metadata_location
+            .as_deref(),
+        Some("s3://t-1--table-s3/metadata/00001.metadata.json")
+    );
+    // Renamed into another namespace: its id (and pointer) stay, found by id.
+    assert_eq!(
+        tx(&|tx| tx.create_namespace(at, "archive", "n-2", ("me", 5))),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.rename_table(
+            at,
+            ("sales", "orders", "t-1"),
+            ("archive", "old"),
+            Some("v1"),
+            ("me", 6)
+        )),
+        Err(TableError::VersionMismatch)
+    );
+    // Another table's id (one made since at the name): not it.
+    assert_eq!(
+        tx(&|tx| tx.rename_table(
+            at,
+            ("sales", "orders", "t-0"),
+            ("archive", "old"),
+            Some("v2"),
+            ("me", 6)
+        )),
+        Err(TableError::NoSuchTable)
+    );
+    assert_eq!(
+        tx(&|tx| tx.rename_table(
+            at,
+            ("sales", "orders", "t-1"),
+            ("archive", "old"),
+            Some("v2"),
+            ("me", 6)
+        )),
+        Ok(())
+    );
+    assert_eq!(read("sales", "orders"), None);
+    let moved = ObjFile::new(&mut storage.lock())
+        .table_by_id(at, "t-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            moved.namespace.as_str(),
+            moved.name.as_str(),
+            moved.version_token.as_str()
+        ),
+        ("archive", "old", "v2")
+    );
+    let listed = ObjFile::new(&mut storage.lock())
+        .list_tables(at, None, "", None, 10)
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    // Deleted with its token: then the namespaces and the bucket can go.
+    let delete = |token: Option<&'static str>| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("archive", "old", "t-1"), token))
+            .unwrap()
+            .map(|_| ())
+    };
+    assert_eq!(delete(Some("v1")), Err(TableError::VersionMismatch));
+    // Another table's id (one made since at the name): not it.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("archive", "old", "t-0"), None))
+            .unwrap()
+            .map(|_| ()),
+        Err(TableError::NoSuchTable)
+    );
+    assert_eq!(delete(Some("v2")), Ok(()));
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .table_by_id(at, "t-1")
+            .unwrap(),
+        None
+    );
+    assert_eq!(tx(&|tx| tx.delete_namespace(at, "sales")), Ok(()));
+    assert_eq!(tx(&|tx| tx.delete_namespace(at, "archive")), Ok(()));
+    assert_eq!(tx(&|tx| tx.delete_table_bucket(at.0, at.1)), Ok(()));
+    let buckets = ObjFile::new(&mut storage.lock())
+        .list_table_buckets("444455556666", "", None, 10)
+        .unwrap();
+    assert_eq!(buckets.len(), 1);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

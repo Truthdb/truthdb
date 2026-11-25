@@ -177,6 +177,17 @@ impl ObjTxn<'_, '_> {
         {
             return Ok(Err(AccountError::NoSuchAccount));
         }
+        // Its table buckets (S3 Tables) first: their tables would pass to an
+        // account made later under the id.
+        let (from, to) = crate::tables::account_range(id);
+        if !self
+            .trees
+            .tree(crate::TABLE_BUCKETS_TREE)
+            .scan_range_limit(self.ctx, Some(&from), Some(&to), 1)?
+            .is_empty()
+        {
+            return Ok(Err(AccountError::NotEmpty("table buckets")));
+        }
         let (lower, upper) = user_range(id);
         if !self
             .trees

@@ -18456,3 +18456,185 @@ assert (head["ChecksumSHA256"], head["ChecksumType"]) == (composite, "COMPOSITE"
 assert s3.get_object(Bucket=B, Key="sha")["Body"].read() == b"alphabeta"
 print("ok")
 "#;
+
+#[test]
+fn s3_tables_keep_table_buckets_namespaces_and_tables_as_aws_does() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "tabler");
+    let (other_account, _, _) = account_with_key(&server, "others");
+    let (nobody_key, nobody_secret) = user_with_key(&server, &account, "nobody", None);
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:*", "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (maker_key, maker_secret) = user_with_key(&server, &account, "maker", Some(&policy));
+    let script = server.dir.join("tables.py");
+    std::fs::write(&script, TABLES_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other_account,
+            &nobody_key,
+            &nobody_secret,
+            &maker_key,
+            &maker_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The account keeps a table bucket: it is not dropped.
+    let refused = native_text(server.native_port, &format!("s3 drop account {account}"));
+    assert!(refused.contains("table buckets"), "{refused}");
+}
+
+const TABLES_SCRIPT: &str = r#"
+import sys
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other_account, nobody_key, nobody_secret, maker_key, maker_secret = sys.argv[1:10]
+def client(access, secret_key):
+    return boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+t = client(key, secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+# Table buckets: made, named as AWS names them, listed in pages.
+arn = t.create_table_bucket(name="warehouse")["arn"]
+assert arn == f"arn:aws:s3tables:us-east-1:{account}:bucket/warehouse", arn
+t.create_table_bucket(name="kept")
+refused(lambda: t.create_table_bucket(name="warehouse"), "ConflictException")
+for bad in ["Abc", "my_bucket", "awsdata", "x--table-s3"]:
+    refused(lambda: t.create_table_bucket(name=bad), "BadRequestException")
+got = t.get_table_bucket(tableBucketARN=arn)
+assert (got["name"], got["ownerAccountId"], got["type"], got["arn"]) == ("warehouse", account, "customer", arn), got
+page = t.list_table_buckets(maxBuckets=1)
+assert [b["name"] for b in page["tableBuckets"]] == ["kept"] and page["continuationToken"], page
+rest = t.list_table_buckets(maxBuckets=1, continuationToken=page["continuationToken"])
+assert [b["name"] for b in rest["tableBuckets"]] == ["warehouse"] and "continuationToken" not in rest, rest
+assert [b["name"] for b in t.list_table_buckets(prefix="war")["tableBuckets"]] == ["warehouse"]
+# Namespaces.
+made = t.create_namespace(tableBucketARN=arn, namespace=["sales"])
+assert (made["tableBucketARN"], made["namespace"]) == (arn, ["sales"]), made
+refused(lambda: t.create_namespace(tableBucketARN=arn, namespace=["Sales"]), "BadRequestException")
+refused(lambda: t.create_namespace(tableBucketARN=arn, namespace=["awsx"]), "BadRequestException")
+refused(lambda: t.create_namespace(tableBucketARN=arn, namespace=["sales"]), "ConflictException")
+space = t.get_namespace(tableBucketARN=arn, namespace="sales")
+assert (space["namespace"], space["ownerAccountId"], space["tableBucketId"]) == (["sales"], account, got["tableBucketId"]), space
+t.create_namespace(tableBucketARN=arn, namespace=["archive"])
+assert [n["namespace"] for n in t.list_namespaces(tableBucketARN=arn)["namespaces"]] == [["archive"], ["sales"]]
+# Tables: by name and by ARN, their warehouse location and version token.
+table = t.create_table(tableBucketARN=arn, namespace="sales", name="orders", format="ICEBERG")
+table_arn, token = table["tableARN"], table["versionToken"]
+assert table_arn.startswith(arn + "/table/"), table
+refused(lambda: t.create_table(tableBucketARN=arn, namespace="sales", name="orders", format="ICEBERG"),
+    "ConflictException")
+refused(lambda: t.create_table(tableBucketARN=arn, namespace="none", name="x", format="ICEBERG"),
+    "NotFoundException")
+refused(lambda: t.create_table(tableBucketARN=arn, namespace="sales", name="x", format="ICEBERG",
+    metadata={"iceberg": {"schema": {"fields": [{"name": "id", "type": "int"}]}}}), "NotImplemented")
+by_name = t.get_table(tableBucketARN=arn, namespace="sales", name="orders")
+by_arn = t.get_table(tableArn=table_arn)
+assert by_name == by_arn | {"ResponseMetadata": by_name["ResponseMetadata"]}, (by_name, by_arn)
+assert (by_name["format"], by_name["versionToken"], by_name["namespace"]) == ("ICEBERG", token, ["sales"]), by_name
+assert by_name["namespaceId"] == space["namespaceId"], (by_name, space)
+warehouse = by_name["warehouseLocation"]
+assert warehouse.startswith("s3://") and warehouse.endswith("--table-s3") and "metadataLocation" not in by_name, by_name
+listed = t.list_tables(tableBucketARN=arn, namespace="sales")["tables"]
+assert [(x["name"], x["tableARN"], x["namespaceId"]) for x in listed] == [("orders", table_arn, space["namespaceId"])], listed
+# In pages, across namespaces, and by prefix.
+for space, name in [("archive", "a1"), ("archive", "b2"), ("sales", "a3")]:
+    t.create_table(tableBucketARN=arn, namespace=space, name=name, format="ICEBERG")
+seen, next_page = [], None
+while True:
+    page = t.list_tables(tableBucketARN=arn, maxTables=1, **({"continuationToken": next_page} if next_page else {}))
+    seen += [(x["namespace"][0], x["name"]) for x in page["tables"]]
+    next_page = page.get("continuationToken")
+    if not next_page:
+        break
+assert seen == [("archive", "a1"), ("archive", "b2"), ("sales", "a3"), ("sales", "orders")], seen
+assert [x["name"] for x in t.list_tables(tableBucketARN=arn, prefix="a")["tables"]] == ["a1", "a3"]
+spaces = t.list_namespaces(tableBucketARN=arn, maxNamespaces=1)
+assert [n["namespace"] for n in spaces["namespaces"]] == [["archive"]], spaces
+spaces = t.list_namespaces(tableBucketARN=arn, maxNamespaces=1, continuationToken=spaces["continuationToken"])
+assert [n["namespace"] for n in spaces["namespaces"]] == [["sales"]] and "continuationToken" not in spaces, spaces
+for space, name in [("archive", "a1"), ("archive", "b2"), ("sales", "a3")]:
+    t.delete_table(tableBucketARN=arn, namespace=space, name=name)
+refused(lambda: t.list_table_buckets(type="other"), "BadRequestException")
+# Whether a table is there is said only to whom may get it.
+nobody = client(nobody_key, nobody_secret)
+refused(lambda: nobody.get_table(tableBucketARN=arn, namespace="sales", name="missing"), "ForbiddenException")
+refused(lambda: nobody.get_table(tableBucketARN=arn, namespace="sales", name="orders"), "ForbiddenException")
+refused(lambda: nobody.get_table_metadata_location(tableBucketARN=arn, namespace="sales", name="missing"),
+    "ForbiddenException")
+refused(lambda: t.get_table(tableBucketARN=arn, namespace="sales", name="missing"), "NotFoundException")
+# The metadata pointer: swapped only from the current token, only to a
+# metadata file of its warehouse.
+location = t.get_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders")
+assert (location["versionToken"], location["warehouseLocation"]) == (token, warehouse), location
+first = f"{warehouse}/metadata/00000-a.metadata.json"
+refused(lambda: t.update_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders",
+    versionToken="stale", metadataLocation=first), "ConflictException")
+refused(lambda: t.update_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders",
+    versionToken=token, metadataLocation="s3://elsewhere/m.metadata.json"), "BadRequestException")
+refused(lambda: t.update_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders",
+    versionToken=token, metadataLocation=f"{warehouse}/metadata/x.json"), "BadRequestException")
+updated = t.update_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders",
+    versionToken=token, metadataLocation=first)
+assert updated["versionToken"] != token and updated["metadataLocation"] == first, updated
+assert t.get_table(tableArn=table_arn)["metadataLocation"] == first
+token = updated["versionToken"]
+# Renamed (into another namespace): its ARN stays.
+t.rename_table(tableBucketARN=arn, namespace="sales", name="orders", newNamespaceName="archive",
+    newName="orders_2024", versionToken=token)
+moved = t.get_table(tableArn=table_arn)
+assert (moved["namespace"], moved["name"]) == (["archive"], "orders_2024"), moved
+archive = t.get_namespace(tableBucketARN=arn, namespace="archive")
+assert moved["namespaceId"] == archive["namespaceId"] != by_name["namespaceId"], (moved, archive)
+# Not empty: neither the namespace nor the bucket goes.
+refused(lambda: t.delete_namespace(tableBucketARN=arn, namespace="archive"), "ConflictException")
+refused(lambda: t.delete_table_bucket(tableBucketARN=arn), "ConflictException")
+refused(lambda: t.delete_table(tableBucketARN=arn, namespace="archive", name="orders_2024",
+    versionToken="stale"), "ConflictException")
+t.delete_table(tableBucketARN=arn, namespace="archive", name="orders_2024", versionToken=moved["versionToken"])
+refused(lambda: t.get_table(tableArn=table_arn), "NotFoundException")
+# Not built here: refused, not ignored.
+refused(lambda: t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy="{}"), "NotImplemented")
+refused(lambda: t.get_table_bucket_encryption(tableBucketARN=arn), "NotImplemented")
+# Another account's ARN, and a user with no policies: forbidden.
+theirs = arn.replace(account, other_account)
+refused(lambda: t.get_table_bucket(tableBucketARN=theirs), "ForbiddenException")
+refused(lambda: client(nobody_key, nobody_secret).get_table_bucket(tableBucketARN=arn), "ForbiddenException")
+refused(lambda: client(nobody_key, nobody_secret).create_table_bucket(name="mine"), "ForbiddenException")
+# A user's changes are by its account (createdBy and modifiedBy are
+# account ids), not its access key.
+maker = client(maker_key, maker_secret)
+maker.create_namespace(tableBucketARN=arn, namespace=["made"])
+made_table = maker.create_table(tableBucketARN=arn, namespace="made", name="t", format="ICEBERG")
+assert maker.get_namespace(tableBucketARN=arn, namespace="made")["createdBy"] == account
+got_table = maker.get_table(tableArn=made_table["tableARN"])
+assert (got_table["createdBy"], got_table["modifiedBy"]) == (account, account), got_table
+maker.delete_table(tableBucketARN=arn, namespace="made", name="t")
+for space in ["sales", "archive", "made"]:
+    t.delete_namespace(tableBucketARN=arn, namespace=space)
+t.delete_table_bucket(tableBucketARN=arn)
+refused(lambda: t.get_table_bucket(tableBucketARN=arn), "NotFoundException")
+assert [b["name"] for b in t.list_table_buckets()["tableBuckets"]] == ["kept"]
+print("ok")
+"#;
