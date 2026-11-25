@@ -20,9 +20,8 @@ const MAX_METADATA_BYTES: u64 = 50 * 1024 * 1024;
 /// Items a list answers at most, and when none is asked.
 const MAX_LISTED: usize = 1000;
 
-/// The operations served, as `/v1/config` names them (`updateTable`, a
-/// table's commit, is not yet).
-const ENDPOINTS: [&str; 11] = [
+/// The operations served, as `/v1/config` names them.
+const ENDPOINTS: [&str; 12] = [
     "GET /v1/{prefix}/namespaces",
     "POST /v1/{prefix}/namespaces",
     "GET /v1/{prefix}/namespaces/{namespace}",
@@ -32,6 +31,7 @@ const ENDPOINTS: [&str; 11] = [
     "POST /v1/{prefix}/namespaces/{namespace}/tables",
     "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "POST /v1/{prefix}/tables/rename",
 ];
@@ -56,6 +56,7 @@ pub(super) fn error_type(err: &TError) -> &'static str {
         404 if err.message.contains("namespace") => "NoSuchNamespaceException",
         404 if err.message.contains("table bucket") => "NoSuchWarehouseException",
         404 => "NoSuchTableException",
+        409 if err.kind == "CommitFailedException" => "CommitFailedException",
         409 if err.message.contains("not empty") => "NamespaceNotEmptyException",
         409 if err.message.contains("version token") => "CommitFailedException",
         409 => "AlreadyExistsException",
@@ -99,8 +100,7 @@ pub(super) async fn serve(
                         Method::GET => load_table(ctx, &bucket, at).await,
                         Method::HEAD => table_exists(ctx, &bucket, at).await,
                         Method::DELETE => drop_table(ctx, &bucket, at).await,
-                        // A table's commit (updateTable).
-                        Method::POST => Err(TError::not_implemented("Committing a table")),
+                        Method::POST => commit_table(ctx, &bucket, at).await,
                         _ => Err(TError::not_implemented("This table operation")),
                     }
                 }
@@ -512,6 +512,13 @@ async fn load_table(
         &["GetTableMetadataLocation", "GetTableData"],
     )
     .await?;
+    let file = current_file(ctx, &table).await?;
+    Ok((StatusCode::OK, Some(loaded(&table, Some(file)))))
+}
+
+/// The table's current metadata file, read from its storage (a gzipped
+/// one decompressed).
+async fn current_file(ctx: &Ctx<'_>, table: &TableInfo) -> Result<Value, TError> {
     let Some(location) = table.metadata_location.clone() else {
         return Err(TError::not_found(
             "The table does not exist as an Iceberg table yet: it has no metadata file.",
@@ -540,7 +547,7 @@ async fn load_table(
     };
     let file: Value = serde_json::from_slice(&file)
         .map_err(|_| TError::bad("The table's metadata file is not JSON."))?;
-    Ok((StatusCode::OK, Some(loaded(&table, Some(file)))))
+    Ok(file)
 }
 
 /// The bytes of the metadata file at `location` (`s3://<bucket>/<key>`),
@@ -585,6 +592,132 @@ fn metadata_file(
         done += take;
     }
     Ok(Ok(out))
+}
+
+/// `updateTable`, a table's commit: its requirements checked and updates
+/// applied to its current metadata, written as its next metadata file, and
+/// the table pointed at it if it has not changed since it was read.
+async fn commit_table(
+    ctx: &Ctx<'_>,
+    bucket: &str,
+    at: (String, String),
+) -> Result<(StatusCode, Option<Value>), TError> {
+    only(ctx.input, &["identifier", "requirements", "updates"])?;
+    if let Some(given) = ctx.input.get("identifier").filter(|given| !given.is_null())
+        && identifier(Some(given), "identifier")? != at
+    {
+        return Err(TError::bad("identifier is not the table of the path."));
+    }
+    let list = |field: &str| -> Result<Vec<Value>, TError> {
+        match ctx.input.get(field) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(items)) => Ok(items.clone()),
+            Some(_) => Err(TError::bad(format!("{field} is a list."))),
+        }
+    };
+    let (requirements, updates) = (list("requirements")?, list("updates")?);
+    let (table, _) = table_at(
+        ctx,
+        bucket,
+        &at,
+        &[
+            "UpdateTableMetadataLocation",
+            "PutTableData",
+            "GetTableData",
+        ],
+    )
+    .await?;
+    let base = current_file(ctx, &table).await?;
+    let location = table
+        .metadata_location
+        .clone()
+        .expect("read: it has a metadata file");
+    let now = crate::objects::now_ms();
+    let next = match crate::iceberg_commit::apply(&base, &location, &requirements, &updates, now) {
+        Ok(Some(next)) => next,
+        Ok(None) => {
+            return Ok((
+                StatusCode::OK,
+                Some(json!({ "metadata-location": location, "metadata": base })),
+            ));
+        }
+        Err(crate::iceberg_commit::CommitError::Failed(message)) => {
+            return Err(TError {
+                status: 409,
+                kind: "CommitFailedException",
+                message,
+            });
+        }
+        Err(crate::iceberg_commit::CommitError::Invalid(message)) => {
+            return Err(TError::bad(message));
+        }
+    };
+    // `<version>-<uuid>.metadata.json`, the version after the current's.
+    let version = location
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.split(['-', '.']).next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .map_or_else(
+            || {
+                next["metadata-log"]
+                    .as_array()
+                    .map_or(1, |log| log.len() as u64)
+            },
+            |version| version + 1,
+        );
+    let key = format!("metadata/{version:05}-{}.metadata.json", super::uuid());
+    let next_location = format!("{}/{key}", table.warehouse_location);
+    let body = super::metadata_body(ctx.state, next.to_string(), now).await?;
+    let (account, bucket, who) = (
+        ctx.caller.account.to_string(),
+        bucket.to_string(),
+        ctx.caller.who.to_string(),
+    );
+    let (namespace, name) = at;
+    let (token, new_token) = (table.version_token.clone(), super::uuid().replace('-', ""));
+    let (id, pointed) = (table.id.clone(), next_location.clone());
+    write_with(ctx.state, move |tx| {
+        // Only from the token read (the table has not changed since); a
+        // refusal writes nothing.
+        let pointed_at = tx.update_metadata_location(
+            (&account, &bucket),
+            (&namespace, &name, &id),
+            (&token, &new_token),
+            &pointed,
+            (&who, now),
+        )?;
+        if pointed_at.is_err() {
+            return Ok(pointed_at);
+        }
+        let attrs = truthdb_object::ObjectAttrs {
+            content_type: Some("application/json".to_string()),
+            ..truthdb_object::ObjectAttrs::default()
+        };
+        // Its storage is there with it (the table is, in this transaction).
+        if tx
+            .put_object(
+                &truthdb_object::warehouse_bucket(&id),
+                &key,
+                &body,
+                &attrs,
+                truthdb_object::StorageClass::Standard,
+                now,
+                0,
+            )?
+            .is_err()
+        {
+            return Err(truthdb_core::storage::StorageError::InvalidFile(
+                "a table's storage refused its metadata file".to_string(),
+            ));
+        }
+        Ok(pointed_at)
+    })
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Some(json!({ "metadata-location": next_location, "metadata": next })),
+    ))
 }
 
 async fn table_exists(
