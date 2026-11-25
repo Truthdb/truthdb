@@ -68,6 +68,20 @@ pub(crate) fn apply(
     if table.get("last-updated-ms") == base.get("last-updated-ms") {
         table.insert("last-updated-ms".to_string(), json!(now_ms));
     }
+    // Never before an entry of its logs (Iceberg's Java reader refuses it): a
+    // snapshot's client clock behind the last commit's is not taken.
+    let latest = ["metadata-log", "snapshot-log"]
+        .iter()
+        .flat_map(|field| list(&table, field))
+        .filter_map(|entry| entry.get("timestamp-ms").and_then(Value::as_i64))
+        .max()
+        .unwrap_or_default();
+    if int(&table, "last-updated-ms").unwrap_or_default() < latest {
+        table.insert(
+            "last-updated-ms".to_string(),
+            json!(latest.max(now_ms as i64)),
+        );
+    }
     // The default spec and sort order apply to the current schema.
     let schema = by_id(
         &table,
@@ -92,6 +106,17 @@ pub(crate) fn apply(
     .ok_or_else(|| invalid("The default sort order does not exist."))?;
     crate::iceberg_metadata::check_spec(schema, spec).map_err(CommitError::Invalid)?;
     crate::iceberg_metadata::check_order(schema, order).map_err(CommitError::Invalid)?;
+    // Each spec and order added applies to the current schema too.
+    for id in &added.specs {
+        if let Some(spec) = by_id(&table, "partition-specs", "spec-id", Some(*id)) {
+            crate::iceberg_metadata::check_spec(schema, spec).map_err(CommitError::Invalid)?;
+        }
+    }
+    for id in &added.orders {
+        if let Some(order) = by_id(&table, "sort-orders", "order-id", Some(*id)) {
+            crate::iceberg_metadata::check_order(schema, order).map_err(CommitError::Invalid)?;
+        }
+    }
     Ok(Some(Value::Object(table)))
 }
 
@@ -150,6 +175,63 @@ fn text<'a>(map: &'a Map<String, Value>, field: &str, what: &str) -> Result<&'a 
     map.get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(format!("{what}.{field} is a string.")))
+}
+
+/// Whether `text` is a UUID (8-4-4-4-12 hexadecimal digits).
+fn is_uuid(text: &str) -> bool {
+    text.len() == 36
+        && text.char_indices().all(|(at, c)| {
+            if matches!(at, 8 | 13 | 18 | 23) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// A statistics file (`partition`: a partition statistics file), with the
+/// fields Iceberg's readers require.
+fn check_statistics(file: &Value, partition: bool, what: &str) -> Result<i64, CommitError> {
+    let map = object(file, what)?;
+    let id = number(map, "snapshot-id", what)?;
+    text(map, "statistics-path", what)?;
+    number(map, "file-size-in-bytes", what)?;
+    if partition {
+        return Ok(id);
+    }
+    number(map, "file-footer-size-in-bytes", what)?;
+    if map
+        .get("key-metadata")
+        .is_some_and(|key| !key.is_null() && !key.is_string())
+    {
+        return Err(invalid(format!("{what}.key-metadata is a string.")));
+    }
+    let blobs = map
+        .get("blob-metadata")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid(format!("{what}.blob-metadata is a list.")))?;
+    for blob in blobs {
+        let what = &format!("{what}.blob-metadata[]");
+        let blob = object(blob, what)?;
+        if !matches!(
+            blob.get("type").and_then(Value::as_str),
+            Some("apache-datasketches-theta-v1" | "deletion-vector-v1")
+        ) {
+            return Err(invalid(format!("{what}.type is a blob type.")));
+        }
+        number(blob, "snapshot-id", what)?;
+        number(blob, "sequence-number", what)?;
+        ids(blob, "fields", what)?;
+        if blob.get("properties").is_some_and(|properties| {
+            !properties.is_null()
+                && !properties
+                    .as_object()
+                    .is_some_and(|map| map.values().all(Value::is_string))
+        }) {
+            return Err(invalid(format!("{what}.properties are strings.")));
+        }
+    }
+    Ok(id)
 }
 
 /// A requirement, against the table's current metadata.
@@ -318,6 +400,9 @@ fn apply_update(
     match action {
         "assign-uuid" => {
             let uuid = text(map, "uuid", what)?;
+            if !is_uuid(uuid) {
+                return Err(invalid(format!("{what}.uuid is a UUID.")));
+            }
             if table.get("table-uuid").and_then(Value::as_str) != Some(uuid) {
                 table.insert("table-uuid".to_string(), json!(uuid));
                 added.changed = true;
@@ -461,6 +546,25 @@ fn apply_update(
             let at = number(fields, "timestamp-ms", "snapshot")?;
             let sequence = number(fields, "sequence-number", "snapshot")?;
             text(fields, "manifest-list", "snapshot")?;
+            // Its summary's operation is one of Iceberg's.
+            if let Some(summary) = fields.get("summary").filter(|summary| !summary.is_null()) {
+                let summary = object(summary, "snapshot.summary")?;
+                if !matches!(
+                    summary.get("operation").and_then(Value::as_str),
+                    Some("append" | "replace" | "overwrite" | "delete")
+                ) || summary.values().any(|value| !value.is_string())
+                {
+                    return Err(invalid(
+                        "snapshot.summary is strings, its operation append, replace, overwrite or delete.",
+                    ));
+                }
+            }
+            if fields
+                .get("schema-id")
+                .is_some_and(|id| !id.is_null() && !id.is_i64())
+            {
+                return Err(invalid("snapshot.schema-id is a whole number."));
+            }
             if by_id(table, "snapshots", "snapshot-id", Some(id)).is_some() {
                 return Err(invalid(format!("Snapshot with id {id} already exists")));
             }
@@ -612,7 +716,7 @@ fn apply_update(
             let file = map
                 .get(member)
                 .ok_or_else(|| invalid(format!("{what}.{member} is required.")))?;
-            let id = number(object(file, member)?, "snapshot-id", member)?;
+            let id = check_statistics(file, action == "set-partition-statistics", member)?;
             let mut stats = list(table, field);
             stats.retain(|stat| stat.get("snapshot-id").and_then(Value::as_i64) != Some(id));
             stats.push(file.clone());
@@ -750,6 +854,26 @@ mod tests {
         ));
         // Nothing to change: no next metadata.
         assert_eq!(apply(&second, AT, &[], &[], 999), Ok(None));
+        // A snapshot stamped before the last commit (a client's clock
+        // behind): the table's time does not run back.
+        let behind = apply(
+            &second,
+            "s3://t--table-s3/metadata/00002-c.metadata.json",
+            &[],
+            &append(9, Some(2), 3)
+                .into_iter()
+                .map(|mut update| {
+                    if update["action"] == "add-snapshot" {
+                        update["snapshot"]["timestamp-ms"] = json!(5);
+                    }
+                    update
+                })
+                .collect::<Vec<_>>(),
+            999,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(behind["last-updated-ms"], 999);
     }
 
     #[test]
@@ -908,6 +1032,37 @@ mod tests {
             (
                 json!({"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 9}),
                 "unknown snapshot",
+            ),
+            (
+                json!({"action": "assign-uuid", "uuid": "not-a-uuid"}),
+                "is a UUID",
+            ),
+            (
+                json!({"action": "set-statistics", "statistics": {"snapshot-id": 1}}),
+                "statistics-path",
+            ),
+            (
+                json!({"action": "set-statistics", "statistics": {"snapshot-id": 1,
+                "statistics-path": "s3://t--table-s3/s.puffin", "file-size-in-bytes": 1,
+                "file-footer-size-in-bytes": 1, "blob-metadata": [{"type": "other", "snapshot-id": 1,
+                "sequence-number": 1, "fields": [1]}]}}),
+                "blob type",
+            ),
+            (
+                json!({"action": "set-partition-statistics", "partition-statistics": {"snapshot-id": 1,
+                "statistics-path": "s3://t--table-s3/p.parquet"}}),
+                "file-size-in-bytes",
+            ),
+            // An order added, not the default: its fields checked too.
+            (
+                json!({"action": "add-sort-order", "sort-order": {"order-id": 3, "fields": [{"bogus": 1}]}}),
+                "bogus is not a member",
+            ),
+            (
+                json!({"action": "add-snapshot", "snapshot": {"snapshot-id": 5, "sequence-number": 1,
+                "timestamp-ms": 1, "manifest-list": "s3://t--table-s3/m.avro",
+                "summary": {"operation": "rewrite"}}}),
+                "operation",
             ),
             (
                 json!({"action": "add-encryption-key", "encryption-key": {}}),

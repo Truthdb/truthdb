@@ -664,11 +664,18 @@ async fn commit_table(
                     .as_array()
                     .map_or(1, |log| log.len() as u64)
             },
-            |version| version + 1,
+            |version| version.saturating_add(1),
         );
     let key = format!("metadata/{version:05}-{}.metadata.json", super::uuid());
     let next_location = format!("{}/{key}", table.warehouse_location);
-    let body = super::metadata_body(ctx.state, next.to_string(), now).await?;
+    // As large as a reader takes, at most.
+    let file = next.to_string();
+    if file.len() as u64 > MAX_METADATA_BYTES {
+        return Err(TError::bad(
+            "A metadata.json file over 50MB is not supported.",
+        ));
+    }
+    let body = super::metadata_body(ctx.state, file, now).await?;
     let (account, bucket, who) = (
         ctx.caller.account.to_string(),
         bucket.to_string(),
