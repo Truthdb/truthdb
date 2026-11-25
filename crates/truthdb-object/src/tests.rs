@@ -8944,6 +8944,41 @@ fn maintenance_records_are_kept_per_table_and_bucket_and_tables_are_listed_acros
     assert_eq!(read(Some("t-10"), config), Some(b"ten".to_vec()));
     assert_eq!(read(None, config), Some(b"bucket".to_vec()));
     assert_eq!(read(None, status), None);
+    // Noncurrent objects, listed by key (the status not among them), one
+    // unmarked.
+    for key in ["data/b.parquet", "data/a.parquet"] {
+        assert_eq!(
+            tx(&|tx| tx.put_maintenance(
+                at,
+                Some("t-1"),
+                (MaintenanceRecord::Noncurrent, key),
+                b"5"
+            )),
+            Ok(())
+        );
+    }
+    let marked = || {
+        ObjFile::new(&mut storage.lock())
+            .maintenance_records(at, Some("t-1"), MaintenanceRecord::Noncurrent)
+            .unwrap()
+    };
+    assert_eq!(
+        marked(),
+        [
+            ("data/a.parquet".to_string(), b"5".to_vec()),
+            ("data/b.parquet".to_string(), b"5".to_vec())
+        ]
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.delete_maintenance_record(
+                at,
+                Some("t-1"),
+                (MaintenanceRecord::Noncurrent, "data/a.parquet"),
+            )
+        })
+        .unwrap();
+    assert_eq!(marked().len(), 1);
     // Every account's tables, two a page.
     let mut seen = Vec::new();
     let mut after: Option<Vec<u8>> = None;
