@@ -17951,7 +17951,9 @@ while True:
     events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateBucket"}])["Events"]
     made = [e for e in events if json.loads(e["CloudTrailEvent"])["requestParameters"].get("bucketName") == B]
     listed = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "ListDirectoryBuckets"}])["Events"]
-    if made and listed:
+    uploads = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
+        "AttributeValue": "ListMultipartUploads"}])["Events"]
+    if made and listed and uploads:
         break
     assert time.time() < deadline, events
     time.sleep(0.5)
@@ -17962,8 +17964,6 @@ assert general and general[0]["EventSource"] == "s3.amazonaws.com", events
 made_record = json.loads(made[0]["CloudTrailEvent"])
 assert made_record["resources"] == [{"accountId": account, "type": "AWS::S3Express::DirectoryBucket",
     "ARN": arn}], made_record
-uploads = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
-    "AttributeValue": "ListMultipartUploads"}])["Events"]
 assert uploads and uploads[0]["EventSource"] == "s3express.amazonaws.com", uploads
 def records(prefix):
     out = []
@@ -18197,5 +18197,147 @@ try:
     raise SystemExit("created with a session")
 except botocore.exceptions.ClientError as error:
     assert error.response["Error"]["Code"] == "NoSuchBucket", error.response
+print("ok")
+"#;
+
+#[test]
+fn rename_object_moves_a_directory_buckets_object_as_s3_express_does() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "renamer");
+    let reader = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3express:CreateSession", "Resource": "*", "Condition": {"StringEquals": {"s3express:SessionMode": "ReadOnly"}}}}"#;
+    let (reader_key, reader_secret) = user_with_key(&server, &account, "reader", Some(reader));
+    let script = server.dir.join("rename.py");
+    std::fs::write(&script, RENAME_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &key,
+            &secret,
+            &reader_key,
+            &reader_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const RENAME_SCRIPT: &str = r#"
+import sys, base64, zlib
+import boto3, botocore.config, botocore.exceptions
+port, key, secret, reader_key, reader_secret = sys.argv[1:6]
+def client(access, secret_key, sessions=True):
+    s3 = {"addressing_style": "path"}
+    if not sessions:
+        s3["disable_s3_express_session_auth"] = True
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3=s3))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+B = "data--use1-az4--x-s3"
+plain = client(key, secret, sessions=False)
+plain.create_bucket(Bucket=B, CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+plain.create_bucket(Bucket="general")
+s3 = client(key, secret)
+missing = lambda name: refused(lambda: s3.head_object(Bucket=B, Key=name), "404")
+# A key alone as its source: the object, whole, with its metadata, ETag and
+# Last-Modified; the source gone.
+s3.put_object(Bucket=B, Key="dir/a b", Body=b"one", ContentType="text/plain", Metadata={"k": "v"})
+before = s3.head_object(Bucket=B, Key="dir/a b", ChecksumMode="ENABLED")
+s3.rename_object(Bucket=B, Key="dir/renamed", RenameSource="dir/a b")
+after = s3.head_object(Bucket=B, Key="dir/renamed", ChecksumMode="ENABLED")
+for field in ["ETag", "LastModified", "ContentType", "Metadata", "ChecksumCRC32", "StorageClass"]:
+    assert after.get(field) == before.get(field), (field, before, after)
+assert s3.get_object(Bucket=B, Key="dir/renamed")["Body"].read() == b"one"
+missing("dir/a b")
+# bucket/key as its source, onto an object there (replaced).
+s3.put_object(Bucket=B, Key="dir/other", Body=b"two")
+s3.rename_object(Bucket=B, Key="dir/renamed", RenameSource=f"{B}/dir/other")
+assert s3.get_object(Bucket=B, Key="dir/renamed")["Body"].read() == b"two"
+missing("dir/other")
+# The destination's conditions.
+s3.put_object(Bucket=B, Key="dir/x", Body=b"x")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/renamed", RenameSource="dir/x",
+    DestinationIfNoneMatch="*"), "PreconditionFailed")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/renamed", RenameSource="dir/x",
+    DestinationIfMatch='"0000"'), "PreconditionFailed")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/none", RenameSource="dir/x",
+    DestinationIfMatch='"0000"'), "PreconditionFailed")
+etag = s3.head_object(Bucket=B, Key="dir/renamed")["ETag"]
+s3.rename_object(Bucket=B, Key="dir/renamed", RenameSource="dir/x", DestinationIfMatch=etag)
+s3.put_object(Bucket=B, Key="dir/y", Body=b"y")
+s3.rename_object(Bucket=B, Key="dir/new", RenameSource="dir/y", DestinationIfNoneMatch="*")
+# A date that does not parse is no condition, the destination there or not.
+s3.put_object(Bucket=B, Key="dir/d", Body=b"d")
+def garbled(request, **_):
+    request.headers["If-Modified-Since"] = "not a date"
+s3.meta.events.register("before-sign.s3.RenameObject", garbled)
+s3.rename_object(Bucket=B, Key="dir/d2", RenameSource="dir/d")
+s3.meta.events.unregister("before-sign.s3.RenameObject", garbled)
+# The source's.
+s3.put_object(Bucket=B, Key="dir/z", Body=b"z")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/z2", RenameSource="dir/z",
+    SourceIfMatch='"0000"'), "PreconditionFailed")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/z2", RenameSource="dir/z",
+    SourceIfNoneMatch="*"), "PreconditionFailed")
+z = s3.head_object(Bucket=B, Key="dir/z")["ETag"]
+s3.rename_object(Bucket=B, Key="dir/z2", RenameSource="dir/z", SourceIfMatch=z)
+# Refused: a missing source, a key ending in /, another bucket's object.
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/q", RenameSource="dir/missing"), "NoSuchKey")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/q/", RenameSource="dir/z2"), "InvalidRequest")
+# Onto itself: as it was.
+s3.rename_object(Bucket=B, Key="dir/z2", RenameSource="dir/z2")
+assert s3.get_object(Bucket=B, Key="dir/z2")["Body"].read() == b"z"
+# A client token: the same rename again is done already; another rename
+# under it is refused.
+s3.put_object(Bucket=B, Key="dir/t", Body=b"t")
+s3.rename_object(Bucket=B, Key="dir/t2", RenameSource="dir/t", ClientToken="token-1")
+s3.rename_object(Bucket=B, Key="dir/t2", RenameSource="dir/t", ClientToken="token-1")
+assert s3.get_object(Bucket=B, Key="dir/t2")["Body"].read() == b"t"
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/t3", RenameSource="dir/t2", ClientToken="token-1"),
+    "IdempotencyParameterMismatch")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/t3", RenameSource="dir/t2", ClientToken="x" * 65),
+    "InvalidArgument")
+# Parameters of the same lengths, other names: another rename.
+s3.put_object(Bucket=B, Key="dir/u", Body=b"u")
+s3.rename_object(Bucket=B, Key="dir/u2", RenameSource="dir/u", ClientToken="token-2")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/v2", RenameSource="dir/v", ClientToken="token-2"),
+    "IdempotencyParameterMismatch")
+# A ReadOnly session renames nothing; a general purpose bucket renames none.
+refused(lambda: client(reader_key, reader_secret).rename_object(Bucket=B, Key="dir/r",
+    RenameSource="dir/t2"), "AccessDenied")
+plain.put_object(Bucket="general", Key="g", Body=b"g")
+refused(lambda: plain.rename_object(Bucket="general", Key="g2", RenameSource="g"), "NotImplemented")
+# A multipart object keeps its parts' checksums.
+made = s3.create_multipart_upload(Bucket=B, Key="dir/big", ChecksumAlgorithm="CRC32",
+    ChecksumType="FULL_OBJECT")
+first, last = b"p" * (5 * 1024 * 1024), b"the last part"
+listed = []
+for number, data in enumerate([first, last], 1):
+    sent = s3.upload_part(Bucket=B, Key="dir/big", UploadId=made["UploadId"], PartNumber=number,
+        Body=data, ChecksumAlgorithm="CRC32")
+    listed.append({"PartNumber": number, "ETag": sent["ETag"], "ChecksumCRC32": sent["ChecksumCRC32"]})
+s3.complete_multipart_upload(Bucket=B, Key="dir/big", UploadId=made["UploadId"],
+    MultipartUpload={"Parts": listed}, ChecksumType="FULL_OBJECT")
+s3.rename_object(Bucket=B, Key="dir/moved", RenameSource="dir/big")
+part = s3.head_object(Bucket=B, Key="dir/moved", PartNumber=1, ChecksumMode="ENABLED")
+assert part["ChecksumCRC32"] == base64.b64encode(zlib.crc32(first).to_bytes(4, "big")).decode(), part
 print("ok")
 "#;

@@ -669,6 +669,68 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(info))
     }
 
+    /// Renames `source` (the current version of `bucket`'s `from`, with its
+    /// attributes `attrs`) to `to`, in this transaction (RenameObject): a
+    /// version there with its body, attributes, part checksums and
+    /// Last-Modified, replacing `to`'s null version, and `source` removed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rename_object(
+        &mut self,
+        bucket: &str,
+        (from, source): (&str, &ObjectInfo),
+        attrs: &ObjectAttrs,
+        to: &str,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<Result<ObjectInfo, ObjectError>, StorageError> {
+        if let Err(err) = validate_key(to) {
+            return Ok(Err(err));
+        }
+        let Some(bucket_row) = self.bucket_row(bucket)? else {
+            return Ok(Err(ObjectError::NoSuchBucket));
+        };
+        // Onto itself it is already so (the steps below would remove it).
+        if from == to {
+            return Ok(Ok(source.clone()));
+        }
+        let sums = match source.parts > 0 {
+            true => self.part_checksums_of((bucket, from, source.version))?,
+            false => Vec::new(),
+        };
+        // Its body is the new version's too, before the source lets it go.
+        self.add_ref(source.body)?;
+        let version = next_counter(self, NEXT_VERSION_KEY)?;
+        let renamed = self.insert_version_as(
+            bucket,
+            to,
+            bucket_row.versioning,
+            NewVersion {
+                body: source.body,
+                size: source.size,
+                md5: source.md5,
+                parts: source.parts,
+                storage_class: source.storage_class,
+            },
+            attrs,
+            Some((version, source.mtime_ms)),
+            now_ms,
+            grace_ms,
+        )?;
+        self.put_part_checksums((bucket, to, renamed.version), &sums)?;
+        let which = match source.null_version {
+            true => VersionSel::Null,
+            false => VersionSel::Seq(source.version),
+        };
+        // The source was read in this lock hold: its removal fails only if
+        // the storage does, and then nothing of the rename stays.
+        if let Err(err) = self.delete_object(bucket, from, Some(which), false, now_ms, grace_ms)? {
+            return Err(StorageError::InvalidFile(format!(
+                "a renamed version could not be removed: {err:?}"
+            )));
+        }
+        Ok(Ok(renamed))
+    }
+
     /// Writes a version of `key` holding `version.body`'s one reference and,
     /// unless versioning is enabled, replaces the key's null version. A
     /// rule of the bucket's replication configuration that applies to it

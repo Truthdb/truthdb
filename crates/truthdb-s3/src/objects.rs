@@ -673,7 +673,7 @@ pub(crate) fn http_date(ms: u64) -> String {
     )
 }
 
-fn parse_http_date(value: &str) -> Option<u64> {
+pub(crate) fn parse_http_date(value: &str) -> Option<u64> {
     httpdate::parse_http_date(value)
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1015,6 +1015,7 @@ pub async fn get_object(
         trail_flush: state.trail_flush,
         trail_selectors: state.trail_selectors.clone(),
         sessions: state.sessions.clone(),
+        rename_tokens: state.rename_tokens.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {

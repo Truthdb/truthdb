@@ -175,6 +175,7 @@ pub async fn copy_object(
         trail_flush: state.trail_flush,
         trail_selectors: state.trail_selectors.clone(),
         sessions: state.sessions.clone(),
+        rename_tokens: state.rename_tokens.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
@@ -607,6 +608,7 @@ pub async fn upload_part_copy(
         trail_flush: state.trail_flush,
         trail_selectors: state.trail_selectors.clone(),
         sessions: state.sessions.clone(),
+        rename_tokens: state.rename_tokens.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     let part = tokio::spawn(crate::scope::within(scope, async move {

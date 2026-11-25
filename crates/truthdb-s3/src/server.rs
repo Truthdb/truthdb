@@ -72,6 +72,8 @@ pub struct S3State {
     pub trail_selectors: std::sync::Arc<crate::trails::TrailCache>,
     /// Directory buckets' sessions (CreateSession), in memory.
     pub sessions: std::sync::Arc<crate::session::Sessions>,
+    /// RenameObject's client tokens, in memory.
+    pub rename_tokens: std::sync::Arc<crate::rename::RenameTokens>,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
