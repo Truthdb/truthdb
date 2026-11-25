@@ -142,6 +142,24 @@ fn table_row(table: &TableInfo) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Where a list's scan starts: past `after` (the smallest key above it),
+/// or at `prefix`, within the range of `parts`.
+fn start(parts: &[&str], prefix: &str, after: Option<&str>) -> Vec<u8> {
+    let mut at_prefix = parts.to_vec();
+    at_prefix.push(prefix);
+    let from = key(&at_prefix);
+    match after {
+        Some(after) => {
+            let mut past = parts.to_vec();
+            past.push(after);
+            let mut past = key(&past);
+            past.push(0);
+            past.max(from)
+        }
+        None => from,
+    }
+}
+
 /// The last part of a key (after its last 0 byte).
 fn last(key: &[u8]) -> Result<String, StorageError> {
     let at = key
@@ -312,14 +330,18 @@ impl ObjTxn<'_, '_> {
             .transpose()
     }
 
-    /// Deletes a table, if `version_token` (when given) is its own.
+    /// Deletes the table of id `id` at that name, if `version_token` (when
+    /// given) is its own: one of the name made since is not it.
     pub fn delete_table(
         &mut self,
         (account, bucket): (&str, &str),
-        (namespace, name): (&str, &str),
+        (namespace, name, id): (&str, &str, &str),
         version_token: Option<&str>,
     ) -> Result<Result<TableInfo, TableError>, StorageError> {
-        let Some(table) = self.table_in((account, bucket), (namespace, name))? else {
+        let Some(table) = self
+            .table_in((account, bucket), (namespace, name))?
+            .filter(|table| table.id == id)
+        else {
             return Ok(Err(TableError::NoSuchTable));
         };
         if version_token.is_some_and(|token| token != table.version_token) {
@@ -338,18 +360,22 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(table))
     }
 
-    /// Renames a table (to another namespace of its bucket, or another
-    /// name), if `version_token` (when given) is its own: its id stays.
+    /// Renames the table of id `id` (to another namespace of its bucket, or
+    /// another name), if `version_token` (when given) is its own: its id
+    /// stays, and one of the name made since is not it.
     #[allow(clippy::too_many_arguments)]
     pub fn rename_table(
         &mut self,
         (account, bucket): (&str, &str),
-        (namespace, name): (&str, &str),
+        (namespace, name, id): (&str, &str, &str),
         (to_namespace, to_name): (&str, &str),
         version_token: Option<&str>,
         (modified_by, now_ms): (&str, u64),
     ) -> Result<Result<(), TableError>, StorageError> {
-        let Some(mut table) = self.table_in((account, bucket), (namespace, name))? else {
+        let Some(mut table) = self
+            .table_in((account, bucket), (namespace, name))?
+            .filter(|table| table.id == id)
+        else {
             return Ok(Err(TableError::NoSuchTable));
         };
         if version_token.is_some_and(|token| token != table.version_token) {
@@ -452,18 +478,20 @@ impl ObjFile<'_> {
         let Some(tree) = self.existing_tree(TABLE_BUCKETS_TREE)? else {
             return Ok(Vec::new());
         };
-        let (lower, upper) = range(&[account]);
+        let (_, upper) = range(&[account]);
+        let lower = start(&[account], prefix, after);
         let mut out = Vec::new();
-        for (row_key, row) in
-            tree.scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
-        {
+        for (row_key, row) in tree.scan_range_limit(
+            &mut self.core.page_ctx(0),
+            Some(&lower),
+            Some(&upper),
+            limit,
+        )? {
             let name = last(&row_key)?;
-            if name.starts_with(prefix) && after.is_none_or(|after| name.as_str() > after) {
-                out.push(bucket_info(&name, &row)?);
-                if out.len() == limit {
-                    break;
-                }
+            if !name.starts_with(prefix) {
+                break;
             }
+            out.push(bucket_info(&name, &row)?);
         }
         Ok(out)
     }
@@ -494,18 +522,20 @@ impl ObjFile<'_> {
         let Some(tree) = self.existing_tree(TABLE_NAMESPACES_TREE)? else {
             return Ok(Vec::new());
         };
-        let (lower, upper) = range(&[account, bucket]);
+        let (_, upper) = range(&[account, bucket]);
+        let lower = start(&[account, bucket], prefix, after);
         let mut out = Vec::new();
-        for (row_key, row) in
-            tree.scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
-        {
+        for (row_key, row) in tree.scan_range_limit(
+            &mut self.core.page_ctx(0),
+            Some(&lower),
+            Some(&upper),
+            limit,
+        )? {
             let name = last(&row_key)?;
-            if name.starts_with(prefix) && after.is_none_or(|after| name.as_str() > after) {
-                out.push(namespace_info(&name, &row)?);
-                if out.len() == limit {
-                    break;
-                }
+            if !name.starts_with(prefix) {
+                break;
             }
+            out.push(namespace_info(&name, &row)?);
         }
         Ok(out)
     }
@@ -562,21 +592,48 @@ impl ObjFile<'_> {
             Some(namespace) => range(&[account, bucket, namespace]),
             None => range(&[account, bucket]),
         };
+        // Past `after` when given (the smallest key above it).
+        let lower = match after {
+            Some((space, name)) => {
+                let mut past = key(&[account, bucket, space, name]);
+                past.push(0);
+                past.max(lower)
+            }
+            None => lower,
+        };
         let mut out = Vec::new();
-        for (row_key, row) in
-            tree.scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
-        {
-            let text = String::from_utf8(row_key).map_err(|_| corrupt("table key"))?;
-            let mut parts = text.rsplitn(3, '\0');
-            let (Some(name), Some(space)) = (parts.next(), parts.next()) else {
-                return Err(corrupt("table key"));
+        let mut from = lower;
+        // A page of the rows (prefix is per namespace: filtered here).
+        while out.len() < limit {
+            let rows = tree.scan_range_limit(
+                &mut self.core.page_ctx(0),
+                Some(&from),
+                Some(&upper),
+                limit,
+            )?;
+            let Some((last_key, _)) = rows.last() else {
+                break;
             };
-            if name.starts_with(prefix) && after.is_none_or(|after| (space, name) > after) {
-                out.push(table_info(space, name, &row)?);
-                if out.len() == limit {
-                    break;
+            let mut next = last_key.clone();
+            next.push(0);
+            let full = rows.len() == limit;
+            for (row_key, row) in rows {
+                let text = String::from_utf8(row_key).map_err(|_| corrupt("table key"))?;
+                let mut parts = text.rsplitn(3, '\0');
+                let (Some(name), Some(space)) = (parts.next(), parts.next()) else {
+                    return Err(corrupt("table key"));
+                };
+                if name.starts_with(prefix) {
+                    out.push(table_info(space, name, &row)?);
+                    if out.len() == limit {
+                        break;
+                    }
                 }
             }
+            if !full {
+                break;
+            }
+            from = next;
         }
         Ok(out)
     }

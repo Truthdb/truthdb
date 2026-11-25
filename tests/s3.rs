@@ -18551,6 +18551,32 @@ warehouse = by_name["warehouseLocation"]
 assert warehouse.startswith("s3://") and warehouse.endswith("--table-s3") and "metadataLocation" not in by_name, by_name
 listed = t.list_tables(tableBucketARN=arn, namespace="sales")["tables"]
 assert [(x["name"], x["tableARN"]) for x in listed] == [("orders", table_arn)], listed
+# In pages, across namespaces, and by prefix.
+for space, name in [("archive", "a1"), ("archive", "b2"), ("sales", "a3")]:
+    t.create_table(tableBucketARN=arn, namespace=space, name=name, format="ICEBERG")
+seen, next_page = [], None
+while True:
+    page = t.list_tables(tableBucketARN=arn, maxTables=1, **({"continuationToken": next_page} if next_page else {}))
+    seen += [(x["namespace"][0], x["name"]) for x in page["tables"]]
+    next_page = page.get("continuationToken")
+    if not next_page:
+        break
+assert seen == [("archive", "a1"), ("archive", "b2"), ("sales", "a3"), ("sales", "orders")], seen
+assert [x["name"] for x in t.list_tables(tableBucketARN=arn, prefix="a")["tables"]] == ["a1", "a3"]
+spaces = t.list_namespaces(tableBucketARN=arn, maxNamespaces=1)
+assert [n["namespace"] for n in spaces["namespaces"]] == [["archive"]], spaces
+spaces = t.list_namespaces(tableBucketARN=arn, maxNamespaces=1, continuationToken=spaces["continuationToken"])
+assert [n["namespace"] for n in spaces["namespaces"]] == [["sales"]] and "continuationToken" not in spaces, spaces
+for space, name in [("archive", "a1"), ("archive", "b2"), ("sales", "a3")]:
+    t.delete_table(tableBucketARN=arn, namespace=space, name=name)
+refused(lambda: t.list_table_buckets(type="other"), "BadRequestException")
+# Whether a table is there is said only to whom may get it.
+nobody = client(nobody_key, nobody_secret)
+refused(lambda: nobody.get_table(tableBucketARN=arn, namespace="sales", name="missing"), "ForbiddenException")
+refused(lambda: nobody.get_table(tableBucketARN=arn, namespace="sales", name="orders"), "ForbiddenException")
+refused(lambda: nobody.get_table_metadata_location(tableBucketARN=arn, namespace="sales", name="missing"),
+    "ForbiddenException")
+refused(lambda: t.get_table(tableBucketARN=arn, namespace="sales", name="missing"), "NotFoundException")
 # The metadata pointer: swapped only from the current token, only to a
 # metadata file of its warehouse.
 location = t.get_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders")

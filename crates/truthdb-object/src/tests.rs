@@ -8471,17 +8471,28 @@ fn a_table_catalog_keeps_buckets_namespaces_and_tables_with_a_versioned_pointer(
     assert_eq!(
         tx(&|tx| tx.rename_table(
             at,
-            ("sales", "orders"),
+            ("sales", "orders", "t-1"),
             ("archive", "old"),
             Some("v1"),
             ("me", 6)
         )),
         Err(TableError::VersionMismatch)
     );
+    // Another table's id (one made since at the name): not it.
     assert_eq!(
         tx(&|tx| tx.rename_table(
             at,
-            ("sales", "orders"),
+            ("sales", "orders", "t-0"),
+            ("archive", "old"),
+            Some("v2"),
+            ("me", 6)
+        )),
+        Err(TableError::NoSuchTable)
+    );
+    assert_eq!(
+        tx(&|tx| tx.rename_table(
+            at,
+            ("sales", "orders", "t-1"),
             ("archive", "old"),
             Some("v2"),
             ("me", 6)
@@ -8508,11 +8519,19 @@ fn a_table_catalog_keeps_buckets_namespaces_and_tables_with_a_versioned_pointer(
     // Deleted with its token: then the namespaces and the bucket can go.
     let delete = |token: Option<&'static str>| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.delete_table(at, ("archive", "old"), token))
+            .transaction(|tx| tx.delete_table(at, ("archive", "old", "t-1"), token))
             .unwrap()
             .map(|_| ())
     };
     assert_eq!(delete(Some("v1")), Err(TableError::VersionMismatch));
+    // Another table's id (one made since at the name): not it.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("archive", "old", "t-0"), None))
+            .unwrap()
+            .map(|_| ()),
+        Err(TableError::NoSuchTable)
+    );
     assert_eq!(delete(Some("v2")), Ok(()));
     assert_eq!(
         ObjFile::new(&mut storage.lock())

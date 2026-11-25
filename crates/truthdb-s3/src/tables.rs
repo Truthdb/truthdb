@@ -406,8 +406,13 @@ async fn serve(
             }
             (&Method::GET, ["buckets"]) => {
                 check("ListTableBuckets", "*")?;
-                if param(&params, "type").is_some_and(|kind| kind != "customer") {
-                    return Ok((StatusCode::OK, Some(json!({ "tableBuckets": [] }))));
+                match param(&params, "type") {
+                    None | Some("customer") => {}
+                    // AWS's own table buckets: none here.
+                    Some("aws") => {
+                        return Ok((StatusCode::OK, Some(json!({ "tableBuckets": [] }))));
+                    }
+                    Some(_) => return Err(TError::bad("type is customer or aws.")),
                 }
                 let limit = page_size(&params, "maxBuckets")?;
                 let after = untoken(&params)?;
@@ -640,7 +645,12 @@ async fn serve(
                         (bucket, table)
                     }
                 };
-                let table = table.ok_or_else(|| table_error(TableError::NoSuchTable))?;
+                // A table that is not there is said only to whom may get
+                // the bucket's tables.
+                let Some(table) = table else {
+                    check("GetTable", &caller.table_arn(&bucket, "*"))?;
+                    return Err(table_error(TableError::NoSuchTable));
+                };
                 let table_arn = caller.table_arn(&bucket, &table.id);
                 check("GetTable", &table_arn)?;
                 let found = find_bucket(state, &caller, &bucket).await?;
@@ -668,26 +678,42 @@ async fn serve(
                 let bucket = caller.bucket_of(arn)?;
                 let namespace = namespace_name(namespace)?.to_string();
                 let name = table_name(name)?.to_string();
+                // The operation's action, known before the table is read (an
+                // operation not built here is refused before it).
+                let action = match (method, rest) {
+                    (&Method::DELETE, []) => "DeleteTable",
+                    (&Method::PUT, ["rename"]) => "RenameTable",
+                    (&Method::GET, ["metadata-location"]) => "GetTableMetadataLocation",
+                    (&Method::PUT, ["metadata-location"]) => "UpdateTableMetadataLocation",
+                    (_, ["policy"]) => return Err(TError::not_implemented("A table policy")),
+                    _ => return Err(TError::not_implemented("This table operation")),
+                };
                 let (account, looked) = (caller.account.to_string(), bucket.clone());
                 let (space, named) = (namespace.clone(), name.clone());
-                let table = read(state, move |file| file.table((&account, &looked), (&space, &named)))
-                    .await?
-                    .ok_or_else(|| table_error(TableError::NoSuchTable))?;
+                let Some(table) =
+                    read(state, move |file| file.table((&account, &looked), (&space, &named))).await?
+                else {
+                    // Said only to whom may act on the bucket's tables.
+                    check(action, &caller.table_arn(&bucket, "*"))?;
+                    return Err(table_error(TableError::NoSuchTable));
+                };
                 let table_arn = caller.table_arn(&bucket, &table.id);
+                check(action, &table_arn)?;
                 let account = caller.account.to_string();
+                let id = table.id.clone();
                 match (method, rest) {
                     (&Method::DELETE, []) => {
-                        check("DeleteTable", &table_arn)?;
                         let token = param(&params, "versionToken").map(str::to_string);
+                        // The very table authorized (one renamed into its
+                        // name since is not it).
                         write(state, move |tx| {
-                            tx.delete_table((&account, &bucket), (&namespace, &name), token.as_deref())
+                            tx.delete_table((&account, &bucket), (&namespace, &name, &id), token.as_deref())
                                 .map(|deleted| deleted.map(|_| ()))
                         })
                         .await?;
                         Ok((StatusCode::NO_CONTENT, None))
                     }
                     (&Method::PUT, ["rename"]) => {
-                        check("RenameTable", &table_arn)?;
                         refuse_extras(&input, &["newNamespaceName", "newName", "versionToken"])?;
                         let to_namespace = string(&input, "newNamespaceName")?
                             .map(namespace_name)
@@ -704,7 +730,7 @@ async fn serve(
                         write(state, move |tx| {
                             tx.rename_table(
                                 (&account, &bucket),
-                                (&namespace, &name),
+                                (&namespace, &name, &id),
                                 (&to_namespace, &to_name),
                                 token.as_deref(),
                                 (&who, crate::objects::now_ms()),
@@ -714,7 +740,6 @@ async fn serve(
                         Ok((StatusCode::NO_CONTENT, None))
                     }
                     (&Method::GET, ["metadata-location"]) => {
-                        check("GetTableMetadataLocation", &table_arn)?;
                         let mut answer = json!({
                             "versionToken": table.version_token,
                             "warehouseLocation": table.warehouse_location,
@@ -725,7 +750,6 @@ async fn serve(
                         Ok((StatusCode::OK, Some(answer)))
                     }
                     (&Method::PUT, ["metadata-location"]) => {
-                        check("UpdateTableMetadataLocation", &table_arn)?;
                         refuse_extras(&input, &["versionToken", "metadataLocation"])?;
                         let token = required(&input, "versionToken")?.to_string();
                         let location = required(&input, "metadataLocation")?.to_string();
@@ -763,8 +787,7 @@ async fn serve(
                             })),
                         ))
                     }
-                    (_, ["policy"]) => Err(TError::not_implemented("A table policy")),
-                    _ => Err(TError::not_implemented("This table operation")),
+                    _ => unreachable!("an action for each operation, above"),
                 }
             }
             _ => Err(TError::not_implemented("This S3 Tables operation")),
