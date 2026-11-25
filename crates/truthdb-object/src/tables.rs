@@ -420,7 +420,8 @@ impl ObjTxn<'_, '_> {
             &key(&[account, bucket, &table.id]),
             &key(&[&table.namespace, &table.name]),
         )?;
-        // Its files' bucket, made with it (its id is new: no bucket has it).
+        // Its files' bucket, made with it (its id is new: no bucket has it;
+        // one that did would leave the table without it, so nothing is made).
         if self
             .create_warehouse(
                 &warehouse_bucket(&table.id),
@@ -430,7 +431,9 @@ impl ObjTxn<'_, '_> {
             )?
             .is_err()
         {
-            return Ok(Err(TableError::Exists));
+            return Err(StorageError::InvalidFile(
+                "a new table's storage bucket exists already".to_string(),
+            ));
         }
         Ok(Ok(()))
     }
