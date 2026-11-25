@@ -193,9 +193,9 @@ fn table_name(name: &str) -> Result<&str, TError> {
 /// What a request is about: the caller's region and account.
 struct Caller<'a> {
     region: &'a str,
+    /// Its account: also who made a change, as `createdBy` and
+    /// `modifiedBy` name it (an account id).
     account: &'a str,
-    /// Who made it, as `createdBy` and `modifiedBy` name it.
-    who: String,
 }
 
 impl Caller<'_> {
@@ -361,14 +361,9 @@ async fn serve(
         Vec::new(),
     )
     .await?;
-    let who = principal.user.as_ref().map_or_else(
-        || principal.account.clone(),
-        |_| principal.access_key.clone(),
-    );
     let caller = Caller {
         region: &state.region,
         account: &principal.account,
-        who,
     };
     let path = segments(parts.uri.path())?;
     let params = query(parts.uri.query().unwrap_or(""));
@@ -460,7 +455,7 @@ async fn serve(
                 };
                 let namespace = namespace_name(namespace)?.to_string();
                 check("CreateNamespace", arn)?;
-                let (account, id, who) = (caller.account.to_string(), uuid(), caller.who.clone());
+                let (account, id, who) = (caller.account.to_string(), uuid(), caller.account.to_string());
                 let created = namespace.clone();
                 write(state, move |tx| {
                     tx.create_namespace(
@@ -543,9 +538,9 @@ async fn serve(
                     name,
                     id: id.clone(),
                     created_ms: now,
-                    created_by: caller.who.clone(),
+                    created_by: caller.account.to_string(),
                     modified_ms: now,
-                    modified_by: caller.who.clone(),
+                    modified_by: caller.account.to_string(),
                     metadata_location: None,
                     version_token: uuid().replace('-', ""),
                     warehouse_location: format!("s3://{id}--table-s3"),
@@ -583,14 +578,25 @@ async fn serve(
                 let prefix = param(&params, "prefix").unwrap_or("").to_string();
                 let account = caller.account.to_string();
                 let listed_bucket = bucket.clone();
-                let mut tables = read(state, move |file| {
-                    file.list_tables(
+                // With the ids of their namespaces, read with them.
+                let (mut tables, namespace_ids) = read(state, move |file| {
+                    let tables = file.list_tables(
                         (&account, &listed_bucket),
                         namespace.as_deref(),
                         &prefix,
                         after.as_ref().map(|(space, name)| (space.as_str(), name.as_str())),
                         limit + 1,
-                    )
+                    )?;
+                    let mut ids = std::collections::BTreeMap::new();
+                    for table in &tables {
+                        if !ids.contains_key(&table.namespace)
+                            && let Some(space) =
+                                file.namespace((&account, &listed_bucket), &table.namespace)?
+                        {
+                            ids.insert(table.namespace.clone(), space.id);
+                        }
+                    }
+                    Ok((tables, ids))
                 })
                 .await?;
                 let more = tables.len() > limit;
@@ -603,6 +609,7 @@ async fn serve(
                         "tableARN": caller.table_arn(&bucket, &table.id),
                         "createdAt": at(table.created_ms),
                         "modifiedAt": at(table.modified_ms),
+                        "namespaceId": namespace_ids.get(&table.namespace),
                         "tableBucketId": found.id,
                     })).collect::<Vec<_>>(),
                 });
@@ -654,11 +661,17 @@ async fn serve(
                 let table_arn = caller.table_arn(&bucket, &table.id);
                 check("GetTable", &table_arn)?;
                 let found = find_bucket(state, &caller, &bucket).await?;
+                let (account, looked, space) =
+                    (caller.account.to_string(), bucket.clone(), table.namespace.clone());
+                let namespace_id = read(state, move |file| file.namespace((&account, &looked), &space))
+                    .await?
+                    .map(|space| space.id);
                 let mut answer = json!({
                     "name": table.name,
                     "type": "customer",
                     "tableARN": table_arn,
                     "namespace": [table.namespace],
+                    "namespaceId": namespace_id,
                     "versionToken": table.version_token,
                     "warehouseLocation": table.warehouse_location,
                     "createdAt": at(table.created_ms),
@@ -726,7 +739,7 @@ async fn serve(
                             .unwrap_or(&name)
                             .to_string();
                         let token = string(&input, "versionToken")?.map(str::to_string);
-                        let who = caller.who.clone();
+                        let who = caller.account.to_string();
                         write(state, move |tx| {
                             tx.rename_table(
                                 (&account, &bucket),
@@ -765,11 +778,11 @@ async fn serve(
                                 "The metadata location is a .metadata.json (or .metadata.json.gz) file in the table's warehouse location.",
                             ));
                         }
-                        let (who, next) = (caller.who.clone(), uuid().replace('-', ""));
+                        let (who, next) = (caller.account.to_string(), uuid().replace('-', ""));
                         let updated = write_with(state, move |tx| {
                             tx.update_metadata_location(
                                 (&account, &bucket),
-                                (&namespace, &name),
+                                (&namespace, &name, &id),
                                 (&token, &next),
                                 &location,
                                 (&who, crate::objects::now_ms()),

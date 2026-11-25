@@ -18468,6 +18468,10 @@ fn s3_tables_keep_table_buckets_namespaces_and_tables_as_aws_does() {
     let (account, key, secret) = account_with_key(&server, "tabler");
     let (other_account, _, _) = account_with_key(&server, "others");
     let (nobody_key, nobody_secret) = user_with_key(&server, &account, "nobody", None);
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:*", "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (maker_key, maker_secret) = user_with_key(&server, &account, "maker", Some(&policy));
     let script = server.dir.join("tables.py");
     std::fs::write(&script, TABLES_SCRIPT).expect("script");
     let output = Command::new(&python)
@@ -18480,6 +18484,8 @@ fn s3_tables_keep_table_buckets_namespaces_and_tables_as_aws_does() {
             &other_account,
             &nobody_key,
             &nobody_secret,
+            &maker_key,
+            &maker_secret,
         ])
         .output()
         .expect("run python");
@@ -18497,7 +18503,7 @@ fn s3_tables_keep_table_buckets_namespaces_and_tables_as_aws_does() {
 const TABLES_SCRIPT: &str = r#"
 import sys
 import boto3, botocore.config, botocore.exceptions
-port, account, key, secret, other_account, nobody_key, nobody_secret = sys.argv[1:8]
+port, account, key, secret, other_account, nobody_key, nobody_secret, maker_key, maker_secret = sys.argv[1:10]
 def client(access, secret_key):
     return boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
         aws_access_key_id=access, aws_secret_access_key=secret_key,
@@ -18547,10 +18553,11 @@ by_name = t.get_table(tableBucketARN=arn, namespace="sales", name="orders")
 by_arn = t.get_table(tableArn=table_arn)
 assert by_name == by_arn | {"ResponseMetadata": by_name["ResponseMetadata"]}, (by_name, by_arn)
 assert (by_name["format"], by_name["versionToken"], by_name["namespace"]) == ("ICEBERG", token, ["sales"]), by_name
+assert by_name["namespaceId"] == space["namespaceId"], (by_name, space)
 warehouse = by_name["warehouseLocation"]
 assert warehouse.startswith("s3://") and warehouse.endswith("--table-s3") and "metadataLocation" not in by_name, by_name
 listed = t.list_tables(tableBucketARN=arn, namespace="sales")["tables"]
-assert [(x["name"], x["tableARN"]) for x in listed] == [("orders", table_arn)], listed
+assert [(x["name"], x["tableARN"], x["namespaceId"]) for x in listed] == [("orders", table_arn, space["namespaceId"])], listed
 # In pages, across namespaces, and by prefix.
 for space, name in [("archive", "a1"), ("archive", "b2"), ("sales", "a3")]:
     t.create_table(tableBucketARN=arn, namespace=space, name=name, format="ICEBERG")
@@ -18598,6 +18605,8 @@ t.rename_table(tableBucketARN=arn, namespace="sales", name="orders", newNamespac
     newName="orders_2024", versionToken=token)
 moved = t.get_table(tableArn=table_arn)
 assert (moved["namespace"], moved["name"]) == (["archive"], "orders_2024"), moved
+archive = t.get_namespace(tableBucketARN=arn, namespace="archive")
+assert moved["namespaceId"] == archive["namespaceId"] != by_name["namespaceId"], (moved, archive)
 # Not empty: neither the namespace nor the bucket goes.
 refused(lambda: t.delete_namespace(tableBucketARN=arn, namespace="archive"), "ConflictException")
 refused(lambda: t.delete_table_bucket(tableBucketARN=arn), "ConflictException")
@@ -18613,7 +18622,16 @@ theirs = arn.replace(account, other_account)
 refused(lambda: t.get_table_bucket(tableBucketARN=theirs), "ForbiddenException")
 refused(lambda: client(nobody_key, nobody_secret).get_table_bucket(tableBucketARN=arn), "ForbiddenException")
 refused(lambda: client(nobody_key, nobody_secret).create_table_bucket(name="mine"), "ForbiddenException")
-for space in ["sales", "archive"]:
+# A user's changes are by its account (createdBy and modifiedBy are
+# account ids), not its access key.
+maker = client(maker_key, maker_secret)
+maker.create_namespace(tableBucketARN=arn, namespace=["made"])
+made_table = maker.create_table(tableBucketARN=arn, namespace="made", name="t", format="ICEBERG")
+assert maker.get_namespace(tableBucketARN=arn, namespace="made")["createdBy"] == account
+got_table = maker.get_table(tableArn=made_table["tableARN"])
+assert (got_table["createdBy"], got_table["modifiedBy"]) == (account, account), got_table
+maker.delete_table(tableBucketARN=arn, namespace="made", name="t")
+for space in ["sales", "archive", "made"]:
     t.delete_namespace(tableBucketARN=arn, namespace=space)
 t.delete_table_bucket(tableBucketARN=arn)
 refused(lambda: t.get_table_bucket(tableBucketARN=arn), "NotFoundException")

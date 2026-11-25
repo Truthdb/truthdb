@@ -8440,12 +8440,12 @@ fn a_table_catalog_keeps_buckets_namespaces_and_tables_with_a_versioned_pointer(
             .unwrap()
     };
     // The pointer: swapped only from its current token.
-    let swap = |token: &'static str, next: &'static str| {
+    let swap_of = |id: &'static str, token: &'static str, next: &'static str| {
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
                 tx.update_metadata_location(
                     at,
-                    ("sales", "orders"),
+                    ("sales", "orders", id),
                     (token, next),
                     "s3://t-1--table-s3/metadata/00001.metadata.json",
                     ("me", 4),
@@ -8454,6 +8454,9 @@ fn a_table_catalog_keeps_buckets_namespaces_and_tables_with_a_versioned_pointer(
             .unwrap()
             .map(|table| table.version_token)
     };
+    let swap = |token, next| swap_of("t-1", token, next);
+    // Another table's id (one made since at the name): not it.
+    assert_eq!(swap_of("t-0", "v1", "v2"), Err(TableError::NoSuchTable));
     assert_eq!(swap("v0", "v2"), Err(TableError::VersionMismatch));
     assert_eq!(swap("v1", "v2"), Ok("v2".to_string()));
     assert_eq!(

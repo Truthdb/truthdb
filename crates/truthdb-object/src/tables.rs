@@ -421,18 +421,22 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(()))
     }
 
-    /// Points a table at metadata file `location`, if `version_token` is
-    /// its own (compare-and-swap): its token is then `new_token`.
+    /// Points the table of id `id` at metadata file `location`, if
+    /// `version_token` is its own (compare-and-swap): its token is then
+    /// `new_token`. One of the name made since is not it.
     #[allow(clippy::too_many_arguments)]
     pub fn update_metadata_location(
         &mut self,
         (account, bucket): (&str, &str),
-        (namespace, name): (&str, &str),
+        (namespace, name, id): (&str, &str, &str),
         (version_token, new_token): (&str, &str),
         location: &str,
         (modified_by, now_ms): (&str, u64),
     ) -> Result<Result<TableInfo, TableError>, StorageError> {
-        let Some(mut table) = self.table_in((account, bucket), (namespace, name))? else {
+        let Some(mut table) = self
+            .table_in((account, bucket), (namespace, name))?
+            .filter(|table| table.id == id)
+        else {
             return Ok(Err(TableError::NoSuchTable));
         };
         if version_token != table.version_token {
