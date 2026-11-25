@@ -21,6 +21,7 @@ pub mod directory;
 pub mod error;
 pub mod iam_api;
 mod iceberg_commit;
+mod iceberg_manifests;
 mod iceberg_metadata;
 pub mod inventory_config;
 pub mod inventory_run;
