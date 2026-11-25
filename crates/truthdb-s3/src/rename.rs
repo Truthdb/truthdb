@@ -37,6 +37,9 @@ pub struct RenameTokens(Mutex<Kept>);
 struct Kept {
     by_token: HashMap<(String, String), (Done, u64)>,
     of_account: HashMap<String, usize>,
+    /// When the first of them expires (none: never), so a full store is
+    /// scanned only when one has.
+    earliest: Option<u64>,
 }
 
 impl Kept {
@@ -50,11 +53,16 @@ impl Kept {
         let Kept {
             by_token,
             of_account,
+            earliest,
         } = self;
+        *earliest = None;
         by_token.retain(|(account, _), (_, until)| {
             let kept = *until > now_ms;
             if !kept && let Some(count) = of_account.get_mut(account) {
                 *count -= 1;
+            }
+            if kept {
+                *earliest = Some(earliest.map_or(*until, |at| at.min(*until)));
             }
             kept
         });
@@ -89,17 +97,17 @@ impl RenameTokens {
     fn keep(&self, account: &str, token: &str, done: Done, now_ms: u64) {
         let mut kept = self.0.lock().expect("rename tokens poisoned");
         if kept.full(account) {
-            kept.prune(now_ms);
+            if kept.earliest.is_some_and(|at| at <= now_ms) {
+                kept.prune(now_ms);
+            }
             if kept.full(account) {
                 return;
             }
         }
         let key = (account.to_string(), token.to_string());
-        if kept
-            .by_token
-            .insert(key, (done, now_ms + TOKEN_MS))
-            .is_none()
-        {
+        let until = now_ms + TOKEN_MS;
+        kept.earliest = Some(kept.earliest.map_or(until, |at| at.min(until)));
+        if kept.by_token.insert(key, (done, until)).is_none() {
             *kept.of_account.entry(account.to_string()).or_default() += 1;
         }
     }
@@ -139,6 +147,33 @@ const CONDITIONS: [&str; 8] = [
     "x-amz-rename-source-if-unmodified-since",
 ];
 
+/// The digest of a rename's parameters, as its client token keeps them:
+/// each one's presence (an empty header is not an absent one), then its
+/// length, so none runs into the next.
+fn digest(bucket: &str, key: &str, from: &str, headers: &hyper::HeaderMap) -> Done {
+    let mut parameters = ring::digest::Context::new(&ring::digest::SHA256);
+    let conditions = CONDITIONS.iter().map(|name| header(headers, name));
+    for part in [bucket, key, from]
+        .into_iter()
+        .map(|part| Some(part.to_string()))
+        .chain(conditions)
+    {
+        match part {
+            None => parameters.update(&[0]),
+            Some(part) => {
+                parameters.update(&[1]);
+                parameters.update(&(part.len() as u64).to_le_bytes());
+                parameters.update(part.as_bytes());
+            }
+        }
+    }
+    parameters
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("a SHA-256 digest is 32 bytes")
+}
+
 fn failed() -> S3Error {
     S3Error::new(
         412,
@@ -172,23 +207,7 @@ pub async fn rename_object(
             "x-amz-client-token is 1 to 64 characters of ASCII 33 to 126",
         ));
     }
-    // Its parameters, each length-prefixed so none runs into the next.
-    let mut parameters = ring::digest::Context::new(&ring::digest::SHA256);
-    let conditions = CONDITIONS
-        .iter()
-        .map(|name| header(request.headers(), name).unwrap_or_default());
-    for part in [bucket.clone(), key.clone(), from.clone()]
-        .into_iter()
-        .chain(conditions)
-    {
-        parameters.update(&(part.len() as u64).to_le_bytes());
-        parameters.update(part.as_bytes());
-    }
-    let done: Done = parameters
-        .finish()
-        .as_ref()
-        .try_into()
-        .expect("a SHA-256 digest is 32 bytes");
+    let done = digest(&bucket, &key, &from, request.headers());
     let now = now_ms();
     if let Some(token) = &token {
         match state.rename_tokens.seen(account, token, &done, now) {
@@ -295,6 +314,8 @@ mod tests {
         ));
         // An account's share: past it, its tokens are not kept, another's
         // are; the expired ones go to make room.
+        // One that outlives the prune below.
+        tokens.keep("111122223333", "mid", one, 1_000 + TOKEN_MS / 2);
         for n in 1..MAX_PER_ACCOUNT {
             tokens.keep("111122223333", &n.to_string(), one, 1_000);
         }
@@ -308,10 +329,25 @@ mod tests {
             tokens.seen("444455556666", "theirs", &one, 1_000),
             Seen::Done
         ));
+        // Nothing had expired until then: the store kept the first expiry,
+        // and scanned only once it came.
         tokens.keep("111122223333", "later", one, 1_000 + TOKEN_MS);
         assert!(matches!(
             tokens.seen("111122223333", "later", &one, 1_000 + TOKEN_MS),
             Seen::Done
         ));
+        let earliest = tokens.0.lock().unwrap().earliest;
+        assert_eq!(earliest, Some(1_000 + TOKEN_MS / 2 + TOKEN_MS));
+    }
+
+    #[test]
+    fn a_renames_digest_tells_an_empty_header_from_an_absent_one() {
+        let mut headers = hyper::HeaderMap::new();
+        let absent = digest("b", "k", "s", &headers);
+        headers.insert("if-match", hyper::header::HeaderValue::from_static(""));
+        assert_ne!(digest("b", "k", "s", &headers), absent);
+        // Nor does one part run into the next.
+        let none = hyper::HeaderMap::new();
+        assert_ne!(digest("b", "ks", "", &none), digest("b", "k", "s", &none));
     }
 }

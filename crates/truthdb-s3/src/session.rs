@@ -60,17 +60,29 @@ pub struct Sessions(Mutex<Kept>);
 struct Kept {
     by_id: HashMap<String, Session>,
     of_account: HashMap<String, usize>,
+    /// When the first of them expires (none: never), so a full store is
+    /// scanned only when one has.
+    earliest: Option<u64>,
 }
 
 impl Kept {
     /// Keeps the sessions `keep` takes, and counts them again.
     /// Keeps the sessions `keep` takes, uncounting the others.
     fn retain(&mut self, keep: impl Fn(&Session) -> bool) {
-        let Kept { by_id, of_account } = self;
+        let Kept {
+            by_id,
+            of_account,
+            earliest,
+        } = self;
+        *earliest = None;
         by_id.retain(|_, session| {
             let kept = keep(session);
             if !kept && let Some(count) = of_account.get_mut(&session.principal.account) {
                 *count -= 1;
+            }
+            if kept {
+                *earliest =
+                    Some(earliest.map_or(session.expires_ms, |at| at.min(session.expires_ms)));
             }
             kept
         });
@@ -124,12 +136,18 @@ impl Sessions {
         let account = principal.account.clone();
         let mut kept = self.0.lock().expect("sessions poisoned");
         if kept.full(&account) {
-            kept.retain(|session| session.expires_ms > now_ms);
+            if kept.earliest.is_some_and(|at| at <= now_ms) {
+                kept.retain(|session| session.expires_ms > now_ms);
+            }
             if kept.full(&account) {
                 return None;
             }
         }
         let id = format!("TDBS{id}");
+        kept.earliest = Some(
+            kept.earliest
+                .map_or(session.expires_ms, |at| at.min(session.expires_ms)),
+        );
         kept.by_id.insert(id.clone(), session.clone());
         *kept.of_account.entry(account).or_default() += 1;
         Some((id, session))
@@ -300,12 +318,23 @@ mod tests {
         // make room, and while none has expired no more are made; another
         // account's are made still.
         let count = |sessions: &Sessions| sessions.0.lock().unwrap().by_id.len();
+        // One that outlives the prune below.
+        sessions
+            .create(scope.clone(), &principal, 1_000 + LIFETIME_MS / 2)
+            .unwrap();
         while count(&sessions) < MAX_PER_ACCOUNT {
             sessions.create(scope.clone(), &principal, 1_000).unwrap();
         }
         let later = 1_000 + LIFETIME_MS;
+        let earliest = |sessions: &Sessions| sessions.0.lock().unwrap().earliest;
+        assert_eq!(earliest(&sessions), Some(1_000 + LIFETIME_MS));
         assert!(sessions.create(scope.clone(), &principal, later).is_some());
-        assert_eq!(count(&sessions), 1);
+        assert_eq!(count(&sessions), 2);
+        // The store kept its first expiry, recomputed as it pruned.
+        assert_eq!(
+            earliest(&sessions),
+            Some(1_000 + LIFETIME_MS / 2 + LIFETIME_MS)
+        );
         while count(&sessions) < MAX_PER_ACCOUNT {
             sessions.create(scope.clone(), &principal, later).unwrap();
         }
