@@ -37,6 +37,7 @@ mod remote_buckets;
 mod replication;
 mod restores;
 mod stored;
+mod tables;
 pub mod time;
 mod uploads;
 mod usage;
@@ -99,6 +100,7 @@ pub use replication::{
 };
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use stored::{Backlogs, BodyUse, StoredBody};
+pub use tables::{NamespaceInfo, TableBucketInfo, TableError, TableInfo};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 pub use usage::{BucketUsage, UsageKind};
 
@@ -223,6 +225,14 @@ const REPLICATION_BY_RULE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 48;
 /// (bucket, 0, key, 0, !version, part) -> a multipart version's part's
 /// checksum, by its place in the object (see `uploads`).
 const PART_CHECKSUMS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 49;
+/// (account, 0, name) -> an S3 Tables table bucket (see `tables`).
+const TABLE_BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 50;
+/// (account, 0, table bucket, 0, namespace) -> a namespace.
+const TABLE_NAMESPACES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 51;
+/// (account, 0, table bucket, 0, namespace, 0, name) -> a table.
+const TABLES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 52;
+/// (account, 0, table bucket, 0, table id) -> (namespace, 0, name).
+const TABLE_IDS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 53;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -347,7 +357,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 50;
+const TREE_COUNT: usize = 54;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
