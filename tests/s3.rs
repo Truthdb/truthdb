@@ -18887,7 +18887,7 @@ fn pyiceberg_keeps_namespaces_and_tables_in_s3_tables_through_its_rest_catalog()
 }
 
 const PYICEBERG_SCRIPT: &str = r#"
-import json, sys
+import gzip, json, sys
 import boto3, botocore.config
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import (BadRequestError, ForbiddenError, NamespaceAlreadyExistsError,
@@ -18969,6 +18969,20 @@ refused(lambda: c.load_table(("sales", "bare")), NoSuchTableError)
 # Renamed: the same table.
 renamed = c.rename_table(("sales", "orders"), ("sales", "orders_2024"))
 assert renamed.metadata.table_uuid == table.metadata.table_uuid
+# A gzipped metadata file (pointed at with the S3 Tables API) loads too.
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret)
+warehouse = table.location().removeprefix("s3://")
+first = s3.get_object(Bucket=warehouse, Key=location.split("/", 3)[3])["Body"].read()
+s3.put_object(Bucket=warehouse, Key="metadata/00001-z.metadata.json.gz", Body=gzip.compress(first))
+token = t.get_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders_2024")["versionToken"]
+t.update_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders_2024", versionToken=token,
+    metadataLocation=table.location() + "/metadata/00001-z.metadata.json.gz")
+zipped = c.load_table(("sales", "orders_2024"))
+assert zipped.metadata.table_uuid == table.metadata.table_uuid and zipped.metadata_location.endswith(".gz")
+# In pages (one a page, as a client asks): all of them, once each.
+paged = RestCatalog("paged", **{**c.properties, "rest-page-size": "1"})
+assert sorted(paged.list_tables("sales")) == [("sales", "bare"), ("sales", "orders_2024")], paged.list_tables("sales")
 assert sorted(c.list_tables("sales")) == [("sales", "bare"), ("sales", "orders_2024")]
 # Another account: as the table bucket's policy grants.
 refused(lambda: catalog(other_key, other_secret), ForbiddenError)

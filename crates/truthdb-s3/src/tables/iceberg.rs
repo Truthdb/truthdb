@@ -517,9 +517,27 @@ async fn load_table(
             "The table does not exist as an Iceberg table yet: it has no metadata file.",
         ));
     };
+    let gzipped = location.ends_with(".gz");
     let file = read(ctx.state, move |file| metadata_file(file, &location))
         .await?
         .map_err(TError::bad)?;
+    // A gzipped one (`.metadata.json.gz`), read as far as the limit.
+    let file = if gzipped {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(file.as_slice())
+            .take(MAX_METADATA_BYTES + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| TError::bad("The table's metadata file is not gzip."))?;
+        if out.len() as u64 > MAX_METADATA_BYTES {
+            return Err(TError::bad(
+                "A metadata.json file over 50MB is not supported.",
+            ));
+        }
+        out
+    } else {
+        file
+    };
     let file: Value = serde_json::from_slice(&file)
         .map_err(|_| TError::bad("The table's metadata file is not JSON."))?;
     Ok((StatusCode::OK, Some(loaded(&table, Some(file)))))

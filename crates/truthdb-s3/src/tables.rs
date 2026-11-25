@@ -105,7 +105,16 @@ fn table_error(err: TableError) -> TError {
 
 /// Answers one S3 Tables request.
 pub async fn handle(state: &S3State, request: Request<Incoming>) -> Response<Body> {
-    let catalog = request.uri().path().starts_with("/iceberg/");
+    // As the path is routed: its first part, percent-decoded.
+    let catalog = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .is_some_and(|first| {
+            percent_encoding::percent_decode_str(first).decode_utf8_lossy() == "iceberg"
+        });
     let (status, body) = match serve(state, request).await {
         Ok(answer) => answer,
         Err(err) => {
