@@ -11,8 +11,8 @@ use truthdb_core::storage::StorageError;
 use crate::objects::version_from_key;
 use crate::{
     BucketError, OBJECTS_TREE, ObjFile, ObjTxn, ObjectError, TABLE_BUCKETS_TREE, TABLE_IDS_TREE,
-    TABLE_NAMESPACES_TREE, TABLE_POLICIES_TREE, TABLES_TREE, UploadError, VersionSel,
-    WAREHOUSE_PURGES_TREE,
+    TABLE_MAINTENANCE_TREE, TABLE_NAMESPACES_TREE, TABLE_POLICIES_TREE, TABLES_TREE, UploadError,
+    VersionSel, WAREHOUSE_PURGES_TREE,
 };
 
 /// Why a catalog change was refused (the storage itself worked).
@@ -91,6 +91,48 @@ fn policy_prefix(account: &str, bucket: &str, table: Option<&str>) -> Vec<u8> {
         }
     }
     prefix
+}
+
+/// A table as [`ObjFile::all_tables`] lists it: its key, account, table
+/// bucket, and itself.
+pub type ListedTable = (Vec<u8>, String, String, TableInfo);
+
+/// A maintenance record of a table bucket (`table` none) or of a table:
+/// its configuration or its job status, of maintenance `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceRecord {
+    Configuration,
+    JobStatus,
+}
+
+/// The key prefix of a table bucket's (`table` none) or a table's
+/// maintenance records.
+fn maintenance_prefix(account: &str, bucket: &str, table: Option<&str>) -> Vec<u8> {
+    let mut prefix = key(&[account, bucket]);
+    match table {
+        None => prefix.extend_from_slice(&[0, 1]),
+        Some(id) => {
+            prefix.extend_from_slice(&[0, 2]);
+            prefix.extend_from_slice(id.as_bytes());
+            prefix.push(0);
+        }
+    }
+    prefix
+}
+
+fn maintenance_key(
+    (account, bucket): (&str, &str),
+    table: Option<&str>,
+    record: MaintenanceRecord,
+    kind: &str,
+) -> Vec<u8> {
+    let mut row_key = maintenance_prefix(account, bucket, table);
+    row_key.push(match record {
+        MaintenanceRecord::Configuration => 1,
+        MaintenanceRecord::JobStatus => 2,
+    });
+    row_key.extend_from_slice(kind.as_bytes());
+    row_key
 }
 
 /// The keys after `parts` (and a 0 byte), up to the first past them.
@@ -246,6 +288,40 @@ impl ObjTxn<'_, '_> {
         buckets.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
         let policies = self.trees.tree(TABLE_POLICIES_TREE);
         self.delete_document(&policies, &policy_prefix(account, name, None))?;
+        self.delete_maintenance(&maintenance_prefix(account, name, None))?;
+        Ok(Ok(()))
+    }
+
+    /// Deletes the maintenance records under `prefix`.
+    fn delete_maintenance(&mut self, prefix: &[u8]) -> Result<(), StorageError> {
+        let tree = self.trees.tree(TABLE_MAINTENANCE_TREE);
+        let mut upper = prefix.to_vec();
+        upper.push(0xff);
+        for (row_key, _) in tree.scan_range(self.ctx, Some(prefix), Some(&upper))? {
+            tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+        }
+        Ok(())
+    }
+
+    /// Sets a maintenance record of `account`'s table bucket `bucket` (or of
+    /// its table of id `table`): `value`, JSON.
+    pub fn put_maintenance(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+        (record, kind): (MaintenanceRecord, &str),
+        value: &[u8],
+    ) -> Result<Result<(), TableError>, StorageError> {
+        if let Err(err) = self.policy_holder((account, bucket), table)? {
+            return Ok(Err(err));
+        }
+        let tree = self.trees.tree(TABLE_MAINTENANCE_TREE);
+        let row_key = maintenance_key((account, bucket), table, record, kind);
+        if tree.get(self.ctx, &row_key)?.is_some() {
+            tree.update(self.ctx, &mut OpMode::Txn(self.txn), &row_key, value)?;
+        } else {
+            tree.insert_unique(self.ctx, &mut OpMode::Txn(self.txn), &row_key, value)?;
+        }
         Ok(Ok(()))
     }
 
@@ -480,6 +556,7 @@ impl ObjTxn<'_, '_> {
         )?;
         let policies = self.trees.tree(TABLE_POLICIES_TREE);
         self.delete_document(&policies, &policy_prefix(account, bucket, Some(&table.id)))?;
+        self.delete_maintenance(&maintenance_prefix(account, bucket, Some(&table.id)))?;
         // Its files' bucket is gone with it: its objects are removed after
         // (see `ObjFile::warehouse_purge_step`), then it.
         let warehouse = warehouse_bucket(&table.id);
@@ -591,6 +668,51 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
+    /// A maintenance record [`ObjTxn::put_maintenance`] sets.
+    pub fn maintenance(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+        (record, kind): (MaintenanceRecord, &str),
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(tree) = self.existing_tree(TABLE_MAINTENANCE_TREE)? else {
+            return Ok(None);
+        };
+        tree.get(
+            &mut self.core.page_ctx(0),
+            &maintenance_key((account, bucket), table, record, kind),
+        )
+    }
+
+    /// Every account's tables after `after` (a key this answers; none:
+    /// from the first), at most `limit`: each with its key, account and
+    /// table bucket.
+    pub fn all_tables(
+        &mut self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<ListedTable>, StorageError> {
+        let Some(tree) = self.existing_tree(TABLES_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let lower = after.map(|after| [after, &[0]].concat());
+        let mut out = Vec::new();
+        for (row_key, row) in
+            tree.scan_range_limit(&mut self.core.page_ctx(0), lower.as_deref(), None, limit)?
+        {
+            let parts: Vec<&[u8]> = row_key.split(|byte| *byte == 0).collect();
+            let [account, bucket, namespace, name] = parts.as_slice() else {
+                return Err(corrupt("table catalog key"));
+            };
+            let text = |part: &[u8]| {
+                String::from_utf8(part.to_vec()).map_err(|_| corrupt("table catalog key"))
+            };
+            let table = table_info(&text(namespace)?, &text(name)?, &row)?;
+            out.push((row_key.clone(), text(account)?, text(bucket)?, table));
+        }
+        Ok(out)
+    }
+
     /// One step removing a deleted table's files: up to `batch` versions of
     /// the first dropped storage bucket, else up to `batch` of its uploads,
     /// else (empty) the bucket itself. Each step is one transaction, so a

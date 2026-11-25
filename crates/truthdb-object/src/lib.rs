@@ -100,7 +100,9 @@ pub use replication::{
 };
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use stored::{Backlogs, BodyUse, StoredBody};
-pub use tables::{NamespaceInfo, TableBucketInfo, TableError, TableInfo, warehouse_bucket};
+pub use tables::{
+    MaintenanceRecord, NamespaceInfo, TableBucketInfo, TableError, TableInfo, warehouse_bucket,
+};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 pub use usage::{BucketUsage, UsageKind};
 
@@ -240,6 +242,10 @@ const TABLE_POLICIES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 54;
 /// (bucket) -> nothing: a deleted table's storage bucket whose objects are
 /// being removed, then it (see `tables`).
 const WAREHOUSE_PURGES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 55;
+/// (account, 0, table bucket, 0, 1 | 2 table id 0, record, kind) -> a
+/// table bucket's or table's maintenance configuration (record 1) or job
+/// status (record 2), JSON (see `tables`).
+const TABLE_MAINTENANCE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 56;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -364,7 +370,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 56;
+const TREE_COUNT: usize = 57;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.

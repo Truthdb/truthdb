@@ -8864,3 +8864,138 @@ fn a_deleted_tables_files_are_removed_from_where_a_reopened_file_left_off() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn maintenance_records_are_kept_per_table_and_bucket_and_tables_are_listed_across_accounts() {
+    use crate::{MaintenanceRecord, TableError, TableInfo};
+    let path = temp_path("table-maintenance");
+    let storage = create(&path);
+    let tx = |op: &dyn Fn(
+        &mut crate::ObjTxn<'_, '_>,
+    ) -> Result<Result<(), TableError>, StorageError>| {
+        ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
+    };
+    let table = |id: &str| TableInfo {
+        namespace: "sales".to_string(),
+        name: id.replace('-', "_"),
+        id: id.to_string(),
+        created_ms: 1,
+        created_by: "me".to_string(),
+        modified_ms: 1,
+        modified_by: "me".to_string(),
+        metadata_location: None,
+        version_token: "v".to_string(),
+        warehouse_location: String::new(),
+    };
+    // (A table's id names its storage bucket: each account's its own.)
+    for (account, ids) in [
+        ("111111111111", ["t-1", "t-10"]),
+        ("222222222222", ["u-1", "u-10"]),
+    ] {
+        let at = (account, "lake");
+        assert_eq!(tx(&|tx| tx.create_table_bucket(at.0, at.1, "b", 1)), Ok(()));
+        assert_eq!(
+            tx(&|tx| tx.create_namespace(at, "sales", "n", ("me", 1))),
+            Ok(())
+        );
+        for id in ids {
+            assert_eq!(tx(&|tx| tx.create_table(at, &table(id))), Ok(()));
+        }
+    }
+    let at = ("111111111111", "lake");
+    let config = (
+        MaintenanceRecord::Configuration,
+        "icebergSnapshotManagement",
+    );
+    let status = (MaintenanceRecord::JobStatus, "icebergSnapshotManagement");
+    let read = |table: Option<&str>, which| {
+        ObjFile::new(&mut storage.lock())
+            .maintenance(at, table, which)
+            .unwrap()
+    };
+    assert_eq!(
+        tx(&|tx| tx.put_maintenance(at, Some("t-2"), config, b"{}")),
+        Err(TableError::NoSuchTable)
+    );
+    assert_eq!(
+        tx(&|tx| tx.put_maintenance(at, Some("t-1"), config, b"one")),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.put_maintenance(at, Some("t-1"), config, b"two")),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.put_maintenance(at, Some("t-1"), status, b"ran")),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.put_maintenance(at, Some("t-10"), config, b"ten")),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.put_maintenance(at, None, config, b"bucket")),
+        Ok(())
+    );
+    assert_eq!(
+        (read(Some("t-1"), config), read(Some("t-1"), status)),
+        (Some(b"two".to_vec()), Some(b"ran".to_vec()))
+    );
+    assert_eq!(read(Some("t-10"), config), Some(b"ten".to_vec()));
+    assert_eq!(read(None, config), Some(b"bucket".to_vec()));
+    assert_eq!(read(None, status), None);
+    // Every account's tables, two a page.
+    let mut seen = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = ObjFile::new(&mut storage.lock())
+            .all_tables(after.as_deref(), 2)
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|(row_key, ..)| row_key.clone());
+        seen.extend(
+            page.into_iter()
+                .map(|(_, account, bucket, table)| (account, bucket, table.id)),
+        );
+    }
+    assert_eq!(seen.len(), 4);
+    assert_eq!(
+        seen[0],
+        (
+            "111111111111".to_string(),
+            "lake".to_string(),
+            "t-1".to_string()
+        )
+    );
+    // A table's records go with it (another's stay), the bucket's with it.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("sales", "t_1", "t-1"), None))
+            .unwrap()
+            .map(|_| ()),
+        Ok(())
+    );
+    assert_eq!(
+        (read(Some("t-1"), config), read(Some("t-1"), status)),
+        (None, None)
+    );
+    assert_eq!(read(Some("t-10"), config), Some(b"ten".to_vec()));
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("sales", "t_10", "t-10"), None))
+            .unwrap()
+            .map(|_| ()),
+        Ok(())
+    );
+    assert_eq!(tx(&|tx| tx.delete_namespace(at, "sales")), Ok(()));
+    assert_eq!(tx(&|tx| tx.delete_table_bucket(at.0, at.1)), Ok(()));
+    assert_eq!(
+        tx(&|tx| tx.create_table_bucket(at.0, at.1, "b2", 2)),
+        Ok(())
+    );
+    assert_eq!(read(None, config), None);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
