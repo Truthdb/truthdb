@@ -18,6 +18,8 @@ use truthdb_object::{NamespaceInfo, TableBucketInfo, TableError, TableInfo};
 use crate::error::S3Error;
 use crate::server::{Body, Connection, S3State, full};
 
+mod iceberg;
+
 /// The largest request body (S3 Tables' are small JSON documents).
 const MAX_BODY: usize = 1 << 20;
 /// Items a list answers at most, and when none is asked.
@@ -103,10 +105,30 @@ fn table_error(err: TableError) -> TError {
 
 /// Answers one S3 Tables request.
 pub async fn handle(state: &S3State, request: Request<Incoming>) -> Response<Body> {
+    // As the path is routed: its first part, percent-decoded.
+    let catalog = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .is_some_and(|first| {
+            percent_encoding::percent_decode_str(first).decode_utf8_lossy() == "iceberg"
+        });
     let (status, body) = match serve(state, request).await {
         Ok(answer) => answer,
         Err(err) => {
-            let body = json!({ "message": err.message }).to_string();
+            // The Iceberg REST catalog's errors are its own.
+            let body = if catalog {
+                json!({ "error": {
+                    "message": err.message,
+                    "type": iceberg::error_type(&err),
+                    "code": err.status,
+                } })
+            } else {
+                json!({ "message": err.message })
+            }
+            .to_string();
             let response = Response::builder()
                 .status(
                     StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -248,6 +270,11 @@ fn resource_account(
 ) -> String {
     let arn = match path.first().map(String::as_str) {
         Some("buckets" | "namespaces" | "tables") => path.get(1).map(String::as_str),
+        // The Iceberg REST catalog's prefix, or (its config) warehouse.
+        Some("iceberg") => match path.get(2).map(String::as_str) {
+            Some("config") | None => param(params, "warehouse"),
+            prefix => prefix,
+        },
         _ => param(params, "tableArn").or_else(|| param(params, "tableBucketARN")),
     };
     arn.and_then(|arn| arn.strip_prefix(&format!("arn:aws:s3tables:{region}:")))
@@ -419,6 +446,17 @@ async fn serve(
     };
     crate::scope::within(scope, async {
         match (&parts.method, parts_of.as_slice()) {
+            (method, ["iceberg", rest @ ..]) => {
+                let ctx = iceberg::Ctx {
+                    state,
+                    caller: &caller,
+                    authz: &authz,
+                    check: &check,
+                    params: &params,
+                    input: &input,
+                };
+                iceberg::serve(&ctx, method, rest).await
+            }
             (&Method::PUT, ["buckets"]) => {
                 let name = required(&input, "name")?;
                 refuse_extras(&input, &["name"])?;
@@ -592,81 +630,13 @@ async fn serve(
                 if required(&input, "format")? != "ICEBERG" {
                     return Err(TError::bad("format is ICEBERG."));
                 }
-                let weighed = policies(state, &caller, &bucket, None).await?;
-                let policies: Vec<&Policy> = weighed.policies.iter().collect();
-                let authz = authz.with_keys(&[("s3tables:namespace", namespace.clone())]);
-                authz
-                    .check_arn_with("s3tables:CreateTable", arn, caller.account, &policies)
-                    .map_err(|_| TError::forbidden())?;
-                let id = uuid();
-                let now = crate::objects::now_ms();
-                let location = format!("s3://{}", truthdb_object::warehouse_bucket(&id));
-                // With `metadata`, its first metadata file is written into
-                // its storage (which "requires s3tables:PutTableData"), and
-                // it points at it.
-                let first = match input.get("metadata") {
-                    None => None,
-                    Some(metadata) => {
-                        authz
-                            .check_arn_with(
-                                "s3tables:PutTableData",
-                                &caller.table_arn(&bucket, &id),
-                                caller.account,
-                                &policies,
-                            )
-                            .map_err(|_| TError::forbidden())?;
-                        let file = crate::iceberg_metadata::initial(metadata, &location, &uuid(), now)
-                            .map_err(TError::bad)?;
-                        let key = format!("metadata/00000-{}.metadata.json", uuid());
-                        Some((key, metadata_body(state, file.to_string(), now).await?))
-                    }
-                };
-                let table = TableInfo {
-                    namespace,
-                    name,
-                    id: id.clone(),
-                    created_ms: now,
-                    created_by: caller.who.to_string(),
-                    modified_ms: now,
-                    modified_by: caller.who.to_string(),
-                    metadata_location: first.as_ref().map(|(key, _)| format!("{location}/{key}")),
-                    version_token: uuid().replace('-', ""),
-                    warehouse_location: location,
-                };
-                let (account, made) = (caller.account.to_string(), table.clone());
-                let bucket_id = weighed.bucket_id.clone();
-                write(state, move |tx| {
-                    guarded(tx, (&account, &bucket), bucket_id.as_deref(), |tx| {
-                        if let Err(err) = tx.create_table((&account, &bucket), &made)? {
-                            return Ok(Err(err));
-                        }
-                        if let Some((key, body)) = &first {
-                            let attrs = truthdb_object::ObjectAttrs {
-                                content_type: Some("application/json".to_string()),
-                                ..truthdb_object::ObjectAttrs::default()
-                            };
-                            let warehouse = truthdb_object::warehouse_bucket(&made.id);
-                            // Its bucket was just made with it.
-                            if tx
-                                .put_object(
-                                    &warehouse,
-                                    key,
-                                    body,
-                                    &attrs,
-                                    truthdb_object::StorageClass::Standard,
-                                    now,
-                                    0,
-                                )?
-                                .is_err()
-                            {
-                                return Err(truthdb_core::storage::StorageError::InvalidFile(
-                                    "a new table's storage refused its metadata file".to_string(),
-                                ));
-                            }
-                        }
-                        Ok(Ok(()))
-                    })
-                })
+                let (table, _) = make_table(
+                    state,
+                    (&caller, &authz),
+                    (arn, bucket),
+                    (namespace, name),
+                    input.get("metadata"),
+                )
                 .await?;
                 let bucket = caller.bucket_of(arn)?;
                 Ok((
@@ -1101,6 +1071,96 @@ async fn metadata_body(
     .await
     .map_err(|_| TError::from(S3Error::internal("The metadata file was not written.")))?
     .map_err(|err| TError::from(S3Error::internal(err.to_string())))
+}
+
+/// Makes table `name` in `namespace` of table bucket `bucket` (of ARN
+/// `arn`), as CreateTable does: with `metadata`, its first metadata file
+/// written into its storage and pointed at. The table, and that file.
+async fn make_table(
+    state: &S3State,
+    (caller, authz): (&Caller<'_>, &crate::authz::Authz),
+    (arn, bucket): (&str, String),
+    (namespace, name): (String, String),
+    metadata: Option<&Value>,
+) -> Result<(TableInfo, Option<Value>), TError> {
+    let weighed = policies(state, caller, &bucket, None).await?;
+    let policies: Vec<&Policy> = weighed.policies.iter().collect();
+    let authz = authz.with_keys(&[("s3tables:namespace", namespace.clone())]);
+    authz
+        .check_arn_with("s3tables:CreateTable", arn, caller.account, &policies)
+        .map_err(|_| TError::forbidden())?;
+    let id = uuid();
+    let now = crate::objects::now_ms();
+    let location = format!("s3://{}", truthdb_object::warehouse_bucket(&id));
+    // With `metadata`, its first metadata file is written into
+    // its storage (which "requires s3tables:PutTableData"), and
+    // it points at it.
+    let (first, file) = match metadata {
+        None => (None, None),
+        Some(metadata) => {
+            authz
+                .check_arn_with(
+                    "s3tables:PutTableData",
+                    &caller.table_arn(&bucket, &id),
+                    caller.account,
+                    &policies,
+                )
+                .map_err(|_| TError::forbidden())?;
+            let file = crate::iceberg_metadata::initial(metadata, &location, &uuid(), now)
+                .map_err(TError::bad)?;
+            let key = format!("metadata/00000-{}.metadata.json", uuid());
+            let body = metadata_body(state, file.to_string(), now).await?;
+            (Some((key, body)), Some(file))
+        }
+    };
+    let table = TableInfo {
+        namespace,
+        name,
+        id: id.clone(),
+        created_ms: now,
+        created_by: caller.who.to_string(),
+        modified_ms: now,
+        modified_by: caller.who.to_string(),
+        metadata_location: first.as_ref().map(|(key, _)| format!("{location}/{key}")),
+        version_token: uuid().replace('-', ""),
+        warehouse_location: location,
+    };
+    let (account, made) = (caller.account.to_string(), table.clone());
+    let bucket_id = weighed.bucket_id.clone();
+    write(state, move |tx| {
+        guarded(tx, (&account, &bucket), bucket_id.as_deref(), |tx| {
+            if let Err(err) = tx.create_table((&account, &bucket), &made)? {
+                return Ok(Err(err));
+            }
+            if let Some((key, body)) = &first {
+                let attrs = truthdb_object::ObjectAttrs {
+                    content_type: Some("application/json".to_string()),
+                    ..truthdb_object::ObjectAttrs::default()
+                };
+                let warehouse = truthdb_object::warehouse_bucket(&made.id);
+                // Its bucket was just made with it.
+                if tx
+                    .put_object(
+                        &warehouse,
+                        key,
+                        body,
+                        &attrs,
+                        truthdb_object::StorageClass::Standard,
+                        now,
+                        0,
+                    )?
+                    .is_err()
+                {
+                    return Err(truthdb_core::storage::StorageError::InvalidFile(
+                        "a new table's storage refused its metadata file".to_string(),
+                    ));
+                }
+            }
+            Ok(Ok(()))
+        })
+    })
+    .await?;
+    Ok((table, file))
 }
 
 async fn find_bucket(
