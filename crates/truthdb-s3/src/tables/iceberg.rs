@@ -530,9 +530,11 @@ pub(super) async fn read_current(state: &S3State, table: &TableInfo) -> Result<V
         ));
     };
     let gzipped = location.ends_with(".gz");
-    let file = read(state, move |file| metadata_file(file, &location))
-        .await?
-        .map_err(TError::bad)?;
+    let file = read(state, move |file| {
+        stored_file(file, &location, MAX_METADATA_BYTES)
+    })
+    .await?
+    .map_err(TError::bad)?;
     // A gzipped one (`.metadata.json.gz`), read as far as the limit.
     let file = if gzipped {
         use std::io::Read as _;
@@ -555,23 +557,23 @@ pub(super) async fn read_current(state: &S3State, table: &TableInfo) -> Result<V
     Ok(file)
 }
 
-/// The bytes of the metadata file at `location` (`s3://<bucket>/<key>`),
-/// or why it cannot be read.
-fn metadata_file(
+/// The bytes of the table's file at `location` (`s3://<bucket>/<key>`: a
+/// metadata file, a manifest list or a manifest), at most `max`, or why it
+/// cannot be read.
+pub(super) fn stored_file(
     file: &mut truthdb_object::ObjFile<'_>,
     location: &str,
+    max: u64,
 ) -> Result<Result<Vec<u8>, String>, truthdb_core::storage::StorageError> {
     let Some((bucket, key)) = location
         .strip_prefix("s3://")
         .and_then(|rest| rest.split_once('/'))
     else {
-        return Ok(Err(
-            "The table's metadata location is not an S3 URI.".to_string()
-        ));
+        return Ok(Err(format!("{location} is not an S3 URI.")));
     };
     let info = match file.head_object(bucket, key, VersionSel::Latest)? {
         Ok(info) if !info.delete_marker => info,
-        _ => return Ok(Err("The table's metadata file is missing.".to_string())),
+        _ => return Ok(Err(format!("The table's file {location} is missing."))),
     };
     if info.attrs.customer_key.is_some()
         || file.archived_unreadable(
@@ -582,12 +584,14 @@ fn metadata_file(
             crate::objects::now_ms(),
         )?
     {
-        return Ok(Err("The table's metadata file cannot be read.".to_string()));
+        return Ok(Err(format!("The table's file {location} cannot be read.")));
     }
-    if info.size > MAX_METADATA_BYTES {
-        return Ok(Err(
+    if info.size > max {
+        return Ok(Err(if max == MAX_METADATA_BYTES {
             "A metadata.json file over 50MB is not supported.".to_string()
-        ));
+        } else {
+            format!("The table's file {location} is over {max} bytes.")
+        }));
     }
     let mut out = vec![0u8; info.size as usize];
     let mut done = 0usize;

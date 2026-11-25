@@ -175,6 +175,11 @@ pub struct S3Config {
     /// How often each S3 Tables table's maintenance runs (seconds).
     #[serde(default = "default_table_maintenance_seconds")]
     pub table_maintenance_seconds: u64,
+
+    /// How long a day of S3 Tables maintenance's settings is (seconds; a
+    /// test's may be shorter).
+    #[serde(default = "default_table_maintenance_day_seconds")]
+    pub table_maintenance_day_seconds: u64,
 }
 
 fn default_metrics_flush_seconds() -> u64 {
@@ -195,6 +200,10 @@ fn default_trail_flush_seconds() -> u64 {
 
 fn default_table_maintenance_seconds() -> u64 {
     3600
+}
+
+fn default_table_maintenance_day_seconds() -> u64 {
+    86_400
 }
 
 impl S3Config {
@@ -251,6 +260,7 @@ impl Default for S3Config {
             activity_flush_seconds: default_activity_flush_seconds(),
             trail_flush_seconds: default_trail_flush_seconds(),
             table_maintenance_seconds: default_table_maintenance_seconds(),
+            table_maintenance_day_seconds: default_table_maintenance_day_seconds(),
         }
     }
 }

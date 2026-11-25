@@ -1,16 +1,24 @@
 //! S3 Tables' table maintenance: its configurations (Put/Get
 //! TableMaintenanceConfiguration, and the table bucket's), each job's status
-//! (GetTableMaintenanceJobStatus), and the job run in the background on
-//! every table: snapshot management, expiring the snapshots its settings
-//! keep no longer, as a commit of the table. Compaction and unreferenced file
-//! removal are not built: their configurations are refused.
+//! (GetTableMaintenanceJobStatus), and the jobs run in the background on
+//! every table:
+//!
+//! - snapshot management, expiring the snapshots its settings keep no
+//!   longer, as a commit of the table (the files only they referenced then
+//!   marked noncurrent at once);
+//! - unreferenced file removal (the table bucket's): the objects of a
+//!   table's storage no snapshot references, older than unreferencedDays,
+//!   marked noncurrent, and deleted nonCurrentDays after.
+//!
+//! Compaction is not built: its configuration is refused.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
-use truthdb_object::{MaintenanceRecord, TableInfo};
+use truthdb_object::{ListAfter, MaintenanceRecord, TableInfo, VersionSel};
 
 use super::{TError, read, write};
 use crate::server::S3State;
@@ -19,47 +27,50 @@ pub(super) const SNAPSHOT_MANAGEMENT: &str = "icebergSnapshotManagement";
 pub(super) const COMPACTION: &str = "icebergCompaction";
 pub(super) const UNREFERENCED_FILE_REMOVAL: &str = "icebergUnreferencedFileRemoval";
 
-/// "MinimumSnapshots (1 by default) and MaximumSnapshotAge (120 hours by
-/// default)".
-const MIN_SNAPSHOTS_TO_KEEP: i64 = 1;
-const MAX_SNAPSHOT_AGE_HOURS: i64 = 120;
 /// Tables a pass reads at a time.
 const PAGE: usize = 100;
+/// Objects of a table's storage read at a time.
+const LISTED: usize = 1000;
 /// The longest wait between passes (a table is run once its interval since
 /// its last run has passed).
 const MAX_WAIT: Duration = Duration::from_secs(60);
+/// A manifest list or manifest is read whole, up to this.
+const MAX_MANIFEST_BYTES: u64 = 256 << 20;
+/// A deleted object's body stays for readers that resolved it this long.
+const DROP_GRACE_MS: u64 = 15 * 60 * 1000;
 
 /// AWS's message for a commit that lost to another.
 const STALE: &str = "Failed to commit because of out of date metadata. Maintenance will be retried at the next available opportunity.";
+const GC_DISABLED: &str = "Iceberg snapshot management and unreferenced file removal is not supported when the 'gc.enabled' table property is false.";
 
-/// A table's snapshot management configuration: as put, or the default
-/// ("enabled by default").
-pub(super) fn snapshot_configuration(stored: Option<&[u8]>) -> Value {
+/// A type's settings and their defaults: "MinimumSnapshots (1 by default)
+/// and MaximumSnapshotAge (120 hours by default)", "unreferencedDays (3
+/// days by default) and nonCurrentDays (10 days by default)".
+fn defaults(kind: &str) -> &'static [(&'static str, i64)] {
+    match kind {
+        SNAPSHOT_MANAGEMENT => &[("minSnapshotsToKeep", 1), ("maxSnapshotAgeHours", 120)],
+        UNREFERENCED_FILE_REMOVAL => &[("unreferencedDays", 3), ("nonCurrentDays", 10)],
+        _ => &[],
+    }
+}
+
+/// A configuration of `kind`: as put, or the default ("enabled by
+/// default").
+pub(super) fn configuration(kind: &str, stored: Option<&[u8]>) -> Value {
     stored
         .and_then(|value| serde_json::from_slice(value).ok())
         .unwrap_or_else(|| {
-            json!({
-                "status": "enabled",
-                "settings": { SNAPSHOT_MANAGEMENT: {
-                    "minSnapshotsToKeep": MIN_SNAPSHOTS_TO_KEEP,
-                    "maxSnapshotAgeHours": MAX_SNAPSHOT_AGE_HOURS,
-                } },
-            })
+            let settings: Map<String, Value> = defaults(kind)
+                .iter()
+                .map(|(field, value)| (field.to_string(), json!(value)))
+                .collect();
+            json!({ "status": "enabled", "settings": { kind: settings } })
         })
 }
 
-/// The `value` of a PutTableMaintenanceConfiguration of `kind`, checked, its
+/// The `value` of a Put…MaintenanceConfiguration of `kind`, checked, its
 /// settings left out filled with the defaults: as kept.
-pub(super) fn put_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError> {
-    match kind {
-        SNAPSHOT_MANAGEMENT => {}
-        COMPACTION => return Err(TError::not_implemented("Table compaction")),
-        _ => {
-            return Err(TError::bad(
-                "type is icebergCompaction or icebergSnapshotManagement.",
-            ));
-        }
-    }
+fn checked_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError> {
     if let Some(field) = input.keys().find(|field| *field != "value") {
         return Err(TError::bad(format!(
             "{field} is not a field of this request."
@@ -80,33 +91,26 @@ pub(super) fn put_value(kind: &str, input: &Map<String, Value>) -> Result<Value,
         None => "enabled",
         Some(_) => return Err(TError::bad("status is enabled or disabled.")),
     };
-    let mut kept = Map::new();
-    kept.insert(
-        "minSnapshotsToKeep".to_string(),
-        json!(MIN_SNAPSHOTS_TO_KEEP),
-    );
-    kept.insert(
-        "maxSnapshotAgeHours".to_string(),
-        json!(MAX_SNAPSHOT_AGE_HOURS),
-    );
+    let mut kept: Map<String, Value> = defaults(kind)
+        .iter()
+        .map(|(field, value)| (field.to_string(), json!(value)))
+        .collect();
     if let Some(settings) = value.get("settings").filter(|settings| !settings.is_null()) {
         let settings = settings
             .as_object()
             .ok_or_else(|| TError::bad("settings is an object."))?;
-        if let Some(other) = settings.keys().find(|key| *key != SNAPSHOT_MANAGEMENT) {
+        if let Some(other) = settings.keys().find(|key| *key != kind) {
             return Err(TError::bad(format!(
-                "settings.{other} is not of the icebergSnapshotManagement type."
+                "settings.{other} is not of the {kind} type."
             )));
         }
-        if let Some(own) = settings.get(SNAPSHOT_MANAGEMENT) {
+        if let Some(own) = settings.get(kind) {
             let own = own
                 .as_object()
-                .ok_or_else(|| TError::bad("settings.icebergSnapshotManagement is an object."))?;
+                .ok_or_else(|| TError::bad(format!("settings.{kind} is an object.")))?;
             for (field, value) in own {
-                if !matches!(field.as_str(), "minSnapshotsToKeep" | "maxSnapshotAgeHours") {
-                    return Err(TError::bad(format!(
-                        "{field} is not a snapshot management setting."
-                    )));
+                if !kept.contains_key(field) {
+                    return Err(TError::bad(format!("{field} is not a {kind} setting.")));
                 }
                 // PositiveInteger: 1 to 2147483647.
                 let positive = value
@@ -117,7 +121,26 @@ pub(super) fn put_value(kind: &str, input: &Map<String, Value>) -> Result<Value,
             }
         }
     }
-    Ok(json!({ "status": status, "settings": { SNAPSHOT_MANAGEMENT: kept } }))
+    Ok(json!({ "status": status, "settings": { kind: kept } }))
+}
+
+/// A PutTableMaintenanceConfiguration's `value`, checked.
+pub(super) fn put_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError> {
+    match kind {
+        SNAPSHOT_MANAGEMENT => checked_value(kind, input),
+        COMPACTION => Err(TError::not_implemented("Table compaction")),
+        _ => Err(TError::bad(
+            "type is icebergCompaction or icebergSnapshotManagement.",
+        )),
+    }
+}
+
+/// A PutTableBucketMaintenanceConfiguration's `value`, checked.
+pub(super) fn put_bucket_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError> {
+    match kind {
+        UNREFERENCED_FILE_REMOVAL => checked_value(kind, input),
+        _ => Err(TError::bad("type is icebergUnreferencedFileRemoval.")),
+    }
 }
 
 /// A job's status as kept: its status, when it last ran (milliseconds),
@@ -174,7 +197,25 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-/// One pass: every table whose snapshot management is due.
+/// A maintenance job of a table.
+#[derive(Clone, Copy)]
+enum Job {
+    /// Its own configuration's.
+    Snapshots,
+    /// Its table bucket's.
+    Files,
+}
+
+impl Job {
+    fn kind(self) -> &'static str {
+        match self {
+            Job::Snapshots => SNAPSHOT_MANAGEMENT,
+            Job::Files => UNREFERENCED_FILE_REMOVAL,
+        }
+    }
+}
+
+/// One pass: every table's jobs that are due.
 async fn pass(state: &S3State) -> Result<(), TError> {
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -184,39 +225,47 @@ async fn pass(state: &S3State) -> Result<(), TError> {
             return Ok(());
         };
         after = Some(last.clone());
-        // One table's failure stops no other's.
+        // One table's (or job's) failure stops no other's.
         for (_, account, bucket, table) in tables {
-            if let Err(err) = manage_snapshots(state, (&account, &bucket), &table).await {
-                eprintln!("table maintenance of {}: {}", table.id, err.message);
+            for job in [Job::Snapshots, Job::Files] {
+                if let Err(err) = maintain(state, (&account, &bucket), &table, job).await {
+                    eprintln!("table maintenance of {}: {}", table.id, err.message);
+                }
             }
         }
     }
 }
 
-/// Snapshot management of `table`, if it is due: run, and its status kept.
-async fn manage_snapshots(
+/// Job `job` of `listed` (as the pass listed it), if it is due: run, and
+/// its status kept.
+async fn maintain(
     state: &S3State,
     (account, bucket): (&str, &str),
-    table: &TableInfo,
+    listed: &TableInfo,
+    job: Job,
 ) -> Result<(), TError> {
-    let (owner, looked, id) = (account.to_string(), bucket.to_string(), table.id.clone());
-    let (configuration, status) = read(state, move |file| {
+    let kind = job.kind();
+    let (owner, looked, id) = (account.to_string(), bucket.to_string(), listed.id.clone());
+    // The table as it is now (a job before this one may have committed
+    // it since it was listed), with its configuration and status.
+    let (table, stored, status) = read(state, move |file| {
         let at = (owner.as_str(), looked.as_str());
+        let of = match job {
+            Job::Snapshots => Some(id.as_str()),
+            Job::Files => None,
+        };
         Ok((
-            file.maintenance(
-                at,
-                Some(&id),
-                (MaintenanceRecord::Configuration, SNAPSHOT_MANAGEMENT),
-            )?,
-            file.maintenance(
-                at,
-                Some(&id),
-                (MaintenanceRecord::JobStatus, SNAPSHOT_MANAGEMENT),
-            )?,
+            file.table_by_id(at, &id)?,
+            file.maintenance(at, of, (MaintenanceRecord::Configuration, kind))?,
+            file.maintenance(at, Some(&id), (MaintenanceRecord::JobStatus, kind))?,
         ))
     })
     .await?;
-    let configuration = snapshot_configuration(configuration.as_deref());
+    let Some(table) = table else {
+        return Ok(());
+    };
+    let table = &table;
+    let configuration = configuration(kind, stored.as_deref());
     let status: Option<Value> = status.and_then(|status| serde_json::from_slice(&status).ok());
     let now = crate::objects::now_ms();
     let record = if configuration["status"] != "enabled" {
@@ -239,15 +288,36 @@ async fn manage_snapshots(
         if table.metadata_location.is_none() || (last != 0 && now < last + interval) {
             return Ok(());
         }
-        let settings = &configuration["settings"][SNAPSHOT_MANAGEMENT];
-        let keep = settings["minSnapshotsToKeep"]
-            .as_i64()
-            .unwrap_or(MIN_SNAPSHOTS_TO_KEEP);
-        let age_ms = settings["maxSnapshotAgeHours"]
-            .as_i64()
-            .unwrap_or(MAX_SNAPSHOT_AGE_HOURS)
-            .saturating_mul(3_600_000);
-        match expire(state, (account, bucket), table, (keep, age_ms), now).await {
+        let settings = &configuration["settings"][kind];
+        let setting = |field: &str| {
+            settings[field].as_i64().unwrap_or_else(|| {
+                defaults(kind)
+                    .iter()
+                    .find(|(name, _)| *name == field)
+                    .map_or(1, |(_, value)| *value)
+            })
+        };
+        let outcome = match job {
+            Job::Snapshots => {
+                let keep = setting("minSnapshotsToKeep");
+                let age_ms = setting("maxSnapshotAgeHours").saturating_mul(3_600_000);
+                expire(state, (account, bucket), table, (keep, age_ms), now).await
+            }
+            Job::Files => {
+                let day = state.table_maintenance_day.as_millis() as i64;
+                let unreferenced = setting("unreferencedDays").saturating_mul(day) as u64;
+                let noncurrent = setting("nonCurrentDays").saturating_mul(day) as u64;
+                remove_unreferenced(
+                    state,
+                    (account, bucket),
+                    table,
+                    (unreferenced, noncurrent),
+                    now,
+                )
+                .await
+            }
+        };
+        match outcome {
             Ok(()) => status_record("Successful", Some(now), None),
             // Lost to another commit: retried on the next pass ("at the
             // next available opportunity"), its last run as it was.
@@ -264,7 +334,7 @@ async fn manage_snapshots(
         tx.put_maintenance(
             (&owner, &bucket),
             Some(&id),
-            (MaintenanceRecord::JobStatus, SNAPSHOT_MANAGEMENT),
+            (MaintenanceRecord::JobStatus, kind),
             record.as_bytes(),
         )
     })
@@ -272,10 +342,16 @@ async fn manage_snapshots(
     Ok(())
 }
 
+/// The property `key` of a table's metadata.
+fn property<'a>(metadata: &'a Value, key: &str) -> Option<&'a Value> {
+    metadata.get("properties")?.get(key)
+}
+
 /// The snapshots of `table` its settings no longer keep, expired: those
 /// neither among the last `keep` of its main branch nor younger than
-/// `age_ms` ("preserved only when both criteria are satisfied"). Why not,
-/// if it fails.
+/// `age_ms` ("preserved only when both criteria are satisfied"); the
+/// objects only they referenced then marked noncurrent ("immediately ...
+/// regardless of its age"). Why not, if it fails.
 async fn expire(
     state: &S3State,
     (account, bucket): (&str, &str),
@@ -286,13 +362,11 @@ async fn expire(
     let base = super::iceberg::read_current(state, table)
         .await
         .map_err(|err| err.message)?;
-    let properties = base.get("properties").and_then(Value::as_object);
-    let property = |key: &str| properties.and_then(|properties| properties.get(key));
-    if property("gc.enabled").and_then(Value::as_str) == Some("false") {
-        return Err("Iceberg snapshot management and unreferenced file removal is not supported when the 'gc.enabled' table property is false.".to_string());
+    if property(&base, "gc.enabled").and_then(Value::as_str) == Some("false") {
+        return Err(GC_DISABLED.to_string());
     }
-    if property("history.expire.max-snapshot-age-ms").is_some()
-        || property("history.expire.min-snapshots-to-keep").is_some()
+    if property(&base, "history.expire.max-snapshot-age-ms").is_some()
+        || property(&base, "history.expire.min-snapshots-to-keep").is_some()
     {
         return Err(
             "Snapshot management does not support retention set as Apache Iceberg table properties (history.expire.*)."
@@ -331,20 +405,20 @@ async fn expire(
         at = parent_of(id);
     }
     let oldest = now as i64 - age_ms;
-    let expired: Vec<i64> = snapshots
-        .iter()
-        .filter(|snapshot| {
-            let id = snapshot["snapshot-id"].as_i64();
-            id.is_some_and(|id| id != current && !kept.contains(&id))
-                && snapshot["timestamp-ms"]
-                    .as_i64()
-                    .is_some_and(|at| at < oldest)
-        })
-        .filter_map(|snapshot| snapshot["snapshot-id"].as_i64())
-        .collect();
+    let (expired, _): (Vec<Value>, Vec<Value>) = snapshots.iter().cloned().partition(|snapshot| {
+        let id = snapshot["snapshot-id"].as_i64();
+        id.is_some_and(|id| id != current && !kept.contains(&id))
+            && snapshot["timestamp-ms"]
+                .as_i64()
+                .is_some_and(|at| at < oldest)
+    });
     if expired.is_empty() {
         return Ok(());
     }
+    let ids: Vec<i64> = expired
+        .iter()
+        .filter_map(|snapshot| snapshot["snapshot-id"].as_i64())
+        .collect();
     let location = table
         .metadata_location
         .clone()
@@ -356,7 +430,7 @@ async fn expire(
         requirements
             .push(json!({"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": current}));
     }
-    let updates = [json!({"action": "remove-snapshots", "snapshot-ids": expired})];
+    let updates = [json!({"action": "remove-snapshots", "snapshot-ids": ids})];
     let next = match crate::iceberg_commit::apply(&base, &location, &requirements, &updates, now) {
         Ok(Some(next)) => next,
         Ok(None) => return Ok(()),
@@ -364,7 +438,7 @@ async fn expire(
         Err(crate::iceberg_commit::CommitError::Invalid(message)) => return Err(message),
     };
     let at = (table.namespace.clone(), table.name.clone());
-    match super::iceberg::write_next(
+    let next_location = match super::iceberg::write_next(
         state,
         (account, bucket),
         account,
@@ -374,8 +448,306 @@ async fn expire(
     )
     .await
     {
-        Ok(_) => Ok(()),
-        Err(err) if err.status == 409 => Err(STALE.to_string()),
-        Err(err) => Err(err.message),
+        Ok(next_location) => next_location,
+        Err(err) if err.status == 409 => return Err(STALE.to_string()),
+        Err(err) => return Err(err.message),
+    };
+    // The objects only the expired snapshots referenced: noncurrent now.
+    // (Unmarked, they are still unreferenced file removal's to find.)
+    let gone = references(state, table, None, &expired, true).await?;
+    let next_metadata = (next_location.as_str(), &next);
+    let kept = references(
+        state,
+        table,
+        Some(next_metadata),
+        next["snapshots"].as_array().map_or(&[], Vec::as_slice),
+        false,
+    )
+    .await?;
+    let marked: Vec<String> = gone.difference(&kept).cloned().collect();
+    mark(state, (account, bucket), table, &marked, now).await
+}
+
+/// The keys of `table`'s storage `snapshots` reference (their manifest
+/// lists, those lists' manifests, those manifests' data and delete files),
+/// and, with `metadata` (a metadata file's location and contents), that
+/// file, the files of its metadata log and its statistics files. Files
+/// outside the table's storage are not its own, and not read. `tolerant`:
+/// a file that cannot be read (an expired snapshot's, gone already) names
+/// none, rather than failing (what is still referenced is never guessed).
+async fn references(
+    state: &S3State,
+    table: &TableInfo,
+    metadata: Option<(&str, &Value)>,
+    snapshots: &[Value],
+    tolerant: bool,
+) -> Result<HashSet<String>, String> {
+    let prefix = format!("{}/", table.warehouse_location);
+    let key_of = |location: &str| location.strip_prefix(&prefix).map(str::to_string);
+    let mut keys = HashSet::new();
+    if let Some((location, metadata)) = metadata {
+        keys.extend(key_of(location));
+        let files = |field: &str, name: &str| {
+            metadata[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry[name].as_str().and_then(key_of))
+                .collect::<Vec<_>>()
+        };
+        keys.extend(files("metadata-log", "metadata-file"));
+        keys.extend(files("statistics", "statistics-path"));
+        keys.extend(files("partition-statistics", "statistics-path"));
     }
+    let mut manifests = HashSet::new();
+    for snapshot in snapshots {
+        let Some(list) = snapshot["manifest-list"].as_str() else {
+            continue;
+        };
+        let Some(list_key) = key_of(list) else {
+            continue;
+        };
+        keys.insert(list_key);
+        let named = stored(state, list)
+            .await
+            .and_then(|bytes| crate::iceberg_manifests::manifest_list(&bytes));
+        let listed = match named {
+            Ok(listed) => listed,
+            Err(_) if tolerant => continue,
+            Err(err) => return Err(err),
+        };
+        for manifest in listed {
+            if let Some(manifest_key) = key_of(&manifest)
+                && manifests.insert(manifest_key.clone())
+            {
+                keys.insert(manifest_key);
+                let files = stored(state, &manifest)
+                    .await
+                    .and_then(|bytes| crate::iceberg_manifests::manifest_files(&bytes));
+                match files {
+                    Ok(files) => keys.extend(files.iter().filter_map(|file| key_of(file))),
+                    Err(_) if tolerant => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// The bytes of the table's file at `location`.
+async fn stored(state: &S3State, location: &str) -> Result<Vec<u8>, String> {
+    let location = location.to_string();
+    read(state, move |file| {
+        super::iceberg::stored_file(file, &location, MAX_MANIFEST_BYTES)
+    })
+    .await
+    .map_err(|err| err.message)?
+}
+
+/// Marks the objects `keys` of `table`'s storage noncurrent at `now` (those
+/// marked already keep their time).
+async fn mark(
+    state: &S3State,
+    (account, bucket): (&str, &str),
+    table: &TableInfo,
+    keys: &[String],
+    now: u64,
+) -> Result<(), String> {
+    for key in keys {
+        let (owner, bucket, id, key) = (
+            account.to_string(),
+            bucket.to_string(),
+            table.id.clone(),
+            key.clone(),
+        );
+        let (looked, place, of, named) = (owner.clone(), bucket.clone(), id.clone(), key.clone());
+        let known = read(state, move |file| {
+            file.maintenance(
+                (&looked, &place),
+                Some(&of),
+                (MaintenanceRecord::Noncurrent, &named),
+            )
+        })
+        .await
+        .map_err(|err| err.message)?;
+        if known.is_some() {
+            continue;
+        }
+        write(state, move |tx| {
+            tx.put_maintenance(
+                (&owner, &bucket),
+                Some(&id),
+                (MaintenanceRecord::Noncurrent, &key),
+                now.to_string().as_bytes(),
+            )
+        })
+        .await
+        .map_err(|err| err.message)?;
+    }
+    Ok(())
+}
+
+/// Unreferenced file removal of `table`: the objects of its storage no
+/// snapshot (nor its metadata) references, older than `unreferenced_ms`,
+/// marked noncurrent; those marked `noncurrent_ms` ago deleted for good
+/// ("Deletes of noncurrent objects are permanent"); a marked one referenced
+/// again, or written again since it was marked, unmarked.
+async fn remove_unreferenced(
+    state: &S3State,
+    (account, bucket): (&str, &str),
+    table: &TableInfo,
+    (unreferenced_ms, noncurrent_ms): (u64, u64),
+    now: u64,
+) -> Result<(), String> {
+    let location = table
+        .metadata_location
+        .clone()
+        .expect("run only with a metadata file");
+    let metadata = super::iceberg::read_current(state, table)
+        .await
+        .map_err(|err| err.message)?;
+    if property(&metadata, "gc.enabled").and_then(Value::as_str) == Some("false") {
+        return Err(GC_DISABLED.to_string());
+    }
+    let snapshots = metadata["snapshots"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let referenced = references(
+        state,
+        table,
+        Some((&location, &metadata)),
+        &snapshots,
+        false,
+    )
+    .await?;
+    let (owner, looked, id) = (account.to_string(), bucket.to_string(), table.id.clone());
+    let mut marked: BTreeMap<String, u64> = read(state, move |file| {
+        file.maintenance_records((&owner, &looked), Some(&id), MaintenanceRecord::Noncurrent)
+    })
+    .await
+    .map_err(|err| err.message)?
+    .into_iter()
+    .map(|(key, value)| {
+        let at = std::str::from_utf8(&value)
+            .ok()
+            .and_then(|at| at.parse().ok())
+            .unwrap_or(now);
+        (key, at)
+    })
+    .collect();
+    let warehouse = truthdb_object::warehouse_bucket(&table.id);
+    let mut after: Option<String> = None;
+    let mut to_mark = Vec::new();
+    loop {
+        let (listed, cursor) = (warehouse.clone(), after.clone());
+        let page = read(state, move |file| {
+            file.list_objects(
+                &listed,
+                "",
+                None,
+                cursor.as_deref().map(ListAfter::Key),
+                LISTED,
+            )
+        })
+        .await
+        .map_err(|err| err.message)?
+        .map_err(|err| format!("The table's storage cannot be listed: {err:?}"))?;
+        for object in &page.objects {
+            let key = &object.key;
+            match marked.remove(key) {
+                // Referenced again, or written again since: current.
+                Some(at) if referenced.contains(key) || object.info.mtime_ms > at => {
+                    unmark(state, (account, bucket), table, key).await?;
+                }
+                Some(at) if now >= at.saturating_add(noncurrent_ms) => {
+                    delete(
+                        state,
+                        (account, bucket),
+                        table,
+                        (key, object.info.version),
+                        now,
+                    )
+                    .await?;
+                }
+                Some(_) => {}
+                None if !referenced.contains(key)
+                    && now >= object.info.mtime_ms.saturating_add(unreferenced_ms) =>
+                {
+                    to_mark.push(key.clone());
+                }
+                None => {}
+            }
+        }
+        match (page.truncated, page.objects.last()) {
+            (true, Some(last)) => after = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    // Marks of objects no longer there.
+    for key in marked.keys() {
+        unmark(state, (account, bucket), table, key).await?;
+    }
+    mark(state, (account, bucket), table, &to_mark, now).await
+}
+
+async fn unmark(
+    state: &S3State,
+    (account, bucket): (&str, &str),
+    table: &TableInfo,
+    key: &str,
+) -> Result<(), String> {
+    let (owner, bucket, id, key) = (
+        account.to_string(),
+        bucket.to_string(),
+        table.id.clone(),
+        key.to_string(),
+    );
+    write(state, move |tx| {
+        tx.delete_maintenance_record(
+            (&owner, &bucket),
+            Some(&id),
+            (MaintenanceRecord::Noncurrent, &key),
+        )
+        .map(Ok)
+    })
+    .await
+    .map_err(|err| err.message)
+}
+
+/// Deletes noncurrent object `key` (its version `version`) of `table`'s
+/// storage for good, and its mark.
+async fn delete(
+    state: &S3State,
+    (account, bucket): (&str, &str),
+    table: &TableInfo,
+    (key, version): (&str, u64),
+    now: u64,
+) -> Result<(), String> {
+    let (owner, bucket, id, key) = (
+        account.to_string(),
+        bucket.to_string(),
+        table.id.clone(),
+        key.to_string(),
+    );
+    write(state, move |tx| {
+        // Gone since (or written again: its version another) is no error.
+        let _ = tx.delete_object(
+            &truthdb_object::warehouse_bucket(&id),
+            &key,
+            Some(VersionSel::Seq(version)),
+            true,
+            now,
+            DROP_GRACE_MS,
+        )?;
+        tx.delete_maintenance_record(
+            (&owner, &bucket),
+            Some(&id),
+            (MaintenanceRecord::Noncurrent, &key),
+        )
+        .map(Ok)
+    })
+    .await
+    .map_err(|err| err.message)
 }
