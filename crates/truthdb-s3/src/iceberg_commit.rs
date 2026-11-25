@@ -559,11 +559,18 @@ fn apply_update(
                     ));
                 }
             }
-            if fields
-                .get("schema-id")
-                .is_some_and(|id| !id.is_null() && !id.is_i64())
-            {
-                return Err(invalid("snapshot.schema-id is a whole number."));
+            for field in [
+                "schema-id",
+                "parent-snapshot-id",
+                "first-row-id",
+                "added-rows",
+            ] {
+                if fields
+                    .get(field)
+                    .is_some_and(|id| !id.is_null() && !id.is_i64())
+                {
+                    return Err(invalid(format!("snapshot.{field} is a whole number.")));
+                }
             }
             if by_id(table, "snapshots", "snapshot-id", Some(id)).is_some() {
                 return Err(invalid(format!("Snapshot with id {id} already exists")));
@@ -595,12 +602,22 @@ fn apply_update(
             let mut reference = Map::new();
             reference.insert("snapshot-id".to_string(), json!(id));
             reference.insert("type".to_string(), json!(kind));
+            // Positive whole numbers; a tag keeps none of a branch's
+            // snapshots (as Iceberg's SnapshotRef has them).
             for field in [
                 "max-ref-age-ms",
                 "max-snapshot-age-ms",
                 "min-snapshots-to-keep",
             ] {
                 if let Some(value) = map.get(field).filter(|value| !value.is_null()) {
+                    if value.as_i64().is_none_or(|value| value <= 0) {
+                        return Err(invalid(format!(
+                            "{what}.{field} is a positive whole number."
+                        )));
+                    }
+                    if kind == "tag" && field != "max-ref-age-ms" {
+                        return Err(invalid(format!("A tag does not take {field}.")));
+                    }
                     reference.insert(field.to_string(), value.clone());
                 }
             }
@@ -619,9 +636,17 @@ fn apply_update(
             }
             if name == "main" {
                 table.insert("current-snapshot-id".to_string(), json!(id));
-                let at = stamp.unwrap_or_else(|| crate::objects::now_ms() as i64);
-                stamp = Some(at);
                 let mut log = list(table, "snapshot-log");
+                // In order: never before the log's last entry.
+                let last = log
+                    .last()
+                    .and_then(|entry| entry.get("timestamp-ms"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let at = stamp
+                    .unwrap_or_else(|| crate::objects::now_ms() as i64)
+                    .max(last);
+                stamp = Some(at);
                 log.push(json!({ "snapshot-id": id, "timestamp-ms": at }));
                 table.insert("snapshot-log".to_string(), Value::Array(log));
             }
@@ -874,6 +899,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(behind["last-updated-ms"], 999);
+        // Its snapshot log stays in order: logged no earlier than the last.
+        let log = behind["snapshot-log"].as_array().unwrap();
+        assert_eq!(
+            log[log.len() - 1]["timestamp-ms"],
+            log[log.len() - 2]["timestamp-ms"]
+        );
     }
 
     #[test]
@@ -1032,6 +1063,39 @@ mod tests {
             (
                 json!({"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 9}),
                 "unknown snapshot",
+            ),
+            // A ref's retention: positive whole numbers, a branch's only.
+            (
+                json!({"action": "set-snapshot-ref", "ref-name": "t", "type": "tag",
+                    "snapshot-id": 9, "min-snapshots-to-keep": 1}),
+                "A tag does not take",
+            ),
+            (
+                json!({"action": "set-snapshot-ref", "ref-name": "b", "type": "branch",
+                    "snapshot-id": 9, "max-ref-age-ms": -1}),
+                "positive whole number",
+            ),
+            (
+                json!({"action": "set-snapshot-ref", "ref-name": "b", "type": "branch",
+                    "snapshot-id": 9, "min-snapshots-to-keep": 1.5}),
+                "positive whole number",
+            ),
+            (
+                json!({"action": "add-snapshot", "snapshot": {"snapshot-id": 5, "sequence-number": 1,
+                    "timestamp-ms": 1, "manifest-list": "s3://t--table-s3/m.avro",
+                    "parent-snapshot-id": "abc"}}),
+                "parent-snapshot-id is a whole number",
+            ),
+            (
+                json!({"action": "add-snapshot", "snapshot": {"snapshot-id": 5, "sequence-number": 1,
+                    "timestamp-ms": 1, "manifest-list": "s3://t--table-s3/m.avro", "added-rows": "x"}}),
+                "added-rows is a whole number",
+            ),
+            // A spec added, not the default: its source checked too.
+            (
+                json!({"action": "add-spec", "spec": {"spec-id": 4, "fields": [
+                    {"source-id": 9, "field-id": 1000, "transform": "identity", "name": "p"}]}}),
+                "source field 9",
             ),
             (
                 json!({"action": "assign-uuid", "uuid": "not-a-uuid"}),
