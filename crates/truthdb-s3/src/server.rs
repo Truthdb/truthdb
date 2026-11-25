@@ -522,6 +522,8 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
     // service its requests are signed for.
     match request_service(&request).as_deref() {
         Some("s3vectors") => return Ok(crate::vectors::handle(state, request).await),
+        // S3 Tables' REST-JSON API, the same way.
+        Some("s3tables") => return Ok(crate::tables::handle(state, request).await),
         // IAM and STS (the Query protocol), told apart the same way.
         Some(service @ ("iam" | "sts")) => {
             let service = service.to_string();

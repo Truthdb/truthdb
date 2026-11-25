@@ -151,6 +151,11 @@ fn last(key: &[u8]) -> Result<String, StorageError> {
     String::from_utf8(key[at..].to_vec()).map_err(|_| corrupt("table catalog key"))
 }
 
+/// The table bucket keys of `account`.
+pub(crate) fn account_range(account: &str) -> (Vec<u8>, Vec<u8>) {
+    range(&[account])
+}
+
 impl ObjTxn<'_, '_> {
     /// Makes table bucket `name` of `account`, with id `id`.
     pub fn create_table_bucket(
