@@ -1155,9 +1155,9 @@ mod tests {
             Result<(), TableError>,
             truthdb_core::storage::StorageError,
         >| { ObjFile::new(&mut storage.lock()).transaction(op).unwrap() };
-        let make = |id: &'static str| {
+        let make = |id: Option<&'static str>| {
             move |tx: &mut truthdb_object::ObjTxn<'_, '_>| {
-                guarded(tx, at, Some(id), |tx| {
+                guarded(tx, at, id, |tx| {
                     tx.create_namespace(at, "sales", "n", ("me", 2))
                 })
             }
@@ -1166,6 +1166,9 @@ mod tests {
             tx(&|tx| tx.create_table_bucket(at.0, at.1, "b1", 1)),
             Ok(())
         );
+        // None read when authorized (so by no bucket policy), one made
+        // since: not changed.
+        assert_eq!(tx(&make(None)), Err(TableError::NoSuchTableBucket));
         // Deleted and made again (with other policies) since b1's were read:
         // not changed.
         assert_eq!(tx(&|tx| tx.delete_table_bucket(at.0, at.1)), Ok(()));
@@ -1173,14 +1176,14 @@ mod tests {
             tx(&|tx| tx.create_table_bucket(at.0, at.1, "b2", 1)),
             Ok(())
         );
-        assert_eq!(tx(&make("b1")), Err(TableError::NoSuchTableBucket));
+        assert_eq!(tx(&make(Some("b1"))), Err(TableError::NoSuchTableBucket));
         assert_eq!(
             ObjFile::new(&mut storage.lock())
                 .namespace(at, "sales")
                 .unwrap(),
             None
         );
-        assert_eq!(tx(&make("b2")), Ok(()));
+        assert_eq!(tx(&make(Some("b2"))), Ok(()));
         drop(storage);
         let _ = std::fs::remove_file(&path);
     }

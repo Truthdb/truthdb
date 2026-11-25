@@ -242,15 +242,15 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Whether `account`'s table bucket `bucket` is still the one of id
-    /// `id` (read with the policies a change was authorized by; none read,
-    /// none to check): one deleted and made again since is not it.
+    /// `id`, read with the policies a change was authorized by: one deleted
+    /// and made again since is not it, nor one made since none was read.
     pub fn table_bucket_is(
         &mut self,
         (account, bucket): (&str, &str),
         id: Option<&str>,
     ) -> Result<Result<(), TableError>, StorageError> {
         let Some(id) = id else {
-            return Ok(Ok(()));
+            return Ok(Err(TableError::NoSuchTableBucket));
         };
         let row = self
             .trees
