@@ -231,7 +231,7 @@ pub async fn receive_body(
     key: Option<&crate::ssec::ProvidedKey>,
     class: StorageClass,
     algorithm: Option<&str>,
-) -> Result<(SealedBody, StoredChecksum), S3Error> {
+) -> Result<(SealedBody, StoredChecksum, u64), S3Error> {
     let headers = request.headers().clone();
     // A checksum of an algorithm this server does not compute is refused,
     // not ignored.
@@ -314,7 +314,7 @@ pub async fn receive_body(
         }
         sink.push(state, &decoded).await?;
     }
-    let (_, checksum) = decoder.finish(declared)?;
+    let (len, checksum) = decoder.finish(declared)?;
     if let Some(algorithm) = algorithm
         && checksum.algorithm != algorithm
     {
@@ -329,7 +329,7 @@ pub async fn receive_body(
             "The Content-MD5 you specified did not match what we received.",
         ));
     }
-    Ok((sealed, checksum))
+    Ok((sealed, checksum, len))
 }
 
 /// A body written into the object engine as it arrives: in segments, with
@@ -496,7 +496,7 @@ pub async fn put_object(
     let condition = crate::conditional::Condition::of_write(request.headers())?;
     // An append (a directory bucket's), at the object's current size.
     let offset = crate::append::offset(request.headers())?;
-    let appended_len = crate::append::appended_len(request.headers());
+    let with_metadata = crate::append::with_metadata(request.headers());
     // Fail before writing anything when the bucket or key is wrong, or the
     // condition does not hold.
     let mut append_algorithm = None;
@@ -525,7 +525,7 @@ pub async fn put_object(
             if current.map_or(0, |current| current.size) != offset {
                 return Err(crate::append::invalid_offset());
             }
-            crate::append::check_request(request.headers(), current.is_some())?;
+            crate::append::check_metadata(with_metadata, current.is_some())?;
             // The appended part's checksum is of the object's algorithm.
             append_algorithm = current
                 .and_then(|current| current.attrs.checksum.as_ref())
@@ -543,7 +543,7 @@ pub async fn put_object(
     }
     attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
     let headers = request.headers().clone();
-    let (sealed, checksum) = receive_body(
+    let (sealed, checksum, received) = receive_body(
         state,
         request,
         auth,
@@ -552,6 +552,11 @@ pub async fn put_object(
         append_algorithm.as_deref(),
     )
     .await?;
+    if offset.is_some() && received == 0 {
+        return Err(S3Error::invalid_request(
+            "Request body cannot be empty when 'write offset' is specified.",
+        ));
+    }
     attrs.checksum = Some(checksum);
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (stored, versioning, expiration) =
@@ -589,16 +594,23 @@ pub async fn put_object(
                 {
                     return Ok(Err(err));
                 }
+                // What the early check decided, held again: the object may
+                // have been replaced while the body arrived.
                 let part = attrs.checksum.clone();
-                let whole = match (&part, appended_len) {
-                    (Some(part), Some(len)) => crate::append::appended_checksum(
+                if let Err(err) = crate::append::check_metadata(with_metadata, true)
+                    .and_then(|()| crate::append::check_algorithm(&current, part.as_ref()))
+                {
+                    return Ok(Err(err));
+                }
+                let whole = match &part {
+                    Some(part) => crate::append::appended_checksum(
                         file,
                         (&bucket_name, &key_name),
                         &current,
                         part,
-                        len,
+                        received,
                     )?,
-                    _ => None,
+                    None => None,
                 };
                 // Its attributes stay (an append sets none), with the
                 // checksum of all of it.

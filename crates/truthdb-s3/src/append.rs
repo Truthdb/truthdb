@@ -35,19 +35,16 @@ pub(crate) fn invalid_offset() -> S3Error {
     )
 }
 
-/// What an append may not carry, before its body is read: S3's refusals of
-/// an empty body, and of user metadata for an object that exists.
-pub(crate) fn check_request(headers: &HeaderMap, exists: bool) -> Result<(), S3Error> {
-    if appended_len(headers) == Some(0) {
-        return Err(S3Error::invalid_request(
-            "Request body cannot be empty when 'write offset' is specified.",
-        ));
-    }
-    if exists
-        && headers
-            .keys()
-            .any(|name| name.as_str().starts_with("x-amz-meta-"))
-    {
+/// Whether a request carries user metadata.
+pub(crate) fn with_metadata(headers: &HeaderMap) -> bool {
+    headers
+        .keys()
+        .any(|name| name.as_str().starts_with("x-amz-meta-"))
+}
+
+/// S3's refusal of user metadata on an append to an object that exists.
+pub(crate) fn check_metadata(with_metadata: bool, exists: bool) -> Result<(), S3Error> {
+    if with_metadata && exists {
         return Err(S3Error::invalid_request(
             "Cannot specify both a write offset value and user-defined object metadata for existing objects",
         ));
@@ -55,12 +52,22 @@ pub(crate) fn check_request(headers: &HeaderMap, exists: bool) -> Result<(), S3E
     Ok(())
 }
 
-/// The appended body's length, as the request declares it (checked as the
-/// body is read).
-pub(crate) fn appended_len(headers: &HeaderMap) -> Option<u64> {
-    header(headers, "x-amz-decoded-content-length")
-        .or_else(|| header(headers, "content-length"))
-        .and_then(|value| value.trim().parse().ok())
+/// The appended part's checksum must be of the object's algorithm (the
+/// body was read computing it; the object may have been replaced since).
+pub(crate) fn check_algorithm(
+    current: &ObjectInfo,
+    part: Option<&StoredChecksum>,
+) -> Result<(), S3Error> {
+    match (&current.attrs.checksum, part) {
+        (Some(kept), Some(part)) if kept.algorithm != part.algorithm => {
+            Err(S3Error::invalid_request(format!(
+                "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: {}",
+                kept.algorithm.to_ascii_lowercase(),
+                part.algorithm.to_ascii_lowercase()
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The object's checksum once `part` (the appended body's, `len` bytes) is
@@ -74,8 +81,7 @@ pub(crate) fn appended_checksum(
     part: &StoredChecksum,
     len: u64,
 ) -> Result<Option<StoredChecksum>, StorageError> {
-    // `part` is of the object's algorithm: the body was read computing it,
-    // and one sent with another was refused.
+    // `part` is of the object's algorithm (`check_algorithm`).
     let Some(kept) = &current.attrs.checksum else {
         return Ok(None);
     };

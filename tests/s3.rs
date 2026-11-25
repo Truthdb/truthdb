@@ -18408,6 +18408,31 @@ bare.put_object(Bucket=B, Key="log", Body=b"three", WriteOffsetBytes=8)
 head = s3.head_object(Bucket=B, Key="log", ChecksumMode="ENABLED")
 assert head["ChecksumCRC32"] == crc(b"one two three"), head
 assert s3.list_objects_v2(Bucket=B, Prefix="")["Contents"][0]["Size"] == 13
+# An aws-chunked append with no x-amz-decoded-content-length: its length is
+# its bytes', not its encoding's.
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
+import urllib.request, urllib.error
+def chunked(data, offset):
+    trailer = f"x-amz-checksum-crc32:{crc(data)}"
+    chunks = (f"{len(data):x}\r\n".encode() + data + b"\r\n") if data else b""
+    body = chunks + f"0\r\n{trailer}\r\n\r\n".encode()
+    request = AWSRequest(method="PUT", url=f"http://127.0.0.1:{port}/{B}/log", data=body, headers={
+        "content-encoding": "aws-chunked", "x-amz-trailer": "x-amz-checksum-crc32",
+        "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        "x-amz-write-offset-bytes": str(offset), "content-length": str(len(body))})
+    SigV4Auth(Credentials(key, secret), "s3", "us-east-1").add_auth(request)
+    try:
+        return urllib.request.urlopen(urllib.request.Request(request.url, data=body,
+            headers=dict(request.headers), method="PUT")).status
+    except urllib.error.HTTPError as error:
+        return (error.code, error.read())
+assert chunked(b"four", 13) == 200
+head = s3.head_object(Bucket=B, Key="log", ChecksumMode="ENABLED")
+assert (head["ContentLength"], head["ChecksumCRC32"]) == (17, crc(b"one two threefour")), head
+status, answer = chunked(b"", 17)
+assert status == 400 and b"cannot be empty" in answer, (status, answer)
 # An offset of 0 on a key with no object makes it.
 s3.put_object(Bucket=B, Key="new", Body=b"first", WriteOffsetBytes=0)
 assert s3.get_object(Bucket=B, Key="new")["Body"].read() == b"first"
@@ -18415,10 +18440,10 @@ assert s3.get_object(Bucket=B, Key="new")["Body"].read() == b"first"
 # on an existing one, an empty body, another algorithm, a general bucket.
 refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=12), "InvalidWriteOffset")
 refused(lambda: s3.put_object(Bucket=B, Key="none", Body=b"x", WriteOffsetBytes=3), "InvalidWriteOffset")
-refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=13, Metadata={"k": "v"}),
+refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=17, Metadata={"k": "v"}),
     "InvalidRequest")
-refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"", WriteOffsetBytes=13), "InvalidRequest")
-refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=13, ChecksumAlgorithm="SHA256"),
+refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"", WriteOffsetBytes=17), "InvalidRequest")
+refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=17, ChecksumAlgorithm="SHA256"),
     "InvalidRequest")
 s3.put_object(Bucket="general", Key="g", Body=b"g")
 refused(lambda: s3.put_object(Bucket="general", Key="g", Body=b"x", WriteOffsetBytes=1), "NotImplemented")

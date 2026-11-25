@@ -210,7 +210,7 @@ pub async fn upload_part(
     }
     // Its checksum, of its upload's algorithm when it asked for one,
     // verified (or computed) and kept.
-    let (sealed, checksum) = receive_body(
+    let (sealed, checksum, _) = receive_body(
         state,
         request,
         auth,
