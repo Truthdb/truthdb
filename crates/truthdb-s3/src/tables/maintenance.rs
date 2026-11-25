@@ -342,6 +342,15 @@ async fn maintain(
     Ok(())
 }
 
+/// Whether a table's `gc.enabled` property lets its files be removed: unset
+/// or `true` in any case (any other value is false, as Iceberg's Java
+/// reads it).
+fn gc_enabled(metadata: &Value) -> bool {
+    property(metadata, "gc.enabled")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.eq_ignore_ascii_case("true"))
+}
+
 /// The property `key` of a table's metadata.
 fn property<'a>(metadata: &'a Value, key: &str) -> Option<&'a Value> {
     metadata.get("properties")?.get(key)
@@ -362,7 +371,7 @@ async fn expire(
     let base = super::iceberg::read_current(state, table)
         .await
         .map_err(|err| err.message)?;
-    if property(&base, "gc.enabled").and_then(Value::as_str) == Some("false") {
+    if !gc_enabled(&base) {
         return Err(GC_DISABLED.to_string());
     }
     if property(&base, "history.expire.max-snapshot-age-ms").is_some()
@@ -486,18 +495,11 @@ async fn references(
     snapshots: &[Value],
     tolerant: bool,
 ) -> Result<HashSet<String>, String> {
-    let prefix = format!("{}/", table.warehouse_location);
-    // `s3a://` and `s3n://` name the same objects as `s3://`.
-    let key_of = |location: &str| {
-        let location = ["s3a://", "s3n://"]
-            .iter()
-            .find_map(|scheme| location.strip_prefix(scheme))
-            .map_or_else(|| location.to_string(), |rest| format!("s3://{rest}"));
-        location.strip_prefix(&prefix).map(str::to_string)
-    };
-    // A list or manifest not read hides the files it names: outside the
-    // table's storage (or of no form known) it fails the job, unless what
-    // is sought is files no longer referenced (`tolerant`: fewer found).
+    let bucket = truthdb_object::warehouse_bucket(&table.id);
+    // A location not known to be elsewhere, nor in the table's storage,
+    // may name one of its objects: it fails the job (what is still
+    // referenced is never guessed), unless what is sought is files no
+    // longer referenced (`tolerant`: fewer found).
     let unread = |what: String| -> Result<(), String> {
         if tolerant {
             Ok(())
@@ -507,21 +509,42 @@ async fn references(
             ))
         }
     };
+    // A file's key in the storage (none: elsewhere).
+    let own = |location: &str| -> Result<Option<String>, String> {
+        match place(location, &bucket) {
+            Place::Own(key) => Ok(Some(key)),
+            Place::Elsewhere => Ok(None),
+            Place::Unknown => {
+                unread(format!("The location {location} is not understood")).map(|()| None)
+            }
+        }
+    };
     let mut keys = HashSet::new();
     if let Some((location, metadata)) = metadata {
-        keys.extend(key_of(location));
-        let files = |field: &str, name: &str| {
-            metadata[field]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| entry[name].as_str().and_then(key_of))
-                .collect::<Vec<_>>()
-        };
-        keys.extend(files("metadata-log", "metadata-file"));
-        keys.extend(files("statistics", "statistics-path"));
-        keys.extend(files("partition-statistics", "statistics-path"));
+        keys.extend(own(location)?);
+        for (field, name) in [
+            ("metadata-log", "metadata-file"),
+            ("statistics", "statistics-path"),
+            ("partition-statistics", "statistics-path"),
+        ] {
+            for entry in metadata[field].as_array().into_iter().flatten() {
+                if let Some(location) = entry[name].as_str() {
+                    keys.extend(own(location)?);
+                }
+            }
+        }
     }
+    // A list or manifest is read in the storage only: one elsewhere hides
+    // the files it names.
+    let readable = |location: &str, what: &str| -> Result<Option<String>, String> {
+        match place(location, &bucket) {
+            Place::Own(key) => Ok(Some(key)),
+            _ => unread(format!(
+                "The {what} {location} is outside the table's storage"
+            ))
+            .map(|()| None),
+        }
+    };
     let mut manifests = HashSet::new();
     for snapshot in snapshots {
         // Its manifest list's manifests, or (format version 1) its own.
@@ -530,16 +553,13 @@ async fn references(
             snapshot["manifests"].as_array(),
         ) {
             (Some(list), _) => {
-                let Some(list_key) = key_of(list) else {
-                    unread(format!(
-                        "The manifest list {list} is outside the table's storage"
-                    ))?;
+                let Some(list_key) = readable(list, "manifest list")? else {
                     continue;
                 };
-                keys.insert(list_key);
-                let named = stored(state, list)
+                let named = stored(state, &bucket, &list_key)
                     .await
                     .and_then(|bytes| crate::iceberg_manifests::manifest_list(&bytes));
+                keys.insert(list_key);
                 match named {
                     Ok(listed) => listed,
                     Err(_) if tolerant => continue,
@@ -559,19 +579,20 @@ async fn references(
             }
         };
         for manifest in listed {
-            let Some(manifest_key) = key_of(&manifest) else {
-                unread(format!(
-                    "The manifest {manifest} is outside the table's storage"
-                ))?;
+            let Some(manifest_key) = readable(&manifest, "manifest")? else {
                 continue;
             };
             if manifests.insert(manifest_key.clone()) {
-                keys.insert(manifest_key);
-                let files = stored(state, &manifest)
+                let files = stored(state, &bucket, &manifest_key)
                     .await
                     .and_then(|bytes| crate::iceberg_manifests::manifest_files(&bytes));
+                keys.insert(manifest_key);
                 match files {
-                    Ok(files) => keys.extend(files.iter().filter_map(|file| key_of(file))),
+                    Ok(files) => {
+                        for file in &files {
+                            keys.extend(own(file)?);
+                        }
+                    }
                     Err(_) if tolerant => {}
                     Err(err) => return Err(err),
                 }
@@ -581,9 +602,40 @@ async fn references(
     Ok(keys)
 }
 
-/// The bytes of the table's file at `location`.
-async fn stored(state: &S3State, location: &str) -> Result<Vec<u8>, String> {
-    let location = location.to_string();
+/// Where a location of a table's metadata names a file.
+enum Place {
+    /// An object of the table's storage: its key.
+    Own(String),
+    /// Somewhere else (another bucket, another file system).
+    Elsewhere,
+    /// Not understood.
+    Unknown,
+}
+
+/// Where `location` names a file, as Iceberg's FileIOs read it: the
+/// scheme in any case (`s3`, `s3a` and `s3n` the same), a query or
+/// fragment dropped; in the table's storage (bucket `bucket`) or not.
+fn place(location: &str, bucket: &str) -> Place {
+    let Some((scheme, rest)) = location.split_once("://") else {
+        return Place::Unknown;
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (host, key) = rest.split_once('/').unwrap_or((rest, ""));
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "s3" | "s3a" | "s3n")
+        || !host.eq_ignore_ascii_case(bucket)
+    {
+        return Place::Elsewhere;
+    }
+    if key.is_empty() {
+        Place::Unknown
+    } else {
+        Place::Own(key.to_string())
+    }
+}
+
+/// The bytes of object `key` of the table's storage `bucket`.
+async fn stored(state: &S3State, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
+    let location = format!("s3://{bucket}/{key}");
     read(state, move |file| {
         super::iceberg::stored_file(file, &location, MAX_MANIFEST_BYTES)
     })
@@ -653,7 +705,7 @@ async fn remove_unreferenced(
     let metadata = super::iceberg::read_current(state, table)
         .await
         .map_err(|err| err.message)?;
-    if property(&metadata, "gc.enabled").and_then(Value::as_str) == Some("false") {
+    if !gc_enabled(&metadata) {
         return Err(GC_DISABLED.to_string());
     }
     let snapshots = metadata["snapshots"]
@@ -808,4 +860,72 @@ async fn delete(
             err.message
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_location_names_an_object_of_the_storage_as_icebergs_file_ios_read_it() {
+        let bucket = "t-1--table-s3";
+        let own = |location: &str| match place(location, bucket) {
+            Place::Own(key) => Some(key),
+            _ => None,
+        };
+        for location in [
+            "s3://t-1--table-s3/data/a.parquet",
+            "s3a://t-1--table-s3/data/a.parquet",
+            "S3N://t-1--table-s3/data/a.parquet",
+            "S3://T-1--TABLE-S3/data/a.parquet",
+            "s3://t-1--table-s3/data/a.parquet?versionId=1",
+            "s3://t-1--table-s3/data/a.parquet#part",
+        ] {
+            assert_eq!(
+                own(location).as_deref(),
+                Some("data/a.parquet"),
+                "{location}"
+            );
+        }
+        assert_eq!(
+            own("s3://t-1--table-s3//data/a.parquet").as_deref(),
+            Some("/data/a.parquet")
+        );
+        for elsewhere in [
+            "s3://other/data/a.parquet",
+            "gs://t-1--table-s3/data/a.parquet",
+            "file:///tmp/a.parquet",
+        ] {
+            assert!(
+                matches!(place(elsewhere, bucket), Place::Elsewhere),
+                "{elsewhere}"
+            );
+        }
+        for unknown in [
+            "data/a.parquet",
+            "s3://t-1--table-s3",
+            "s3://t-1--table-s3/",
+        ] {
+            assert!(
+                matches!(place(unknown, bucket), Place::Unknown),
+                "{unknown}"
+            );
+        }
+        // gc.enabled: only unset or true (in any case) lets files be removed.
+        for (value, enabled) in [
+            (None, true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("false"), false),
+            (Some("FALSE"), false),
+            (Some("0"), false),
+            (Some("no"), false),
+        ] {
+            let metadata = match value {
+                Some(value) => json!({"properties": {"gc.enabled": value}}),
+                None => json!({"properties": {}}),
+            };
+            assert_eq!(gc_enabled(&metadata), enabled, "{value:?}");
+        }
+    }
 }

@@ -19144,9 +19144,21 @@ time.sleep(3)
 assert not gone("data/hidden.parquet")
 c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
     {"action": "remove-snapshots", "snapshot-ids": [77]}]}).raise_for_status()
+# A location not understood (no scheme): it fails the job too.
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "set-statistics", "statistics": {"snapshot-id": snapshot_id, "statistics-path": "stats.puffin",
+    "file-size-in-bytes": 4, "file-footer-size-in-bytes": 4, "blob-metadata": []}}]}).raise_for_status()
+for _ in range(300):
+    if "not understood" in files_job("files").get("failureMessage", ""):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"never refused the location: {files_job('files')}")
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "remove-statistics", "snapshot-id": snapshot_id}]}).raise_for_status()
 # gc.enabled false: unreferenced file removal fails for the table.
 c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [],
-    "updates": [{"action": "set-properties", "updates": {"gc.enabled": "false"}}]}).raise_for_status()
+    "updates": [{"action": "set-properties", "updates": {"gc.enabled": "FALSE"}}]}).raise_for_status()
 for _ in range(300):
     if "gc.enabled" in files_job("files").get("failureMessage", ""):
         break
