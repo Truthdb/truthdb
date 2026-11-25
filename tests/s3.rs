@@ -18850,6 +18850,155 @@ refused(lambda: s3.list_parts(Bucket=warehouse, Key="data/00002.parquet", Upload
 print("ok", warehouse)
 "#;
 
+#[test]
+fn pyiceberg_keeps_namespaces_and_tables_in_s3_tables_through_its_rest_catalog() {
+    // A Python with PyIceberg and boto3 installed (pip install pyiceberg boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_PYICEBERG_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_PYICEBERG_PYTHON names no Python with PyIceberg");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "lakes");
+    let (nobody_key, nobody_secret) = user_with_key(&server, &account, "nobody", None);
+    let (other, other_key, other_secret) = account_with_key(&server, "partner");
+    let script = server.dir.join("pyiceberg.py");
+    std::fs::write(&script, PYICEBERG_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg("-I")
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &key,
+            &secret,
+            &nobody_key,
+            &nobody_secret,
+            &other,
+            &other_key,
+            &other_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const PYICEBERG_SCRIPT: &str = r#"
+import json, sys
+import boto3, botocore.config
+from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.exceptions import (BadRequestError, ForbiddenError, NamespaceAlreadyExistsError,
+    NamespaceNotEmptyError, NoSuchNamespaceError, NoSuchTableError, TableAlreadyExistsError)
+from pyiceberg.partitioning import PartitionField, PartitionSpec
+from pyiceberg.schema import Schema
+from pyiceberg.transforms import DayTransform
+from pyiceberg.types import LongType, NestedField, StringType, TimestamptzType
+port, key, secret, nobody_key, nobody_secret, other, other_key, other_secret = sys.argv[1:9]
+t = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+arn = t.create_table_bucket(name="lake")["arn"]
+def catalog(access, secret_key):
+    return RestCatalog("lake", **{
+        "uri": f"http://127.0.0.1:{port}/iceberg", "warehouse": arn,
+        "rest.sigv4-enabled": "true", "rest.signing-name": "s3tables", "rest.signing-region": "us-east-1",
+        "client.access-key-id": access, "client.secret-access-key": secret_key, "client.region": "us-east-1"})
+def refused(call, error):
+    try:
+        call()
+        raise SystemExit(f"not refused: {error.__name__}")
+    except error:
+        pass
+# Without permissions, not even the catalog's config.
+refused(lambda: catalog(nobody_key, nobody_secret), ForbiddenError)
+c = catalog(key, secret)
+# Namespaces: one level.
+c.create_namespace("sales")
+refused(lambda: c.create_namespace("sales"), NamespaceAlreadyExistsError)
+refused(lambda: c.create_namespace(("a", "b")), BadRequestError)
+try:
+    c.list_tables(("a", "b"))
+    raise SystemExit("not refused: multilevel")
+except BadRequestError as error:
+    assert "Multilevel namespaces are not supported" in str(error), error
+refused(lambda: c.create_namespace("other", {"owner": "x"}), BadRequestError)
+assert c.list_namespaces() == [("sales",)], c.list_namespaces()
+assert c.namespace_exists("sales") and not c.namespace_exists("none")
+assert c.load_namespace_properties("sales") == {}
+# One level: no namespace holds another.
+assert c.list_namespaces("sales") == []
+refused(lambda: c.list_namespaces("none"), NoSuchNamespaceError)
+# The catalog's config and errors, as Iceberg's REST API has them.
+base = f"http://127.0.0.1:{port}/iceberg/v1/{c.properties['prefix']}"
+assert c.properties["prefix"] == arn.replace(":", "%3A").replace("/", "%2F"), c.properties["prefix"]
+for path, kind in [("/namespaces/none", "NoSuchNamespaceException"),
+                   ("/namespaces/sales/tables/none", "NoSuchTableException")]:
+    answer = c._session.get(base + path)
+    error = answer.json()["error"]
+    assert (answer.status_code, error["code"], error["type"]) == (404, 404, kind), answer.text
+# A table: its schema, partition spec and properties, as its first metadata file.
+schema = Schema(NestedField(1, "id", LongType(), required=True), NestedField(2, "at", TimestamptzType()),
+    NestedField(3, "who", StringType()), identifier_field_ids=[1])
+spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=DayTransform(), name="at_day"))
+table = c.create_table(("sales", "orders"), schema=schema, partition_spec=spec, properties={"owner": "sales"})
+assert table.metadata.format_version == 2, table.metadata
+assert table.schema().find_field("id").required and table.schema().identifier_field_ids == [1]
+assert [f.name for f in table.spec().fields] == ["at_day"] and table.properties["owner"] == "sales"
+location = table.metadata_location
+assert location.startswith(table.location() + "/metadata/") and location.endswith(".metadata.json"), location
+loaded = c.load_table(("sales", "orders"))
+assert (loaded.metadata.table_uuid, loaded.metadata_location) == (table.metadata.table_uuid, location)
+# The S3 Tables API sees the same table, pointing at the same file.
+got = t.get_table(tableBucketARN=arn, namespace="sales", name="orders")
+assert (got["metadataLocation"], got["warehouseLocation"]) == (location, table.location()), got
+assert c.table_exists(("sales", "orders")) and not c.table_exists(("sales", "none"))
+assert c.list_tables("sales") == [("sales", "orders")]
+refused(lambda: c.create_table(("sales", "orders"), schema=schema), TableAlreadyExistsError)
+refused(lambda: c.create_table(("none", "x"), schema=schema), NoSuchNamespaceError)
+refused(lambda: c.load_table(("sales", "none")), NoSuchTableError)
+# A staged create (a create transaction) is not supported.
+refused(lambda: c.create_table_transaction(("sales", "staged"), schema=schema), BadRequestError)
+assert not c.table_exists(("sales", "staged"))
+refused(lambda: c.list_tables("none"), NoSuchNamespaceError)
+# A table made with the S3 Tables API, without metadata, is no Iceberg table yet.
+t.create_table(tableBucketARN=arn, namespace="sales", name="bare", format="ICEBERG")
+refused(lambda: c.load_table(("sales", "bare")), NoSuchTableError)
+# Renamed: the same table.
+renamed = c.rename_table(("sales", "orders"), ("sales", "orders_2024"))
+assert renamed.metadata.table_uuid == table.metadata.table_uuid
+assert sorted(c.list_tables("sales")) == [("sales", "bare"), ("sales", "orders_2024")]
+# Another account: as the table bucket's policy grants.
+refused(lambda: catalog(other_key, other_secret), ForbiddenError)
+t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"AWS": other},
+    "Action": ["s3tables:GetTableBucket", "s3tables:ListTables", "s3tables:GetTableMetadataLocation"],
+    "Resource": [arn, arn + "/table/*"]}]}))
+theirs = catalog(other_key, other_secret)
+# Loading a table reads its data too (GetTableData).
+refused(lambda: theirs.load_table(("sales", "orders_2024")), ForbiddenError)
+t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"AWS": other},
+    "Action": ["s3tables:GetTableBucket", "s3tables:ListTables", "s3tables:GetTableMetadataLocation",
+               "s3tables:GetTableData"], "Resource": [arn, arn + "/table/*"]}]}))
+assert sorted(theirs.list_tables("sales")) == [("sales", "bare"), ("sales", "orders_2024")]
+assert theirs.load_table(("sales", "orders_2024")).metadata.table_uuid == table.metadata.table_uuid
+refused(lambda: theirs.list_namespaces(), ForbiddenError)
+refused(lambda: theirs.purge_table(("sales", "bare")), ForbiddenError)
+t.delete_table_bucket_policy(tableBucketARN=arn)
+# Dropped only with its files purged; a namespace with tables is not.
+refused(lambda: c.drop_table(("sales", "bare")), BadRequestError)
+refused(lambda: c.drop_namespace("sales"), NamespaceNotEmptyError)
+c.purge_table(("sales", "bare"))
+c.purge_table(("sales", "orders_2024"))
+refused(lambda: c.load_table(("sales", "orders_2024")), NoSuchTableError)
+c.drop_namespace("sales")
+assert c.list_namespaces() == []
+print("ok")
+"#;
+
 const TABLES_SCRIPT: &str = r#"
 import json, sys
 import boto3, botocore.config, botocore.exceptions
