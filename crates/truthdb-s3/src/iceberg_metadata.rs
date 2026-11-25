@@ -92,6 +92,29 @@ pub(crate) fn initial(
     }))
 }
 
+/// A schema a commit adds (Iceberg's form, every id given), checked as a
+/// table's first is: its highest field id.
+pub(crate) fn check_schema(schema: &Value) -> Result<i64, String> {
+    let mut columns = Columns::default();
+    schema_v2(schema, &mut columns)?;
+    Ok(columns.ids.iter().max().copied().unwrap_or(0))
+}
+
+/// Whether partition spec `spec` applies to `schema` (its sources and
+/// transforms, its names), as a table's first is checked.
+pub(crate) fn check_spec(schema: &Value, spec: &Value) -> Result<(), String> {
+    let mut columns = Columns::default();
+    schema_v2(schema, &mut columns)?;
+    partition_spec(spec, &columns).map(|_| ())
+}
+
+/// Whether sort order `order` applies to `schema`.
+pub(crate) fn check_order(schema: &Value, order: &Value) -> Result<(), String> {
+    let mut columns = Columns::default();
+    schema_v2(schema, &mut columns)?;
+    write_order(order, &columns).map(|_| ())
+}
+
 /// What a schema's fields are, as its partition spec, write order and
 /// identifier fields refer to them.
 #[derive(Default)]
