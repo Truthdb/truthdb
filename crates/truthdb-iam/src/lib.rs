@@ -18,7 +18,7 @@ mod tests;
 
 use std::collections::HashMap;
 
-pub use eval::{Decision, evaluate, is_public, without_public_grants};
+pub use eval::{Decision, evaluate, evaluate_all, is_public, without_public_grants};
 pub use policy::{MalformedPolicy, Policy, PolicyKind};
 
 /// A date as milliseconds since the epoch: epoch seconds, or a W3C ISO 8601

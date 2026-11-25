@@ -8552,3 +8552,116 @@ fn a_table_catalog_keeps_buckets_namespaces_and_tables_with_a_versioned_pointer(
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn table_policies_are_kept_per_table_bucket_and_table_and_go_with_them() {
+    use crate::{TableError, TableInfo};
+    let path = temp_path("table-policies");
+    let storage = create(&path);
+    let tx = |op: &dyn Fn(
+        &mut crate::ObjTxn<'_, '_>,
+    ) -> Result<Result<(), TableError>, StorageError>| {
+        ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
+    };
+    let policy = |table: Option<&str>| {
+        ObjFile::new(&mut storage.lock())
+            .table_policy(("111122223333", "warehouse"), table)
+            .unwrap()
+    };
+    let at = ("111122223333", "warehouse");
+    assert_eq!(
+        tx(&|tx| tx.put_table_policy(at, None, b"{}")),
+        Err(TableError::NoSuchTableBucket)
+    );
+    assert_eq!(
+        tx(&|tx| tx.table_bucket_is(at, Some("b"))),
+        Err(TableError::NoSuchTableBucket)
+    );
+    assert_eq!(tx(&|tx| tx.create_table_bucket(at.0, at.1, "b", 1)), Ok(()));
+    // The bucket a change was authorized with: that one only.
+    assert_eq!(tx(&|tx| tx.table_bucket_is(at, Some("b"))), Ok(()));
+    assert_eq!(
+        tx(&|tx| tx.table_bucket_is(at, None)),
+        Err(TableError::NoSuchTableBucket)
+    );
+    assert_eq!(
+        tx(&|tx| tx.table_bucket_is(at, Some("b2"))),
+        Err(TableError::NoSuchTableBucket)
+    );
+    assert_eq!(
+        tx(&|tx| tx.create_namespace(at, "sales", "n", ("me", 1))),
+        Ok(())
+    );
+    for id in ["t-1", "t-10"] {
+        let table = TableInfo {
+            namespace: "sales".to_string(),
+            name: id.replace('-', "_"),
+            id: id.to_string(),
+            created_ms: 1,
+            created_by: "me".to_string(),
+            modified_ms: 1,
+            modified_by: "me".to_string(),
+            metadata_location: None,
+            version_token: "v".to_string(),
+            warehouse_location: String::new(),
+        };
+        assert_eq!(tx(&|tx| tx.create_table(at, &table)), Ok(()));
+    }
+    assert_eq!(
+        tx(&|tx| tx.put_table_policy(at, Some("t-2"), b"{}")),
+        Err(TableError::NoSuchTable)
+    );
+    // Longer than a chunk, and of ids one the other's prefix: each its own.
+    let long = "x".repeat(5000).into_bytes();
+    assert_eq!(tx(&|tx| tx.put_table_policy(at, None, b"bucket")), Ok(()));
+    assert_eq!(
+        tx(&|tx| tx.put_table_policy(at, Some("t-1"), &long)),
+        Ok(())
+    );
+    assert_eq!(
+        tx(&|tx| tx.put_table_policy(at, Some("t-10"), b"ten")),
+        Ok(())
+    );
+    assert_eq!(policy(None), Some(b"bucket".to_vec()));
+    assert_eq!(policy(Some("t-1")), Some(long.clone()));
+    assert_eq!(policy(Some("t-10")), Some(b"ten".to_vec()));
+    // Replaced by a shorter one: none of the longer's chunks stay.
+    assert_eq!(
+        tx(&|tx| tx.put_table_policy(at, Some("t-1"), b"one")),
+        Ok(())
+    );
+    assert_eq!(policy(Some("t-1")), Some(b"one".to_vec()));
+    // Deleted: only its own (and none to delete is no error).
+    assert_eq!(tx(&|tx| tx.delete_table_policy(at, Some("t-10"))), Ok(()));
+    assert_eq!(tx(&|tx| tx.delete_table_policy(at, Some("t-10"))), Ok(()));
+    assert_eq!(
+        (policy(None), policy(Some("t-1")), policy(Some("t-10"))),
+        (Some(b"bucket".to_vec()), Some(b"one".to_vec()), None)
+    );
+    // A table's goes with it, the bucket's with the bucket.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("sales", "t_1", "t-1"), None))
+            .unwrap()
+            .map(|_| ()),
+        Ok(())
+    );
+    assert_eq!(policy(Some("t-1")), None);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("sales", "t_10", "t-10"), None))
+            .unwrap()
+            .map(|_| ()),
+        Ok(())
+    );
+    assert_eq!(policy(None), Some(b"bucket".to_vec()));
+    assert_eq!(tx(&|tx| tx.delete_namespace(at, "sales")), Ok(()));
+    assert_eq!(tx(&|tx| tx.delete_table_bucket(at.0, at.1)), Ok(()));
+    assert_eq!(
+        tx(&|tx| tx.create_table_bucket(at.0, at.1, "b2", 2)),
+        Ok(())
+    );
+    assert_eq!(policy(None), None);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use hyper::HeaderMap;
 use truthdb_core::storage::StorageError;
-use truthdb_iam::{Context, Decision, Identity, Policy, PolicyKind, evaluate};
+use truthdb_iam::{Context, Decision, Identity, Policy, PolicyKind, evaluate_all};
 use truthdb_object::{BUCKET_POLICY, ObjFile, VersionSel};
 
 use crate::error::S3Error;
@@ -636,12 +636,50 @@ impl Authz {
         self.decide(action, arn, Some(owner), None, &self.context)
     }
 
+    /// [`Authz::check_arn`] on a resource with its own policies (an S3
+    /// Tables table bucket's, and a table's), all weighed.
+    pub fn check_arn_with(
+        &self,
+        action: &str,
+        arn: &str,
+        owner: &str,
+        resource_policies: &[&Policy],
+    ) -> Result<(), S3Error> {
+        // The owning account's root always manages its policies (as a
+        // bucket's), so a policy cannot lock it out.
+        if matches!(
+            action,
+            "s3tables:GetTableBucketPolicy"
+                | "s3tables:PutTableBucketPolicy"
+                | "s3tables:DeleteTableBucketPolicy"
+                | "s3tables:GetTablePolicy"
+                | "s3tables:PutTablePolicy"
+                | "s3tables:DeleteTablePolicy"
+        ) && matches!(&self.identity, Identity::Root { account } if account == owner)
+        {
+            return Ok(());
+        }
+        self.decide_all(action, arn, Some(owner), resource_policies, &self.context)
+    }
+
     fn decide(
         &self,
         action: &str,
         arn: &str,
         owner: Option<&str>,
         bucket_policy: Option<&Policy>,
+        context: &Context,
+    ) -> Result<(), S3Error> {
+        let resource_policies: Vec<&Policy> = bucket_policy.into_iter().collect();
+        self.decide_all(action, arn, owner, &resource_policies, context)
+    }
+
+    fn decide_all(
+        &self,
+        action: &str,
+        arn: &str,
+        owner: Option<&str>,
+        resource_policies: &[&Policy],
         context: &Context,
     ) -> Result<(), S3Error> {
         let mut context = context.clone();
@@ -655,7 +693,7 @@ impl Authz {
             context: &context,
         };
         let policies: Vec<&Policy> = self.policies.iter().collect();
-        match evaluate(&request, &policies, owner, bucket_policy) {
+        match evaluate_all(&request, &policies, owner, resource_policies) {
             Decision::Allow => Ok(()),
             Decision::ImplicitDeny | Decision::ExplicitDeny => {
                 Err(S3Error::access_denied("Access Denied"))
