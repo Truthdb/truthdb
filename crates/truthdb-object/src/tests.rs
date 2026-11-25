@@ -8188,6 +8188,21 @@ fn a_rename_moves_a_version_whole_and_replaces_its_destination() {
             .head_object("d--use1-az4--x-s3", key, VersionSel::Latest)
             .unwrap()
     };
+    // Onto itself: as it was (not removed).
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.rename_object(
+                "d--use1-az4--x-s3",
+                ("dir/a", &source),
+                &attrs,
+                "dir/a",
+                2_500,
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(head("dir/a").unwrap(), source);
     let renamed = ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
             tx.rename_object(

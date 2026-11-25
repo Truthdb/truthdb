@@ -18,17 +18,48 @@ use crate::server::{Body, S3State, full};
 
 /// How long a client token is remembered (AWS states none).
 const TOKEN_MS: u64 = 10 * 60 * 1000;
-/// Tokens remembered at most: past it a rename is done but its token not
-/// kept (the expired ones dropped first).
+/// Tokens remembered at most, in all and of one account: past either a
+/// rename is done but its token not kept (the expired ones dropped first).
+/// One account cannot take every other's.
 const MAX_TOKENS: usize = 100_000;
+const MAX_PER_ACCOUNT: usize = 10_000;
 
-/// What a client token's rename was: the account that made it, and the
-/// bucket, key, source and conditions it named.
-type Done = (String, String, String, String, String);
+/// What a client token's rename was: a digest of the bucket, key, source
+/// and conditions it named (whatever their length).
+type Done = [u8; 32];
 
-/// The client tokens of renames done, until they expire.
+/// The client tokens of renames done, by account and token, until they
+/// expire; and how many each account has.
 #[derive(Default)]
-pub struct RenameTokens(Mutex<HashMap<(String, String), (Done, u64)>>);
+pub struct RenameTokens(Mutex<Kept>);
+
+#[derive(Default)]
+struct Kept {
+    by_token: HashMap<(String, String), (Done, u64)>,
+    of_account: HashMap<String, usize>,
+}
+
+impl Kept {
+    fn full(&self, account: &str) -> bool {
+        self.by_token.len() >= MAX_TOKENS
+            || self.of_account.get(account).copied().unwrap_or(0) >= MAX_PER_ACCOUNT
+    }
+
+    /// Drops the tokens expired at `now_ms`, uncounting them.
+    fn prune(&mut self, now_ms: u64) {
+        let Kept {
+            by_token,
+            of_account,
+        } = self;
+        by_token.retain(|(account, _), (_, until)| {
+            let kept = *until > now_ms;
+            if !kept && let Some(count) = of_account.get_mut(account) {
+                *count -= 1;
+            }
+            kept
+        });
+    }
+}
 
 /// A client token's verdict on a rename.
 enum Seen {
@@ -42,8 +73,8 @@ enum Seen {
 
 impl RenameTokens {
     fn seen(&self, account: &str, token: &str, done: &Done, now_ms: u64) -> Seen {
-        let tokens = self.0.lock().expect("rename tokens poisoned");
-        match tokens.get(&(account.to_string(), token.to_string())) {
+        let kept = self.0.lock().expect("rename tokens poisoned");
+        match kept.by_token.get(&(account.to_string(), token.to_string())) {
             Some((kept, until)) if *until > now_ms => {
                 if kept == done {
                     Seen::Done
@@ -56,17 +87,21 @@ impl RenameTokens {
     }
 
     fn keep(&self, account: &str, token: &str, done: Done, now_ms: u64) {
-        let mut tokens = self.0.lock().expect("rename tokens poisoned");
-        if tokens.len() >= MAX_TOKENS {
-            tokens.retain(|_, (_, until)| *until > now_ms);
-            if tokens.len() >= MAX_TOKENS {
+        let mut kept = self.0.lock().expect("rename tokens poisoned");
+        if kept.full(account) {
+            kept.prune(now_ms);
+            if kept.full(account) {
                 return;
             }
         }
-        tokens.insert(
-            (account.to_string(), token.to_string()),
-            (done, now_ms + TOKEN_MS),
-        );
+        let key = (account.to_string(), token.to_string());
+        if kept
+            .by_token
+            .insert(key, (done, now_ms + TOKEN_MS))
+            .is_none()
+        {
+            *kept.of_account.entry(account.to_string()).or_default() += 1;
+        }
     }
 }
 
@@ -137,18 +172,23 @@ pub async fn rename_object(
             "x-amz-client-token is 1 to 64 characters of ASCII 33 to 126",
         ));
     }
-    let conditions: String = CONDITIONS
+    // Its parameters, each length-prefixed so none runs into the next.
+    let mut parameters = ring::digest::Context::new(&ring::digest::SHA256);
+    let conditions = CONDITIONS
         .iter()
-        .map(|name| header(request.headers(), name).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let done: Done = (
-        account.to_string(),
-        bucket.clone(),
-        key.clone(),
-        from.clone(),
-        conditions,
-    );
+        .map(|name| header(request.headers(), name).unwrap_or_default());
+    for part in [bucket.clone(), key.clone(), from.clone()]
+        .into_iter()
+        .chain(conditions)
+    {
+        parameters.update(&(part.len() as u64).to_le_bytes());
+        parameters.update(part.as_bytes());
+    }
+    let done: Done = parameters
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("a SHA-256 digest is 32 bytes");
     let now = now_ms();
     if let Some(token) = &token {
         match state.rename_tokens.seen(account, token, &done, now) {
@@ -183,9 +223,12 @@ pub async fn rename_object(
                     return Ok(Err(failed()));
                 }
             }
+            // (A date that does not parse is no condition, as when it is there.)
             Err(_) => {
                 if header(&headers, "if-match").is_some()
-                    || header(&headers, "if-modified-since").is_some()
+                    || header(&headers, "if-modified-since")
+                        .and_then(|date| crate::objects::parse_http_date(&date))
+                        .is_some()
                 {
                     return Ok(Err(failed()));
                 }
@@ -222,4 +265,53 @@ fn ok() -> Response<Body> {
         .status(StatusCode::OK)
         .body(full(bytes::Bytes::new()))
         .expect("a valid response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_is_its_renames_for_ten_minutes_and_an_account_keeps_its_share() {
+        let tokens = RenameTokens::default();
+        let (one, other) = ([1u8; 32], [2u8; 32]);
+        tokens.keep("111122223333", "t", one, 1_000);
+        assert!(matches!(
+            tokens.seen("111122223333", "t", &one, 1_000),
+            Seen::Done
+        ));
+        assert!(matches!(
+            tokens.seen("111122223333", "t", &other, 1_000),
+            Seen::Mismatch
+        ));
+        // Another account's token of the same name is its own.
+        assert!(matches!(
+            tokens.seen("444455556666", "t", &one, 1_000),
+            Seen::New
+        ));
+        assert!(matches!(
+            tokens.seen("111122223333", "t", &one, 1_000 + TOKEN_MS),
+            Seen::New
+        ));
+        // An account's share: past it, its tokens are not kept, another's
+        // are; the expired ones go to make room.
+        for n in 1..MAX_PER_ACCOUNT {
+            tokens.keep("111122223333", &n.to_string(), one, 1_000);
+        }
+        tokens.keep("111122223333", "full", one, 1_000);
+        assert!(matches!(
+            tokens.seen("111122223333", "full", &one, 1_000),
+            Seen::New
+        ));
+        tokens.keep("444455556666", "theirs", one, 1_000);
+        assert!(matches!(
+            tokens.seen("444455556666", "theirs", &one, 1_000),
+            Seen::Done
+        ));
+        tokens.keep("111122223333", "later", one, 1_000 + TOKEN_MS);
+        assert!(matches!(
+            tokens.seen("111122223333", "later", &one, 1_000 + TOKEN_MS),
+            Seen::Done
+        ));
+    }
 }

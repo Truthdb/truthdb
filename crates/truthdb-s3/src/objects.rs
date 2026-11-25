@@ -673,7 +673,7 @@ pub(crate) fn http_date(ms: u64) -> String {
     )
 }
 
-fn parse_http_date(value: &str) -> Option<u64> {
+pub(crate) fn parse_http_date(value: &str) -> Option<u64> {
     httpdate::parse_http_date(value)
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())

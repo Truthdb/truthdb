@@ -18284,6 +18284,13 @@ etag = s3.head_object(Bucket=B, Key="dir/renamed")["ETag"]
 s3.rename_object(Bucket=B, Key="dir/renamed", RenameSource="dir/x", DestinationIfMatch=etag)
 s3.put_object(Bucket=B, Key="dir/y", Body=b"y")
 s3.rename_object(Bucket=B, Key="dir/new", RenameSource="dir/y", DestinationIfNoneMatch="*")
+# A date that does not parse is no condition, the destination there or not.
+s3.put_object(Bucket=B, Key="dir/d", Body=b"d")
+def garbled(request, **_):
+    request.headers["If-Modified-Since"] = "not a date"
+s3.meta.events.register("before-sign.s3.RenameObject", garbled)
+s3.rename_object(Bucket=B, Key="dir/d2", RenameSource="dir/d")
+s3.meta.events.unregister("before-sign.s3.RenameObject", garbled)
 # The source's.
 s3.put_object(Bucket=B, Key="dir/z", Body=b"z")
 refused(lambda: s3.rename_object(Bucket=B, Key="dir/z2", RenameSource="dir/z",
@@ -18308,6 +18315,11 @@ refused(lambda: s3.rename_object(Bucket=B, Key="dir/t3", RenameSource="dir/t2", 
     "IdempotencyParameterMismatch")
 refused(lambda: s3.rename_object(Bucket=B, Key="dir/t3", RenameSource="dir/t2", ClientToken="x" * 65),
     "InvalidArgument")
+# Parameters of the same lengths, other names: another rename.
+s3.put_object(Bucket=B, Key="dir/u", Body=b"u")
+s3.rename_object(Bucket=B, Key="dir/u2", RenameSource="dir/u", ClientToken="token-2")
+refused(lambda: s3.rename_object(Bucket=B, Key="dir/v2", RenameSource="dir/v", ClientToken="token-2"),
+    "IdempotencyParameterMismatch")
 # A ReadOnly session renames nothing; a general purpose bucket renames none.
 refused(lambda: client(reader_key, reader_secret).rename_object(Bucket=B, Key="dir/r",
     RenameSource="dir/t2"), "AccessDenied")

@@ -689,6 +689,10 @@ impl ObjTxn<'_, '_> {
         let Some(bucket_row) = self.bucket_row(bucket)? else {
             return Ok(Err(ObjectError::NoSuchBucket));
         };
+        // Onto itself it is already so (the steps below would remove it).
+        if from == to {
+            return Ok(Ok(source.clone()));
+        }
         let sums = match source.parts > 0 {
             true => self.part_checksums_of((bucket, from, source.version))?,
             false => Vec::new(),
