@@ -8245,3 +8245,126 @@ fn a_rename_moves_a_version_whole_and_replaces_its_destination() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn an_append_grows_an_object_by_a_part_and_keeps_it_whole() {
+    use crate::{
+        AppendError, MAX_APPEND_PARTS, ObjectAttrs, StorageClass, StoredChecksum, VersionSel,
+    };
+    use md5::{Digest, Md5};
+    let path = temp_path("append");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_directory_bucket("d--use1-az4--x-s3", DEFAULT_ACCOUNT, 1))
+        .unwrap()
+        .unwrap();
+    let seal = |data: &[u8]| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, data, now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        sealed
+    };
+    let sum = |value: &str| StoredChecksum {
+        algorithm: "CRC32".to_string(),
+        full_object: true,
+        value: value.to_string(),
+    };
+    let first = seal(b"one ");
+    let attrs = ObjectAttrs {
+        content_type: Some("text/plain".to_string()),
+        checksum: Some(sum("AAAAAQ==")),
+        ..ObjectAttrs::default()
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.put_object(
+                "d--use1-az4--x-s3",
+                "k",
+                &first,
+                &attrs,
+                StorageClass::Standard,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let head = || {
+        ObjFile::new(&mut storage.lock())
+            .head_object("d--use1-az4--x-s3", "k", VersionSel::Latest)
+            .unwrap()
+            .unwrap()
+    };
+    let append = |data: &[u8], part: &str| {
+        let current = head();
+        let body = seal(data);
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.append_object(
+                    ("d--use1-az4--x-s3", "k"),
+                    &current,
+                    &body,
+                    &current.attrs,
+                    Some(&sum(part)),
+                    now(),
+                    0,
+                )
+            })
+            .unwrap()
+    };
+    append(b"two ", "AAAAAg==").unwrap();
+    let grown = append(b"three", "AAAAAw==").unwrap();
+    // Its parts: the first body, then each appended one; their MD5s make its
+    // ETag, as a multipart object's.
+    assert_eq!((grown.size, grown.parts), (13, 3));
+    let mut digest = Md5::new();
+    for part in [&b"one "[..], b"two ", b"three"] {
+        digest.update(Md5::digest(part));
+    }
+    assert_eq!(grown.md5, <[u8; 16]>::from(digest.finalize()));
+    assert_eq!(grown.attrs.content_type.as_deref(), Some("text/plain"));
+    let part = |place: u16| {
+        ObjFile::new(&mut storage.lock())
+            .part_checksum("d--use1-az4--x-s3", "k", grown.version, place)
+            .unwrap()
+    };
+    assert_eq!(
+        [part(1), part(2), part(3), part(4)],
+        [
+            Some(sum("AAAAAQ==")),
+            Some(sum("AAAAAg==")),
+            Some(sum("AAAAAw==")),
+            None
+        ]
+    );
+    // Whole after the replaced versions' bodies are collected: each part
+    // holds a reference of the new body's.
+    ObjFile::new(&mut storage.lock())
+        .collect_garbage(u64::MAX / 2, ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(
+        read(&storage, head().body, 0, 13).unwrap(),
+        b"one two three"
+    );
+    // No more than 10,000 parts.
+    let mut full = head();
+    full.parts = MAX_APPEND_PARTS;
+    let body = seal(b"more");
+    let refused = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.append_object(
+                ("d--use1-az4--x-s3", "k"),
+                &full,
+                &body,
+                &full.attrs,
+                None,
+                now(),
+                0,
+            )
+        })
+        .unwrap();
+    assert_eq!(refused, Err(AppendError::TooManyParts));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

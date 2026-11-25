@@ -18341,3 +18341,118 @@ part = s3.head_object(Bucket=B, Key="dir/moved", PartNumber=1, ChecksumMode="ENA
 assert part["ChecksumCRC32"] == base64.b64encode(zlib.crc32(first).to_bytes(4, "big")).decode(), part
 print("ok")
 "#;
+
+#[test]
+fn appends_grow_a_directory_buckets_objects_at_their_size() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    let script = server.dir.join("appends.py");
+    std::fs::write(&script, APPENDS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const APPENDS_SCRIPT: &str = r#"
+import sys, base64, hashlib, zlib
+import boto3, botocore.config, botocore.exceptions
+port, key, secret = sys.argv[1:4]
+def client(**config):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}, **config))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+b64 = lambda raw: base64.b64encode(raw).decode()
+crc = lambda data: b64(zlib.crc32(data).to_bytes(4, "big"))
+B = "data--use1-az4--x-s3"
+setup = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(s3={"addressing_style": "path", "disable_s3_express_session_auth": True}))
+setup.create_bucket(Bucket=B, CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+setup.create_bucket(Bucket="general")
+s3 = client()
+# A CRC32 object (the SDK's), appended to: its parts, their CRC32 of the
+# whole, an ETag of two parts, and its size in the answer.
+s3.put_object(Bucket=B, Key="log", Body=b"one ", ContentType="text/plain")
+made = s3.put_object(Bucket=B, Key="log", Body=b"two ", WriteOffsetBytes=4)
+assert made["ResponseMetadata"]["HTTPHeaders"]["x-amz-object-size"] == "8", made
+assert made["ETag"].strip('"').endswith("-2"), made
+head = s3.head_object(Bucket=B, Key="log", ChecksumMode="ENABLED")
+assert (head["ContentLength"], head["ChecksumCRC32"], head["ChecksumType"]) == (8, crc(b"one two "), "FULL_OBJECT"), head
+assert head["ContentType"] == "text/plain" and head["ETag"] == made["ETag"], head
+assert s3.get_object(Bucket=B, Key="log")["Body"].read() == b"one two "
+part = s3.get_object(Bucket=B, Key="log", PartNumber=2, ChecksumMode="ENABLED")
+assert (part["Body"].read(), part["ChecksumCRC32"]) == (b"two ", crc(b"two ")), part
+# Sent with no checksum: of the object's algorithm, so its CRC32 still is.
+bare = client(request_checksum_calculation="when_required")
+bare.put_object(Bucket=B, Key="log", Body=b"three", WriteOffsetBytes=8)
+head = s3.head_object(Bucket=B, Key="log", ChecksumMode="ENABLED")
+assert head["ChecksumCRC32"] == crc(b"one two three"), head
+assert s3.list_objects_v2(Bucket=B, Prefix="")["Contents"][0]["Size"] == 13
+# An aws-chunked append with no x-amz-decoded-content-length: its length is
+# its bytes', not its encoding's.
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
+import urllib.request, urllib.error
+def chunked(data, offset):
+    trailer = f"x-amz-checksum-crc32:{crc(data)}"
+    chunks = (f"{len(data):x}\r\n".encode() + data + b"\r\n") if data else b""
+    body = chunks + f"0\r\n{trailer}\r\n\r\n".encode()
+    request = AWSRequest(method="PUT", url=f"http://127.0.0.1:{port}/{B}/log", data=body, headers={
+        "content-encoding": "aws-chunked", "x-amz-trailer": "x-amz-checksum-crc32",
+        "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        "x-amz-write-offset-bytes": str(offset), "content-length": str(len(body))})
+    SigV4Auth(Credentials(key, secret), "s3", "us-east-1").add_auth(request)
+    try:
+        return urllib.request.urlopen(urllib.request.Request(request.url, data=body,
+            headers=dict(request.headers), method="PUT")).status
+    except urllib.error.HTTPError as error:
+        return (error.code, error.read())
+assert chunked(b"four", 13) == 200
+head = s3.head_object(Bucket=B, Key="log", ChecksumMode="ENABLED")
+assert (head["ContentLength"], head["ChecksumCRC32"]) == (17, crc(b"one two threefour")), head
+status, answer = chunked(b"", 17)
+assert status == 400 and b"cannot be empty" in answer, (status, answer)
+# An offset of 0 on a key with no object makes it.
+s3.put_object(Bucket=B, Key="new", Body=b"first", WriteOffsetBytes=0)
+assert s3.get_object(Bucket=B, Key="new")["Body"].read() == b"first"
+# Refused: another offset than the size, an offset on no object, metadata
+# on an existing one, an empty body, another algorithm, a general bucket.
+refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=12), "InvalidWriteOffset")
+refused(lambda: s3.put_object(Bucket=B, Key="none", Body=b"x", WriteOffsetBytes=3), "InvalidWriteOffset")
+refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=17, Metadata={"k": "v"}),
+    "InvalidRequest")
+refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"", WriteOffsetBytes=17), "InvalidRequest")
+refused(lambda: s3.put_object(Bucket=B, Key="log", Body=b"x", WriteOffsetBytes=17, ChecksumAlgorithm="SHA256"),
+    "InvalidRequest")
+s3.put_object(Bucket="general", Key="g", Body=b"g")
+refused(lambda: s3.put_object(Bucket="general", Key="g", Body=b"x", WriteOffsetBytes=1), "NotImplemented")
+# A SHA256 object: appended to, its checksum is of its parts' (composite).
+s3.put_object(Bucket=B, Key="sha", Body=b"alpha", ChecksumAlgorithm="SHA256")
+s3.put_object(Bucket=B, Key="sha", Body=b"beta", WriteOffsetBytes=5, ChecksumAlgorithm="SHA256")
+head = s3.head_object(Bucket=B, Key="sha", ChecksumMode="ENABLED")
+composite = b64(hashlib.sha256(hashlib.sha256(b"alpha").digest() + hashlib.sha256(b"beta").digest()).digest()) + "-2"
+assert (head["ChecksumSHA256"], head["ChecksumType"]) == (composite, "COMPOSITE"), head
+assert s3.get_object(Bucket=B, Key="sha")["Body"].read() == b"alphabeta"
+print("ok")
+"#;
