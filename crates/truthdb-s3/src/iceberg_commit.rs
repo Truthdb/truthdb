@@ -899,6 +899,19 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(behind["last-updated-ms"], 999);
+        // A snapshot added without moving main, stamped before the logs'
+        // last entry: the table's time does not run back either.
+        let branchless = apply(
+            &second,
+            "s3://t--table-s3/metadata/00002-d.metadata.json",
+            &[],
+            &[json!({"action": "add-snapshot", "snapshot": {"snapshot-id": 8, "parent-snapshot-id": 2,
+                "sequence-number": 3, "timestamp-ms": 5, "manifest-list": "s3://t--table-s3/m8.avro"}})],
+            999,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(branchless["last-updated-ms"], 999);
         // Its snapshot log stays in order: logged no earlier than the last.
         let log = behind["snapshot-log"].as_array().unwrap();
         assert_eq!(
