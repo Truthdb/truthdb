@@ -510,9 +510,9 @@ async fn references(
         }
     };
     // A file's key in the storage (none: elsewhere).
-    let own = |location: &str| -> Result<Option<String>, String> {
+    let own = |location: &str| -> Result<Option<Vec<String>>, String> {
         match place(location, &bucket) {
-            Place::Own(key) => Ok(Some(key)),
+            Place::Own(keys) => Ok(Some(keys)),
             Place::Elsewhere => Ok(None),
             Place::Unknown => {
                 unread(format!("The location {location} is not understood")).map(|()| None)
@@ -521,7 +521,7 @@ async fn references(
     };
     let mut keys = HashSet::new();
     if let Some((location, metadata)) = metadata {
-        keys.extend(own(location)?);
+        keys.extend(own(location)?.into_iter().flatten());
         for (field, name) in [
             ("metadata-log", "metadata-file"),
             ("statistics", "statistics-path"),
@@ -529,16 +529,17 @@ async fn references(
         ] {
             for entry in metadata[field].as_array().into_iter().flatten() {
                 if let Some(location) = entry[name].as_str() {
-                    keys.extend(own(location)?);
+                    keys.extend(own(location)?.into_iter().flatten());
                 }
             }
         }
     }
     // A list or manifest is read in the storage only: one elsewhere hides
     // the files it names.
+    // (One with two readings, a query or fragment, is not read either.)
     let readable = |location: &str, what: &str| -> Result<Option<String>, String> {
         match place(location, &bucket) {
-            Place::Own(key) => Ok(Some(key)),
+            Place::Own(keys) if keys.len() == 1 => Ok(keys.into_iter().next()),
             _ => unread(format!(
                 "The {what} {location} is outside the table's storage"
             ))
@@ -590,7 +591,7 @@ async fn references(
                 match files {
                     Ok(files) => {
                         for file in &files {
-                            keys.extend(own(file)?);
+                            keys.extend(own(file)?.into_iter().flatten());
                         }
                     }
                     Err(_) if tolerant => {}
@@ -604,33 +605,46 @@ async fn references(
 
 /// Where a location of a table's metadata names a file.
 enum Place {
-    /// An object of the table's storage: its key.
-    Own(String),
+    /// Objects of the table's storage: the key (or keys) a reader may read.
+    Own(Vec<String>),
     /// Somewhere else (another bucket, another file system).
     Elsewhere,
-    /// Not understood.
+    /// Not understood, or read differently by readers.
     Unknown,
 }
 
-/// Where `location` names a file, as Iceberg's FileIOs read it: the
-/// scheme in any case (`s3`, `s3a` and `s3n` the same), a query or
-/// fragment dropped; in the table's storage (bucket `bucket`) or not.
+/// Where `location` names a file, as Iceberg's FileIOs read it: the scheme
+/// in any case (`s3`, `s3a` and `s3n` the same), the bucket in any case. A
+/// query or fragment is dropped by some readers and kept by others: both
+/// keys are the table's. A location readers clean up before reading
+/// (spaces or control characters, `.` or `..` segments) is not understood.
 fn place(location: &str, bucket: &str) -> Place {
+    if location.trim() != location || location.chars().any(char::is_control) {
+        return Place::Unknown;
+    }
     let Some((scheme, rest)) = location.split_once("://") else {
         return Place::Unknown;
     };
-    let rest = rest.split(['?', '#']).next().unwrap_or_default();
     let (host, key) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.split(['?', '#']).next().unwrap_or_default();
     if !matches!(scheme.to_ascii_lowercase().as_str(), "s3" | "s3a" | "s3n")
         || !host.eq_ignore_ascii_case(bucket)
     {
         return Place::Elsewhere;
     }
-    if key.is_empty() {
-        Place::Unknown
-    } else {
-        Place::Own(key.to_string())
+    let stripped = key.split(['?', '#']).next().unwrap_or_default();
+    if stripped.is_empty()
+        || key
+            .split(['/', '?', '#'])
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return Place::Unknown;
     }
+    let mut keys = vec![stripped.to_string()];
+    if stripped != key {
+        keys.push(key.to_string());
+    }
+    Place::Own(keys)
 }
 
 /// The bytes of object `key` of the table's storage `bucket`.
@@ -870,7 +884,7 @@ mod tests {
     fn a_location_names_an_object_of_the_storage_as_icebergs_file_ios_read_it() {
         let bucket = "t-1--table-s3";
         let own = |location: &str| match place(location, bucket) {
-            Place::Own(key) => Some(key),
+            Place::Own(keys) => Some(keys),
             _ => None,
         };
         for location in [
@@ -878,37 +892,61 @@ mod tests {
             "s3a://t-1--table-s3/data/a.parquet",
             "S3N://t-1--table-s3/data/a.parquet",
             "S3://T-1--TABLE-S3/data/a.parquet",
-            "s3://t-1--table-s3/data/a.parquet?versionId=1",
-            "s3://t-1--table-s3/data/a.parquet#part",
         ] {
             assert_eq!(
-                own(location).as_deref(),
-                Some("data/a.parquet"),
+                own(location),
+                Some(vec!["data/a.parquet".to_string()]),
+                "{location}"
+            );
+        }
+        // A query or fragment: read without it by some, with it by others.
+        for (location, literal) in [
+            (
+                "s3://t-1--table-s3/data/a.parquet?versionId=1",
+                "data/a.parquet?versionId=1",
+            ),
+            (
+                "s3://t-1--table-s3/data/a.parquet#part",
+                "data/a.parquet#part",
+            ),
+        ] {
+            assert_eq!(
+                own(location),
+                Some(vec!["data/a.parquet".to_string(), literal.to_string()]),
                 "{location}"
             );
         }
         assert_eq!(
-            own("s3://t-1--table-s3//data/a.parquet").as_deref(),
-            Some("/data/a.parquet")
+            own("s3://t-1--table-s3//data/a.parquet"),
+            Some(vec!["/data/a.parquet".to_string()])
         );
         for elsewhere in [
             "s3://other/data/a.parquet",
             "gs://t-1--table-s3/data/a.parquet",
             "file:///tmp/a.parquet",
+            "s3://user@t-1--table-s3/data/a.parquet",
+            "s3://t-1--table-s3:443/data/a.parquet",
         ] {
             assert!(
                 matches!(place(elsewhere, bucket), Place::Elsewhere),
                 "{elsewhere}"
             );
         }
+        // Read differently by readers (cleaned up first): not understood.
         for unknown in [
             "data/a.parquet",
             "s3://t-1--table-s3",
             "s3://t-1--table-s3/",
+            " s3://t-1--table-s3/data/a.parquet",
+            "s3://t-1--table-s3/data/a.parquet ",
+            "\u{1}s3://t-1--table-s3/data/a.parquet",
+            "s3://t-1--table-s3/da\tta/a.parquet",
+            "s3://t-1--table-s3/data/../a.parquet",
+            "s3://t-1--table-s3/./data/a.parquet",
         ] {
             assert!(
                 matches!(place(unknown, bucket), Place::Unknown),
-                "{unknown}"
+                "{unknown:?}"
             );
         }
         // gc.enabled: only unset or true (in any case) lets files be removed.
