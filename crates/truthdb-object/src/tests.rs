@@ -8573,7 +8573,18 @@ fn table_policies_are_kept_per_table_bucket_and_table_and_go_with_them() {
         tx(&|tx| tx.put_table_policy(at, None, b"{}")),
         Err(TableError::NoSuchTableBucket)
     );
+    assert_eq!(
+        tx(&|tx| tx.table_bucket_is(at, Some("b"))),
+        Err(TableError::NoSuchTableBucket)
+    );
     assert_eq!(tx(&|tx| tx.create_table_bucket(at.0, at.1, "b", 1)), Ok(()));
+    // The bucket a change was authorized with: that one only.
+    assert_eq!(tx(&|tx| tx.table_bucket_is(at, Some("b"))), Ok(()));
+    assert_eq!(tx(&|tx| tx.table_bucket_is(at, None)), Ok(()));
+    assert_eq!(
+        tx(&|tx| tx.table_bucket_is(at, Some("b2"))),
+        Err(TableError::NoSuchTableBucket)
+    );
     assert_eq!(
         tx(&|tx| tx.create_namespace(at, "sales", "n", ("me", 1))),
         Ok(())

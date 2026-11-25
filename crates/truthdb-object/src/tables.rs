@@ -241,6 +241,27 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(()))
     }
 
+    /// Whether `account`'s table bucket `bucket` is still the one of id
+    /// `id` (read with the policies a change was authorized by; none read,
+    /// none to check): one deleted and made again since is not it.
+    pub fn table_bucket_is(
+        &mut self,
+        (account, bucket): (&str, &str),
+        id: Option<&str>,
+    ) -> Result<Result<(), TableError>, StorageError> {
+        let Some(id) = id else {
+            return Ok(Ok(()));
+        };
+        let row = self
+            .trees
+            .tree(TABLE_BUCKETS_TREE)
+            .get(self.ctx, &key(&[account, bucket]))?;
+        Ok(match row {
+            Some(row) if bucket_info(bucket, &row)?.id == id => Ok(()),
+            _ => Err(TableError::NoSuchTableBucket),
+        })
+    }
+
     /// Sets the policy of `account`'s table bucket `bucket`, or (`table`,
     /// by id) of one of its tables.
     pub fn put_table_policy(

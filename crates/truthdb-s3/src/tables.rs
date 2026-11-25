@@ -406,8 +406,8 @@ async fn serve(
         origin: None,
     };
     // `action` on `arn`, with the resource's policies.
-    let check = |action: &str, arn: &str, policies: &[Policy]| {
-        let policies: Vec<&Policy> = policies.iter().collect();
+    let check = |action: &str, arn: &str, weighed: &Weighed| {
+        let policies: Vec<&Policy> = weighed.policies.iter().collect();
         authz
             .check_arn_with(
                 &format!("s3tables:{action}"),
@@ -428,7 +428,7 @@ async fn serve(
                     ));
                 }
                 let arn = caller.bucket_arn(name);
-                check("CreateTableBucket", &arn, &[])?;
+                check("CreateTableBucket", &arn, &Weighed::default())?;
                 let (account, name, id) = (caller.account.to_string(), name.to_string(), uuid());
                 write(state, move |tx| {
                     tx.create_table_bucket(&account, &name, &id, crate::objects::now_ms())
@@ -437,7 +437,7 @@ async fn serve(
                 Ok((StatusCode::OK, Some(json!({ "arn": arn }))))
             }
             (&Method::GET, ["buckets"]) => {
-                check("ListTableBuckets", "*", &[])?;
+                check("ListTableBuckets", "*", &Weighed::default())?;
                 match param(&params, "type") {
                     None | Some("customer") => {}
                     // AWS's own table buckets: none here.
@@ -472,8 +472,9 @@ async fn serve(
                     Method::DELETE => "DeleteTableBucketPolicy",
                     _ => return Err(TError::not_implemented("This table bucket policy operation")),
                 };
-                check(action, arn, &policies(state, &caller, &bucket, None).await?)?;
-                resource_policy(state, &caller, (method, &input), &bucket, None).await
+                let weighed = policies(state, &caller, &bucket, None).await?;
+                check(action, arn, &weighed)?;
+                resource_policy(state, &caller, (method, &input), (&bucket, weighed.bucket_id), None).await
             }
             (method, ["buckets", arn]) => {
                 let bucket = caller.bucket_of(arn)?;
@@ -487,7 +488,13 @@ async fn serve(
                     Method::DELETE => {
                         check("DeleteTableBucket", arn, &policies)?;
                         let account = caller.account.to_string();
-                        write(state, move |tx| tx.delete_table_bucket(&account, &bucket)).await?;
+                        let id = policies.bucket_id.clone();
+                        write(state, move |tx| {
+                            guarded(tx, (&account, &bucket), id.as_deref(), |tx| {
+                                tx.delete_table_bucket(&account, &bucket)
+                            })
+                        })
+                        .await?;
                         Ok((StatusCode::NO_CONTENT, None))
                     }
                     _ => Err(TError::not_implemented("This table bucket operation")),
@@ -503,16 +510,19 @@ async fn serve(
                     _ => return Err(TError::bad("namespace is a list of one name.")),
                 };
                 let namespace = namespace_name(namespace)?.to_string();
-                check("CreateNamespace", arn, &policies(state, &caller, &bucket, None).await?)?;
+                let weighed = policies(state, &caller, &bucket, None).await?;
+                check("CreateNamespace", arn, &weighed)?;
                 let (account, id, who) = (caller.account.to_string(), uuid(), caller.who.to_string());
                 let created = namespace.clone();
                 write(state, move |tx| {
-                    tx.create_namespace(
-                        (&account, &bucket),
-                        &created,
-                        &id,
-                        (&who, crate::objects::now_ms()),
-                    )
+                    guarded(tx, (&account, &bucket), weighed.bucket_id.as_deref(), |tx| {
+                        tx.create_namespace(
+                            (&account, &bucket),
+                            &created,
+                            &id,
+                            (&who, crate::objects::now_ms()),
+                        )
+                    })
                 })
                 .await?;
                 Ok((
@@ -562,8 +572,13 @@ async fn serve(
                     Method::DELETE => {
                         check("DeleteNamespace", arn, &policies)?;
                         let account = caller.account.to_string();
-                        write(state, move |tx| tx.delete_namespace((&account, &bucket), &namespace))
-                            .await?;
+                        let id = policies.bucket_id.clone();
+                        write(state, move |tx| {
+                            guarded(tx, (&account, &bucket), id.as_deref(), |tx| {
+                                tx.delete_namespace((&account, &bucket), &namespace)
+                            })
+                        })
+                        .await?;
                         Ok((StatusCode::NO_CONTENT, None))
                     }
                     _ => Err(TError::not_implemented("This namespace operation")),
@@ -577,8 +592,8 @@ async fn serve(
                 if required(&input, "format")? != "ICEBERG" {
                     return Err(TError::bad("format is ICEBERG."));
                 }
-                let policies = policies(state, &caller, &bucket, None).await?;
-                let policies: Vec<&Policy> = policies.iter().collect();
+                let weighed = policies(state, &caller, &bucket, None).await?;
+                let policies: Vec<&Policy> = weighed.policies.iter().collect();
                 let authz = authz.with_keys(&[("s3tables:namespace", namespace.clone())]);
                 authz
                     .check_arn_with("s3tables:CreateTable", arn, caller.account, &policies)
@@ -598,7 +613,13 @@ async fn serve(
                     warehouse_location: format!("s3://{id}--table-s3"),
                 };
                 let (account, made) = (caller.account.to_string(), table.clone());
-                write(state, move |tx| tx.create_table((&account, &bucket), &made)).await?;
+                let bucket_id = weighed.bucket_id.clone();
+                write(state, move |tx| {
+                    guarded(tx, (&account, &bucket), bucket_id.as_deref(), |tx| {
+                        tx.create_table((&account, &bucket), &made)
+                    })
+                })
+                .await?;
                 let bucket = caller.bucket_of(arn)?;
                 Ok((
                     StatusCode::OK,
@@ -767,12 +788,20 @@ async fn serve(
                     return Err(table_error(TableError::NoSuchTable));
                 };
                 let table_arn = caller.table_arn(&bucket, &table.id);
-                check(action, &table_arn, &policies(state, &caller, &bucket, Some(&table.id)).await?)?;
+                let weighed = policies(state, &caller, &bucket, Some(&table.id)).await?;
+                check(action, &table_arn, &weighed)?;
                 let account = caller.account.to_string();
                 let id = table.id.clone();
                 match (method, rest) {
                     (_, ["policy"]) => {
-                        resource_policy(state, &caller, (method, &input), &bucket, Some(&id)).await
+                        resource_policy(
+                            state,
+                            &caller,
+                            (method, &input),
+                            (&bucket, weighed.bucket_id),
+                            Some(&id),
+                        )
+                        .await
                     }
                     (&Method::DELETE, []) => {
                         let token = param(&params, "versionToken").map(str::to_string);
@@ -885,6 +914,31 @@ fn refuse_extras(input: &Map<String, Value>, taken: &[&str]) -> Result<(), TErro
     Ok(())
 }
 
+/// The policies a request is authorized by, and the id of the table bucket
+/// they were read with (none if there was none): a change authorized by
+/// them is made only to that very bucket (see [`guarded`]).
+#[derive(Default)]
+struct Weighed {
+    bucket_id: Option<String>,
+    policies: Vec<Policy>,
+}
+
+/// `op`, if `account`'s table bucket `bucket` is still the one of id `id`
+/// (one deleted and made again since, with other policies, is not it).
+fn guarded<T>(
+    tx: &mut truthdb_object::ObjTxn<'_, '_>,
+    (account, bucket): (&str, &str),
+    id: Option<&str>,
+    op: impl FnOnce(
+        &mut truthdb_object::ObjTxn<'_, '_>,
+    ) -> Result<Result<T, TableError>, truthdb_core::storage::StorageError>,
+) -> Result<Result<T, TableError>, truthdb_core::storage::StorageError> {
+    match tx.table_bucket_is((account, bucket), id)? {
+        Ok(()) => op(tx),
+        Err(err) => Ok(Err(err)),
+    }
+}
+
 /// The policies that weigh on a request on table bucket `bucket` (its
 /// own), or on its table of id `table` (the bucket's and the table's).
 async fn policies(
@@ -892,18 +946,19 @@ async fn policies(
     caller: &Caller<'_>,
     bucket: &str,
     table: Option<&str>,
-) -> Result<Vec<Policy>, TError> {
+) -> Result<Weighed, TError> {
     let (account, bucket) = (caller.account.to_string(), bucket.to_string());
     let table = table.map(str::to_string);
-    let texts = read(state, move |file| {
+    let (bucket_id, texts) = read(state, move |file| {
+        let bucket_id = file.table_bucket(&account, &bucket)?.map(|found| found.id);
         let mut texts = vec![file.table_policy((&account, &bucket), None)?];
         if let Some(id) = &table {
             texts.push(file.table_policy((&account, &bucket), Some(id))?);
         }
-        Ok(texts)
+        Ok((bucket_id, texts))
     })
     .await?;
-    texts
+    let policies = texts
         .into_iter()
         .flatten()
         .map(|text| {
@@ -915,7 +970,11 @@ async fn policies(
                     TError::from(S3Error::internal("A stored table policy does not parse."))
                 })
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(Weighed {
+        bucket_id,
+        policies,
+    })
 }
 
 /// Put, Get and DeleteTableBucketPolicy (`table` none), or TablePolicy
@@ -924,7 +983,7 @@ async fn resource_policy(
     state: &S3State,
     caller: &Caller<'_>,
     (method, input): (&Method, &Map<String, Value>),
-    bucket: &str,
+    (bucket, bucket_id): (&str, Option<String>),
     table: Option<&str>,
 ) -> Result<(StatusCode, Option<Value>), TError> {
     let (account, bucket) = (caller.account.to_string(), bucket.to_string());
@@ -944,7 +1003,9 @@ async fn resource_policy(
                 });
             }
             write(state, move |tx| {
-                tx.put_table_policy((&account, &bucket), table.as_deref(), text.as_bytes())
+                guarded(tx, (&account, &bucket), bucket_id.as_deref(), |tx| {
+                    tx.put_table_policy((&account, &bucket), table.as_deref(), text.as_bytes())
+                })
             })
             .await?;
             Ok((StatusCode::OK, None))
@@ -966,7 +1027,9 @@ async fn resource_policy(
         }
         _ => {
             write(state, move |tx| {
-                tx.delete_table_policy((&account, &bucket), table.as_deref())
+                guarded(tx, (&account, &bucket), bucket_id.as_deref(), |tx| {
+                    tx.delete_table_policy((&account, &bucket), table.as_deref())
+                })
             })
             .await?;
             Ok((StatusCode::NO_CONTENT, None))
@@ -1058,5 +1121,67 @@ mod tests {
             assert!(!valid_name(bad), "{bad}");
         }
         assert!(namespace_name("awsdata").is_err() && table_name("awsdata").is_ok());
+    }
+
+    #[test]
+    fn a_change_is_made_only_to_the_table_bucket_it_was_authorized_on() {
+        use truthdb_core::storage::{Storage, StorageOptions};
+        use truthdb_object::ObjFile;
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-tables-guard-{}-{}",
+            std::process::id(),
+            crate::objects::now_ms()
+        ));
+        let storage = Storage::create_with_wal_bounds(
+            path.clone(),
+            StorageOptions {
+                size_bytes: 64 << 20,
+                wal_ratio: 0.05,
+                metadata_ratio: 0.08,
+                snapshot_ratio: 0.02,
+                allocator_ratio: 0.02,
+                reserved_ratio: 0.17,
+                default_collation: None,
+            },
+            8 << 20,
+            8 << 20,
+            truthdb_engine::database_engines,
+        )
+        .expect("create");
+        let at = ("111122223333", "shared");
+        let tx = |op: &dyn Fn(
+            &mut truthdb_object::ObjTxn<'_, '_>,
+        ) -> Result<
+            Result<(), TableError>,
+            truthdb_core::storage::StorageError,
+        >| { ObjFile::new(&mut storage.lock()).transaction(op).unwrap() };
+        let make = |id: &'static str| {
+            move |tx: &mut truthdb_object::ObjTxn<'_, '_>| {
+                guarded(tx, at, Some(id), |tx| {
+                    tx.create_namespace(at, "sales", "n", ("me", 2))
+                })
+            }
+        };
+        assert_eq!(
+            tx(&|tx| tx.create_table_bucket(at.0, at.1, "b1", 1)),
+            Ok(())
+        );
+        // Deleted and made again (with other policies) since b1's were read:
+        // not changed.
+        assert_eq!(tx(&|tx| tx.delete_table_bucket(at.0, at.1)), Ok(()));
+        assert_eq!(
+            tx(&|tx| tx.create_table_bucket(at.0, at.1, "b2", 1)),
+            Ok(())
+        );
+        assert_eq!(tx(&make("b1")), Err(TableError::NoSuchTableBucket));
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .namespace(at, "sales")
+                .unwrap(),
+            None
+        );
+        assert_eq!(tx(&make("b2")), Ok(()));
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
     }
 }

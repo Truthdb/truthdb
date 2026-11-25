@@ -18611,6 +18611,20 @@ them.delete_table(tableBucketARN=arn, namespace="sales", name="orders")
 t.delete_table_bucket_policy(tableBucketARN=arn)
 refused(lambda: them.get_table_bucket(tableBucketARN=arn), "ForbiddenException")
 refused(lambda: t.get_table_bucket_policy(tableBucketARN=arn), "NotFoundException")
+# A policy denying everything to everyone locks out all but the owner's
+# root's policy changes: it can still remove it (and a table's).
+t.create_table(tableBucketARN=arn, namespace="sales", name="locked", format="ICEBERG")
+deny_all = policy("Deny", "*", "s3tables:*", "*")
+t.put_table_policy(tableBucketARN=arn, namespace="sales", name="locked", resourcePolicy=deny_all)
+t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=deny_all)
+refused(lambda: t.get_table_bucket(tableBucketARN=arn), "ForbiddenException")
+refused(lambda: t.get_table(tableBucketARN=arn, namespace="sales", name="locked"), "ForbiddenException")
+assert t.get_table_bucket_policy(tableBucketARN=arn)["resourcePolicy"] == deny_all
+t.delete_table_bucket_policy(tableBucketARN=arn)
+refused(lambda: t.delete_table(tableBucketARN=arn, namespace="sales", name="locked"), "ForbiddenException")
+t.delete_table_policy(tableBucketARN=arn, namespace="sales", name="locked")
+t.delete_table(tableBucketARN=arn, namespace="sales", name="locked")
+assert t.get_table_bucket(tableBucketARN=arn)["name"] == "shared"
 # A policy goes with its bucket: one made again of the name has none.
 t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=granting)
 for name in ["sales", "theirs"]:

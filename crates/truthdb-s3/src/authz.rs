@@ -645,6 +645,20 @@ impl Authz {
         owner: &str,
         resource_policies: &[&Policy],
     ) -> Result<(), S3Error> {
+        // The owning account's root always manages its policies (as a
+        // bucket's), so a policy cannot lock it out.
+        if matches!(
+            action,
+            "s3tables:GetTableBucketPolicy"
+                | "s3tables:PutTableBucketPolicy"
+                | "s3tables:DeleteTableBucketPolicy"
+                | "s3tables:GetTablePolicy"
+                | "s3tables:PutTablePolicy"
+                | "s3tables:DeleteTablePolicy"
+        ) && matches!(&self.identity, Identity::Root { account } if account == owner)
+        {
+            return Ok(());
+        }
         self.decide_all(action, arn, Some(owner), resource_policies, &self.context)
     }
 
