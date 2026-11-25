@@ -1115,6 +1115,7 @@ pub async fn get_object(
         activity_flush: state.activity_flush,
         trail_logs: state.trail_logs.clone(),
         trail_flush: state.trail_flush,
+        table_maintenance: state.table_maintenance,
         trail_selectors: state.trail_selectors.clone(),
         sessions: state.sessions.clone(),
         rename_tokens: state.rename_tokens.clone(),
