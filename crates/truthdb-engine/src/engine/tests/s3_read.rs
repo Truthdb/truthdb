@@ -1462,3 +1462,176 @@ fn the_object_jobs_apply_lifecycle_rules() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+/// An Arrow-written Parquet file of `batches`, a row group each.
+fn arrow_file(
+    batches: &[arrow_array::RecordBatch],
+    props: parquet::file::properties::WriterProperties,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(&mut out, batches[0].schema(), Some(props)).unwrap();
+    for batch in batches {
+        writer.write(batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+    out
+}
+
+#[test]
+fn parquet_objects_read_as_arrow_batches_within_their_limits() {
+    use arrow_array::{Array, Int64Array, ListArray, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let path = unique_temp_path("s3-read-arrow");
+    let engine = new_engine(&path);
+    bucket(&engine, "arw");
+    let id =
+        |n: i32| std::collections::HashMap::from([("PARQUET:field_id".to_string(), n.to_string())]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false).with_metadata(id(1)),
+        Field::new("name", DataType::Utf8, true).with_metadata(id(2)),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )
+        .with_metadata(id(3)),
+    ]));
+    let batch = |from: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(from..from + 3)),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("a")])),
+                Arc::new(ListArray::from_iter_primitive::<
+                    arrow_array::types::Int64Type,
+                    _,
+                    _,
+                >(vec![
+                    Some(vec![Some(1), Some(2)]),
+                    None,
+                    Some(vec![]),
+                ])),
+            ],
+        )
+        .unwrap()
+    };
+    let props = || parquet::file::properties::WriterProperties::builder().build();
+    put(
+        &engine,
+        "arw",
+        "two",
+        &arrow_file(&[batch(0), batch(3)], props()),
+    );
+    let file = open_arrow_parquet(&engine.storage().core_arc(), "arw", "two").unwrap();
+    assert_eq!(file.metadata().num_row_groups(), 2);
+    // The field ids kept; the strings a dictionary.
+    let read = file.schema();
+    assert_eq!(read.field(0).metadata()["PARQUET:field_id"], "1");
+    assert!(matches!(
+        read.field(1).data_type(),
+        DataType::Dictionary(..)
+    ));
+    let second: Vec<RecordBatch> = file.batches(1).unwrap().map(Result::unwrap).collect();
+    let ids: Vec<i64> = second
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            ids.values().to_vec()
+        })
+        .collect();
+    assert_eq!(ids, [3, 4, 5]);
+    let names = arrow_cast_strings(second[0].column(1));
+    assert_eq!(names, [Some("a".to_string()), None, Some("a".to_string())]);
+    let tags = second[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert!(tags.is_null(1));
+    assert_eq!(tags.value_length(0), 2);
+
+    // A row group declaring more than the budget (1 MiB under test)
+    // decompressed: refused before any page is read.
+    let big = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from_iter_values(0..200_000))],
+    )
+    .unwrap();
+    let plain = || {
+        parquet::file::properties::WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .build()
+    };
+    put(&engine, "arw", "big", &arrow_file(&[big], plain()));
+    let refused = open_arrow_parquet(&engine.storage().core_arc(), "arw", "big")
+        .err()
+        .unwrap();
+    assert!(refused.contains("row group"), "{refused}");
+
+    // A chunk whose pages decompress past what its metadata declares.
+    let small = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from_iter_values(0..1000))],
+    )
+    .unwrap();
+    let lying = with_footer(&arrow_file(&[small.clone()], plain()), |metadata| {
+        let mut builder = metadata.clone().into_builder();
+        for group in builder.take_row_groups() {
+            let column = group.columns()[0].clone();
+            let shrunk = column
+                .into_builder()
+                .set_total_uncompressed_size(100)
+                .build()
+                .unwrap();
+            builder = builder.add_row_group(
+                group
+                    .into_builder()
+                    .set_column_metadata(vec![shrunk])
+                    .build()
+                    .unwrap(),
+            );
+        }
+        builder.build()
+    });
+    put(&engine, "arw", "lying", &lying);
+    let file = open_arrow_parquet(&engine.storage().core_arc(), "arw", "lying").unwrap();
+    let failed: Vec<Result<RecordBatch, String>> = file.batches(0).unwrap().collect();
+    let err = failed.last().unwrap().as_ref().err().unwrap();
+    assert!(err.contains("declared size"), "{err}");
+    // As declared, the same file reads.
+    put(&engine, "arw", "honest", &arrow_file(&[small], plain()));
+    let file = open_arrow_parquet(&engine.storage().core_arc(), "arw", "honest").unwrap();
+    let rows: usize = file
+        .batches(0)
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum();
+    assert_eq!(rows, 1000);
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+/// The strings of a dictionary array of strings.
+fn arrow_cast_strings(array: &arrow_array::ArrayRef) -> Vec<Option<String>> {
+    use arrow_array::{Array, StringArray, types::Int32Type};
+    let dictionary = array
+        .as_any()
+        .downcast_ref::<arrow_array::DictionaryArray<Int32Type>>()
+        .unwrap();
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    (0..dictionary.len())
+        .map(|row| dictionary.key(row).map(|key| values.value(key).to_string()))
+        .collect()
+}

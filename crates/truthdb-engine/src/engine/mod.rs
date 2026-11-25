@@ -1616,6 +1616,7 @@ mod queue_sql;
 #[cfg(test)]
 mod relational_tests;
 mod s3_parquet;
+pub use s3_parquet::{ArrowParquet, open_arrow_parquet};
 mod s3_read;
 mod s3_sql;
 #[cfg(test)]
