@@ -1,7 +1,7 @@
 //! S3 Tables' catalog: an account's table buckets, their namespaces and
 //! their tables (each with its id, its warehouse location and the pointer
 //! to its current Iceberg metadata file, changed by compare-and-swap of a
-//! version token).
+//! version token), and the policies of table buckets and tables.
 
 use serde_json::{Value, json};
 use truthdb_core::relstore::btree::TreeInsert;
@@ -9,7 +9,8 @@ use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
 use crate::{
-    ObjFile, ObjTxn, TABLE_BUCKETS_TREE, TABLE_IDS_TREE, TABLE_NAMESPACES_TREE, TABLES_TREE,
+    ObjFile, ObjTxn, TABLE_BUCKETS_TREE, TABLE_IDS_TREE, TABLE_NAMESPACES_TREE,
+    TABLE_POLICIES_TREE, TABLES_TREE,
 };
 
 /// Why a catalog change was refused (the storage itself worked).
@@ -66,6 +67,22 @@ fn corrupt(what: &str) -> StorageError {
 /// The key of `parts`, joined by 0 bytes (no name has one).
 fn key(parts: &[&str]) -> Vec<u8> {
     parts.join("\0").into_bytes()
+}
+
+/// The key prefix of a table bucket's policy (`table` none) or a table's
+/// (by its id): a marker after the bucket keeps a bucket policy's chunks
+/// apart from its tables' policies.
+fn policy_prefix(account: &str, bucket: &str, table: Option<&str>) -> Vec<u8> {
+    let mut prefix = key(&[account, bucket]);
+    match table {
+        None => prefix.extend_from_slice(&[0, 1]),
+        Some(id) => {
+            prefix.extend_from_slice(&[0, 2]);
+            prefix.extend_from_slice(id.as_bytes());
+            prefix.push(0);
+        }
+    }
+    prefix
 }
 
 /// The keys after `parts` (and a 0 byte), up to the first past them.
@@ -219,6 +236,66 @@ impl ObjTxn<'_, '_> {
             return Ok(Err(TableError::NotEmpty));
         }
         buckets.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+        let policies = self.trees.tree(TABLE_POLICIES_TREE);
+        self.delete_document(&policies, &policy_prefix(account, name, None))?;
+        Ok(Ok(()))
+    }
+
+    /// Sets the policy of `account`'s table bucket `bucket`, or (`table`,
+    /// by id) of one of its tables.
+    pub fn put_table_policy(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+        policy: &[u8],
+    ) -> Result<Result<(), TableError>, StorageError> {
+        if let Err(err) = self.policy_holder((account, bucket), table)? {
+            return Ok(Err(err));
+        }
+        let policies = self.trees.tree(TABLE_POLICIES_TREE);
+        self.put_document(policies, &policy_prefix(account, bucket, table), policy)?;
+        Ok(Ok(()))
+    }
+
+    /// Deletes the policy [`ObjTxn::put_table_policy`] sets (none is no
+    /// error).
+    pub fn delete_table_policy(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+    ) -> Result<Result<(), TableError>, StorageError> {
+        if let Err(err) = self.policy_holder((account, bucket), table)? {
+            return Ok(Err(err));
+        }
+        let policies = self.trees.tree(TABLE_POLICIES_TREE);
+        self.delete_document(&policies, &policy_prefix(account, bucket, table))?;
+        Ok(Ok(()))
+    }
+
+    /// Whether the table bucket (and the table of id `table`) a policy is
+    /// of exists.
+    fn policy_holder(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+    ) -> Result<Result<(), TableError>, StorageError> {
+        if self
+            .trees
+            .tree(TABLE_BUCKETS_TREE)
+            .get(self.ctx, &key(&[account, bucket]))?
+            .is_none()
+        {
+            return Ok(Err(TableError::NoSuchTableBucket));
+        }
+        if let Some(id) = table
+            && self
+                .trees
+                .tree(TABLE_IDS_TREE)
+                .get(self.ctx, &key(&[account, bucket, id]))?
+                .is_none()
+        {
+            return Ok(Err(TableError::NoSuchTable));
+        }
         Ok(Ok(()))
     }
 
@@ -357,6 +434,8 @@ impl ObjTxn<'_, '_> {
             &mut OpMode::Txn(self.txn),
             &key(&[account, bucket, &table.id]),
         )?;
+        let policies = self.trees.tree(TABLE_POLICIES_TREE);
+        self.delete_document(&policies, &policy_prefix(account, bucket, Some(&table.id)))?;
         Ok(Ok(table))
     }
 
@@ -457,6 +536,23 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
+    /// The policy of `account`'s table bucket `bucket`, or (`table`, by
+    /// id) of one of its tables.
+    pub fn table_policy(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(tree) = self.existing_tree(TABLE_POLICIES_TREE)? else {
+            return Ok(None);
+        };
+        crate::documents::read(
+            &mut self.core.page_ctx(0),
+            &tree,
+            &policy_prefix(account, bucket, table),
+        )
+    }
+
     pub fn table_bucket(
         &mut self,
         account: &str,

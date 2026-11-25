@@ -233,6 +233,10 @@ const TABLE_NAMESPACES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 51;
 const TABLES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 52;
 /// (account, 0, table bucket, 0, table id) -> (namespace, 0, name).
 const TABLE_IDS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 53;
+/// (account, 0, table bucket, 0, 1, chunk) -> a table bucket's policy, and
+/// (account, 0, table bucket, 0, 2, table id, 0, chunk) -> a table's (its
+/// document in chunks, see `documents`).
+const TABLE_POLICIES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 54;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -357,7 +361,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 54;
+const TREE_COUNT: usize = 55;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
