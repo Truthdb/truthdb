@@ -420,3 +420,45 @@ fn access_key_secrets_are_reported_in_plaintext_only_in_an_unencrypted_database(
     drop(engine);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn an_import_is_not_made_into_a_deleted_tables_storage() {
+    let path = unique_temp_path("objects-import-table");
+    let engine = new_engine(&path);
+    let at = (truthdb_object::DEFAULT_ACCOUNT, "lake");
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.create_table_bucket(at.0, at.1, "b", 1)?.unwrap();
+                tx.create_namespace(at, "sales", "n", ("me", 1))?.unwrap();
+                tx.create_table(
+                    at,
+                    &truthdb_object::TableInfo {
+                        namespace: "sales".to_string(),
+                        name: "orders".to_string(),
+                        id: "t-1".to_string(),
+                        created_ms: 1,
+                        created_by: "me".to_string(),
+                        modified_ms: 1,
+                        modified_by: "me".to_string(),
+                        metadata_location: None,
+                        version_token: "v".to_string(),
+                        warehouse_location: "s3://t-1--table-s3".to_string(),
+                    },
+                )?
+                .unwrap();
+                Ok(())
+            })
+        })
+        .expect("a table");
+    let import = "s3 create import http://127.0.0.1:1 us-east-1 k s s3://src/ s3://t-1--table-s3/";
+    // Its table deleted (its storage not yet removed): no bucket to import to.
+    engine
+        .object(|file| file.transaction(|tx| tx.delete_table(at, ("sales", "orders", "t-1"), None)))
+        .expect("delete")
+        .expect("deleted");
+    let refused = engine.execute(import).expect_err("refused");
+    assert!(refused.to_string().contains("does not exist"), "{refused}");
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

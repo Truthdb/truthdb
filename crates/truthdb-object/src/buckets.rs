@@ -36,6 +36,19 @@ pub struct BucketInfo {
     /// A directory bucket's zone id (its name's `--<zone>--x-s3`); none for
     /// a general purpose bucket.
     pub zone: Option<String>,
+    /// An S3 Tables table's storage (`<table id>--table-s3`): of what table
+    /// bucket; none for a bucket made with S3's API.
+    pub warehouse: Option<Warehouse>,
+}
+
+/// An S3 Tables table's storage bucket (see `tables`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warehouse {
+    /// The table bucket (of the bucket's owner) whose table it is.
+    pub table_bucket: String,
+    /// Its table was deleted: it is no longer there, and its objects are
+    /// being removed.
+    pub dropped: bool,
 }
 
 /// Why a bucket operation was refused (the storage itself worked).
@@ -53,8 +66,8 @@ pub enum BucketError {
 }
 
 /// A bucket's stored row: creation time, versioning state, where its journal
-/// starts, its owning account, whether Object Lock is enabled, and a
-/// directory bucket's zone.
+/// starts, its owning account, whether Object Lock is enabled, a directory
+/// bucket's zone, and a table's storage bucket's table bucket.
 pub(crate) struct BucketRow {
     pub created_ms: u64,
     pub versioning: Versioning,
@@ -62,6 +75,7 @@ pub(crate) struct BucketRow {
     pub owner: String,
     pub object_lock: bool,
     pub zone: Option<String>,
+    pub warehouse: Option<Warehouse>,
 }
 
 impl BucketRow {
@@ -74,14 +88,18 @@ impl BucketRow {
         });
         out.extend_from_slice(&self.journal_from.to_le_bytes());
         out.extend_from_slice(self.owner.as_bytes());
-        // Only a bucket with Object Lock (1), or a directory bucket (2, then
-        // its zone), has the byte: the others stay readable by a release
-        // from before it. A directory bucket has no Object Lock.
+        // Only a bucket with Object Lock (1), a directory bucket (2, then
+        // its zone), or a table's storage (3, or 4 once dropped, then its
+        // table bucket) has the byte: the others stay readable by a release
+        // from before it. None has more than one.
         if self.object_lock {
             out.push(1);
         } else if let Some(zone) = &self.zone {
             out.push(2);
             out.extend_from_slice(zone.as_bytes());
+        } else if let Some(warehouse) = &self.warehouse {
+            out.push(if warehouse.dropped { 4 } else { 3 });
+            out.extend_from_slice(warehouse.table_bucket.as_bytes());
         }
         out
     }
@@ -95,12 +113,18 @@ impl BucketRow {
         if ![9, 17, 29].contains(&bytes.len()) && bytes.len() < 30 {
             return Err(corrupt());
         }
-        let (object_lock, zone) = match bytes.get(29) {
-            None => (false, None),
-            Some(1) if bytes.len() == 30 => (true, None),
-            Some(2) if bytes.len() > 30 => (
+        let rest = || String::from_utf8(bytes[30..].to_vec()).map_err(|_| corrupt());
+        let (object_lock, zone, warehouse) = match bytes.get(29) {
+            None => (false, None, None),
+            Some(1) if bytes.len() == 30 => (true, None, None),
+            Some(2) if bytes.len() > 30 => (false, Some(rest()?), None),
+            Some(&flag @ (3 | 4)) if bytes.len() > 30 => (
                 false,
-                Some(String::from_utf8(bytes[30..].to_vec()).map_err(|_| corrupt())?),
+                None,
+                Some(Warehouse {
+                    table_bucket: rest()?,
+                    dropped: flag == 4,
+                }),
             ),
             Some(_) => return Err(corrupt()),
         };
@@ -122,6 +146,7 @@ impl BucketRow {
             },
             object_lock,
             zone,
+            warehouse,
         })
     }
 }
@@ -260,6 +285,52 @@ impl ObjTxn<'_, '_> {
         zone: Option<String>,
         now_ms: u64,
     ) -> Result<Result<(), BucketError>, StorageError> {
+        self.insert_row(name, owner, (zone, None), now_ms)
+    }
+
+    /// Creates an S3 Tables table's storage bucket `name` (of a reserved
+    /// name, so never one made with S3's API), of `owner`'s table bucket
+    /// `table_bucket`.
+    pub(crate) fn create_warehouse(
+        &mut self,
+        name: &str,
+        owner: &str,
+        table_bucket: &str,
+        now_ms: u64,
+    ) -> Result<Result<(), BucketError>, StorageError> {
+        let warehouse = Warehouse {
+            table_bucket: table_bucket.to_string(),
+            dropped: false,
+        };
+        self.insert_row(name, owner, (None, Some(warehouse)), now_ms)
+    }
+
+    /// Marks table storage bucket `name` dropped (its table deleted);
+    /// whether it was one not dropped yet.
+    pub(crate) fn drop_warehouse(&mut self, name: &str) -> Result<bool, StorageError> {
+        let Some(mut row) = self.bucket_row(name)? else {
+            return Ok(false);
+        };
+        match &mut row.warehouse {
+            Some(warehouse) if !warehouse.dropped => warehouse.dropped = true,
+            _ => return Ok(false),
+        }
+        self.trees.buckets().update(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            name.as_bytes(),
+            &row.encode(),
+        )?;
+        Ok(true)
+    }
+
+    fn insert_row(
+        &mut self,
+        name: &str,
+        owner: &str,
+        (zone, warehouse): (Option<String>, Option<Warehouse>),
+        now_ms: u64,
+    ) -> Result<Result<(), BucketError>, StorageError> {
         let row = BucketRow {
             created_ms: now_ms,
             versioning: Versioning::Unversioned,
@@ -267,6 +338,7 @@ impl ObjTxn<'_, '_> {
             owner: owner.to_string(),
             object_lock: false,
             zone,
+            warehouse,
         };
         let buckets = self.trees.buckets();
         let inserted = buckets.insert_unique(
@@ -397,6 +469,7 @@ impl ObjFile<'_> {
                     journal_from: row.journal_from,
                     object_lock: row.object_lock,
                     zone: row.zone,
+                    warehouse: row.warehouse,
                 })
             })
             .transpose()
@@ -423,6 +496,7 @@ impl ObjFile<'_> {
                     journal_from: row.journal_from,
                     object_lock: row.object_lock,
                     zone: row.zone,
+                    warehouse: row.warehouse,
                 })
             })
             .collect()

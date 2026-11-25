@@ -1126,7 +1126,15 @@ impl Engine {
                 })
                 .map_err(|err| invalid(err.to_string()))?;
                 let target = bucket.clone();
-                let found = self.object(move |file| file.bucket(&target))?;
+                // A deleted table's storage, still being removed, is gone.
+                let found = self
+                    .object(move |file| file.bucket(&target))?
+                    .filter(|info| {
+                        !info
+                            .warehouse
+                            .as_ref()
+                            .is_some_and(|warehouse| warehouse.dropped)
+                    });
                 match found {
                     None => return Err(invalid(format!("the bucket {bucket} does not exist"))),
                     // Imported objects would not get its default retention.

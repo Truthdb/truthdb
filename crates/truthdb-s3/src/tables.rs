@@ -610,7 +610,7 @@ async fn serve(
                     modified_by: caller.who.to_string(),
                     metadata_location: None,
                     version_token: uuid().replace('-', ""),
-                    warehouse_location: format!("s3://{id}--table-s3"),
+                    warehouse_location: format!("s3://{}", truthdb_object::warehouse_bucket(&id)),
                 };
                 let (account, made) = (caller.account.to_string(), table.clone());
                 let bucket_id = weighed.bucket_id.clone();

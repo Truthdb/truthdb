@@ -8,9 +8,11 @@ use truthdb_core::relstore::btree::TreeInsert;
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
+use crate::objects::version_from_key;
 use crate::{
-    ObjFile, ObjTxn, TABLE_BUCKETS_TREE, TABLE_IDS_TREE, TABLE_NAMESPACES_TREE,
-    TABLE_POLICIES_TREE, TABLES_TREE,
+    BucketError, OBJECTS_TREE, ObjFile, ObjTxn, ObjectError, TABLE_BUCKETS_TREE, TABLE_IDS_TREE,
+    TABLE_NAMESPACES_TREE, TABLE_POLICIES_TREE, TABLES_TREE, UploadError, VersionSel,
+    WAREHOUSE_PURGES_TREE,
 };
 
 /// Why a catalog change was refused (the storage itself worked).
@@ -67,6 +69,12 @@ fn corrupt(what: &str) -> StorageError {
 /// The key of `parts`, joined by 0 bytes (no name has one).
 fn key(parts: &[&str]) -> Vec<u8> {
     parts.join("\0").into_bytes()
+}
+
+/// The name of the bucket a table's data and metadata files are kept in
+/// (its warehouse location is `s3://` it).
+pub fn warehouse_bucket(table_id: &str) -> String {
+    format!("{table_id}--table-s3")
 }
 
 /// The key prefix of a table bucket's policy (`table` none) or a table's
@@ -412,6 +420,21 @@ impl ObjTxn<'_, '_> {
             &key(&[account, bucket, &table.id]),
             &key(&[&table.namespace, &table.name]),
         )?;
+        // Its files' bucket, made with it (its id is new: no bucket has it;
+        // one that did would leave the table without it, so nothing is made).
+        if self
+            .create_warehouse(
+                &warehouse_bucket(&table.id),
+                account,
+                bucket,
+                table.created_ms,
+            )?
+            .is_err()
+        {
+            return Err(StorageError::InvalidFile(
+                "a new table's storage bucket exists already".to_string(),
+            ));
+        }
         Ok(Ok(()))
     }
 
@@ -457,6 +480,17 @@ impl ObjTxn<'_, '_> {
         )?;
         let policies = self.trees.tree(TABLE_POLICIES_TREE);
         self.delete_document(&policies, &policy_prefix(account, bucket, Some(&table.id)))?;
+        // Its files' bucket is gone with it: its objects are removed after
+        // (see `ObjFile::warehouse_purge_step`), then it.
+        let warehouse = warehouse_bucket(&table.id);
+        if self.drop_warehouse(&warehouse)? {
+            self.trees.tree(WAREHOUSE_PURGES_TREE).insert_unique(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                warehouse.as_bytes(),
+                &[],
+            )?;
+        }
         Ok(Ok(table))
     }
 
@@ -557,6 +591,97 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
+    /// One step removing a deleted table's files: up to `batch` versions of
+    /// the first dropped storage bucket, else up to `batch` of its uploads,
+    /// else (empty) the bucket itself. Each step is one transaction, so a
+    /// crash loses none: the next starts where the bucket is. Returns
+    /// whether there was a step.
+    pub fn warehouse_purge_step(
+        &mut self,
+        now_ms: u64,
+        grace_ms: u64,
+        batch: usize,
+    ) -> Result<bool, StorageError> {
+        let corrupt = || StorageError::InvalidFile("corrupt table storage purge".to_string());
+        let Some(purges) = self.existing_tree(WAREHOUSE_PURGES_TREE)? else {
+            return Ok(false);
+        };
+        let Some((name, _)) = purges
+            .scan_range_limit(&mut self.core.page_ctx(0), None, None, 1)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(false);
+        };
+        let bucket = String::from_utf8(name).map_err(|_| corrupt())?;
+        // Its versions (delete markers too), first to last.
+        let start = [bucket.as_bytes(), &[0]].concat();
+        let upper = [bucket.as_bytes(), &[1]].concat();
+        let mut versions = Vec::new();
+        if let Some(objects) = self.existing_tree(OBJECTS_TREE)? {
+            for (row_key, _) in objects.scan_range_limit(
+                &mut self.core.page_ctx(0),
+                Some(&start),
+                Some(&upper),
+                batch,
+            )? {
+                let key = row_key
+                    .get(start.len()..row_key.len().saturating_sub(9))
+                    .ok_or_else(corrupt)?;
+                let key = String::from_utf8(key.to_vec()).map_err(|_| corrupt())?;
+                versions.push((key, version_from_key(&row_key)?));
+            }
+        }
+        if !versions.is_empty() {
+            self.transaction(|tx| {
+                for (key, version) in &versions {
+                    match tx.delete_object(
+                        &bucket,
+                        key,
+                        Some(VersionSel::Seq(*version)),
+                        true,
+                        now_ms,
+                        grace_ms,
+                    )? {
+                        Ok(_) | Err(ObjectError::NoSuchKey | ObjectError::NoSuchVersion) => {}
+                        // A table's storage has no Object Lock.
+                        Err(_) => return Err(corrupt()),
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(true);
+        }
+        let (uploads, _) = self.list_uploads(&bucket, "", None, batch)?;
+        if !uploads.is_empty() {
+            self.transaction(|tx| {
+                for upload in &uploads {
+                    match tx.abort_upload(upload.upload, now_ms, grace_ms)? {
+                        Ok(()) | Err(UploadError::NoSuchUpload) => {}
+                        Err(_) => return Err(corrupt()),
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(true);
+        }
+        // Empty: the bucket goes (one written since is removed next step).
+        self.transaction(|tx| {
+            match tx.delete_bucket(&bucket)? {
+                Ok(()) | Err(BucketError::NoSuchBucket) => {}
+                Err(BucketError::NotEmpty) => return Ok(()),
+                Err(_) => return Err(corrupt()),
+            }
+            tx.trees.tree(WAREHOUSE_PURGES_TREE).delete(
+                tx.ctx,
+                &mut OpMode::Txn(tx.txn),
+                bucket.as_bytes(),
+            )?;
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
     /// The policy of `account`'s table bucket `bucket`, or (`table`, by
     /// id) of one of its tables.
     pub fn table_policy(

@@ -1186,7 +1186,9 @@ async fn list_buckets(state: &S3State, principal: &Principal) -> Result<Response
     let entries: String = buckets
         .iter()
         // General purpose buckets only: ListDirectoryBuckets lists the others.
-        .filter(|bucket| bucket.owner == principal.account && bucket.zone.is_none())
+        .filter(|bucket| {
+            bucket.owner == principal.account && bucket.zone.is_none() && bucket.warehouse.is_none()
+        })
         .map(
             |BucketInfo {
                  name, created_ms, ..

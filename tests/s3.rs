@@ -18641,6 +18641,209 @@ refused(lambda: them.get_table_bucket(tableBucketARN=arn), "ForbiddenException")
 print("ok")
 "#;
 
+#[test]
+fn a_tables_files_are_read_and_written_with_s3_as_its_permissions_allow_until_it_is_deleted() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "lakeowner");
+    let (other, other_key, other_secret) = account_with_key(&server, "partner");
+    let reads = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:GetTableData", "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (reader_key, reader_secret) = user_with_key(&server, &account, "reader", Some(&reads));
+    let script = server.dir.join("table_data.py");
+    std::fs::write(&script, TABLE_DATA_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other,
+            &other_key,
+            &other_secret,
+            &reader_key,
+            &reader_secret,
+        ])
+        .output()
+        .expect("run python");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success() && stdout.contains("ok"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The deleted table's bucket is emptied and removed in the background.
+    let warehouse = stdout
+        .split_whitespace()
+        .last()
+        .expect("the warehouse")
+        .to_string();
+    assert!(warehouse.ends_with("--table-s3"), "{stdout}");
+    let deadline = Instant::now() + DEADLINE;
+    while !sql_rows(
+        server.native_port,
+        &format!("SELECT name FROM sys.s3_buckets WHERE name = '{warehouse}'"),
+    )
+    .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the bucket was never removed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_deleted_tables_files_are_removed_across_a_crash() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let mut server = start_server();
+    let (_, key, secret) = account_with_key(&server, "lakeowner");
+    let script = server.dir.join("table_purge.py");
+    std::fs::write(&script, TABLE_PURGE_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success() && stdout.contains("ok"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let warehouse = stdout
+        .split_whitespace()
+        .last()
+        .expect("the warehouse")
+        .to_string();
+    // Killed while (or before) its files are removed: done after.
+    crash_and_restart(&mut server);
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let left = sql_rows(
+            server.native_port,
+            &format!("SELECT name FROM sys.s3_buckets WHERE name = '{warehouse}'"),
+        );
+        if left.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the bucket was never removed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+const TABLE_PURGE_SCRIPT: &str = r#"
+import sys
+import boto3, botocore.config
+port, key, secret = sys.argv[1:4]
+def client(service):
+    return boto3.client(service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+t, s3 = client("s3tables"), client("s3")
+arn = t.create_table_bucket(name="lake")["arn"]
+t.create_namespace(tableBucketARN=arn, namespace=["sales"])
+table_arn = t.create_table(tableBucketARN=arn, namespace="sales", name="orders", format="ICEBERG")["tableARN"]
+warehouse = t.get_table(tableArn=table_arn)["warehouseLocation"].removeprefix("s3://")
+for index in range(300):
+    s3.put_object(Bucket=warehouse, Key=f"data/{index:04}.parquet", Body=b"PAR1" * 64)
+s3.create_multipart_upload(Bucket=warehouse, Key="data/open.parquet")
+t.delete_table(tableBucketARN=arn, namespace="sales", name="orders")
+print("ok", warehouse)
+"#;
+
+const TABLE_DATA_SCRIPT: &str = r#"
+import json, sys
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other, other_key, other_secret, reader_key, reader_secret = sys.argv[1:10]
+def client(service, access, secret_key):
+    return boto3.client(service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+t = client("s3tables", key, secret)
+s3, theirs, reader = client("s3", key, secret), client("s3", other_key, other_secret), client("s3", reader_key, reader_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+arn = t.create_table_bucket(name="lake")["arn"]
+t.create_namespace(tableBucketARN=arn, namespace=["sales"])
+made = t.create_table(tableBucketARN=arn, namespace="sales", name="orders", format="ICEBERG")
+table_arn = made["tableARN"]
+location = t.get_table(tableArn=table_arn)["warehouseLocation"]
+warehouse = location.removeprefix("s3://")
+assert warehouse.endswith("--table-s3") and warehouse == table_arn.split("/table/")[1] + "--table-s3", location
+# Its files, with S3's calls: put, get, head, and in parts.
+s3.put_object(Bucket=warehouse, Key="metadata/00001.metadata.json", Body=b'{"format-version": 2}')
+assert s3.get_object(Bucket=warehouse, Key="metadata/00001.metadata.json")["Body"].read() == b'{"format-version": 2}'
+assert s3.head_object(Bucket=warehouse, Key="metadata/00001.metadata.json")["ContentLength"] == 21
+upload = s3.create_multipart_upload(Bucket=warehouse, Key="data/00000.parquet")["UploadId"]
+part = s3.upload_part(Bucket=warehouse, Key="data/00000.parquet", UploadId=upload, PartNumber=1, Body=b"PAR1")
+assert [p["PartNumber"] for p in s3.list_parts(Bucket=warehouse, Key="data/00000.parquet", UploadId=upload)["Parts"]] == [1]
+s3.complete_multipart_upload(Bucket=warehouse, Key="data/00000.parquet", UploadId=upload,
+    MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]})
+dropped = s3.create_multipart_upload(Bucket=warehouse, Key="data/00001.parquet")["UploadId"]
+s3.abort_multipart_upload(Bucket=warehouse, Key="data/00001.parquet", UploadId=dropped)
+pending = s3.create_multipart_upload(Bucket=warehouse, Key="data/00002.parquet")["UploadId"]
+updated = t.update_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders",
+    versionToken=made["versionToken"], metadataLocation=f"{location}/metadata/00001.metadata.json")
+assert updated["metadataLocation"] == f"{location}/metadata/00001.metadata.json"
+# Nothing else is done to it with S3, and it is not among the buckets.
+refused(lambda: s3.list_objects_v2(Bucket=warehouse), "AccessDenied")
+refused(lambda: s3.delete_object(Bucket=warehouse, Key="data/00000.parquet"), "AccessDenied")
+refused(lambda: s3.put_object_tagging(Bucket=warehouse, Key="data/00000.parquet",
+    Tagging={"TagSet": [{"Key": "a", "Value": "b"}]}), "AccessDenied")
+refused(lambda: s3.put_bucket_policy(Bucket=warehouse, Policy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"AWS": other}, "Action": "s3:*",
+    "Resource": f"arn:aws:s3:::{warehouse}/*"}]})), "AccessDenied")
+refused(lambda: s3.get_bucket_versioning(Bucket=warehouse), "AccessDenied")
+refused(lambda: s3.create_bucket(Bucket=warehouse), "InvalidBucketName")
+assert warehouse not in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+# Nor do the server's own deliveries write into it.
+s3.create_bucket(Bucket="plain")
+refused(lambda: s3.put_bucket_logging(Bucket="plain", BucketLoggingStatus={"LoggingEnabled": {
+    "TargetBucket": warehouse, "TargetPrefix": "metadata/"}}), "InvalidTargetBucketForLogging")
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="plain", Id="lists", InventoryConfiguration={
+    "Id": "lists", "IsEnabled": True, "IncludedObjectVersions": "Current",
+    "Schedule": {"Frequency": "Daily"},
+    "Destination": {"S3BucketDestination": {"Bucket": f"arn:aws:s3:::{warehouse}", "Format": "CSV"}}}),
+    "InvalidArgument")
+refused(lambda: client("cloudtrail", key, secret).create_trail(Name="trail", S3BucketName=warehouse),
+    "InsufficientS3BucketPolicyException")
+# GetTableData reads, PutTableData writes: a user allowed only to read.
+assert reader.get_object(Bucket=warehouse, Key="data/00000.parquet")["Body"].read() == b"PAR1"
+refused(lambda: reader.put_object(Bucket=warehouse, Key="data/x.parquet", Body=b"x"), "AccessDenied")
+refused(lambda: reader.create_multipart_upload(Bucket=warehouse, Key="data/x.parquet"), "AccessDenied")
+# Another account: as the table bucket's policy grants, and the table's denies.
+refused(lambda: theirs.get_object(Bucket=warehouse, Key="data/00000.parquet"), "AccessDenied")
+t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"AWS": other},
+    "Action": ["s3tables:GetTableData", "s3tables:PutTableData"], "Resource": arn + "/table/*"}]}))
+assert theirs.get_object(Bucket=warehouse, Key="data/00000.parquet")["Body"].read() == b"PAR1"
+theirs.put_object(Bucket=warehouse, Key="data/theirs.parquet", Body=b"PAR1")
+t.put_table_policy(tableBucketARN=arn, namespace="sales", name="orders", resourcePolicy=json.dumps({
+    "Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": {"AWS": other},
+    "Action": "s3tables:GetTableData", "Resource": table_arn}]}))
+refused(lambda: theirs.get_object(Bucket=warehouse, Key="data/00000.parquet"), "AccessDenied")
+theirs.put_object(Bucket=warehouse, Key="data/theirs2.parquet", Body=b"PAR1")
+# Deleted with its table: no longer there (its files then go).
+t.delete_table(tableBucketARN=arn, namespace="sales", name="orders")
+refused(lambda: s3.get_object(Bucket=warehouse, Key="data/00000.parquet"), "NoSuchBucket")
+refused(lambda: s3.put_object(Bucket=warehouse, Key="data/late.parquet", Body=b"x"), "NoSuchBucket")
+refused(lambda: s3.list_parts(Bucket=warehouse, Key="data/00002.parquet", UploadId=pending), "NoSuchBucket")
+print("ok", warehouse)
+"#;
+
 const TABLES_SCRIPT: &str = r#"
 import sys
 import boto3, botocore.config, botocore.exceptions
