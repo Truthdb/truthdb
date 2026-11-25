@@ -19117,7 +19117,15 @@ def removal(unreferenced, noncurrent):
         "unreferencedDays": unreferenced, "nonCurrentDays": noncurrent}}})
 removal(1, 1000)
 s3.put_object(Bucket=store, Key="data/later.puffin", Body=b"PFA1")
-time.sleep(3)
+written = time.time()
+# A successful run more than a (1 s) day after the write: it is marked.
+for _ in range(300):
+    job = files_job("files")
+    if job["status"] == "Successful" and job["lastRunTimestamp"].timestamp() > written + 1.5:
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"later.puffin was never marked: {job}")
 snapshot_id = current.metadata.current_snapshot_id
 c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
     {"action": "set-statistics", "statistics": {"snapshot-id": snapshot_id,
