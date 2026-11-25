@@ -102,8 +102,12 @@ struct Columns {
     /// in no list or map): their type (`decimal`, `fixed` without their
     /// arguments) and full name.
     sources: BTreeMap<i64, (String, String)>,
-    /// Every field's full name (`a.b` for `b` in struct `a`).
+    /// Every field's full name (`a.b` for `b` in struct `a`), each one
+    /// field's.
     names: BTreeSet<String>,
+    /// Every field's short name too: as Iceberg indexes them, without the
+    /// `element` of a list of structs or the `value` of a map's.
+    short_names: BTreeSet<String>,
     /// The fields that may be identifier fields: required primitives, not
     /// float or double, through required structs only.
     identifiers: BTreeSet<i64>,
@@ -172,12 +176,18 @@ fn next_id(last: i64) -> Result<i64, String> {
     }
 }
 
-/// A count in a type or transform's brackets: digits only, more than 0.
-fn count(text: &str) -> Option<u32> {
+/// A number in a type or transform's brackets: digits only, at most a
+/// 32-bit int (as Iceberg's Java reader parses it).
+fn digits(text: &str) -> Option<u32> {
     (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| text.parse::<u32>().ok())
         .flatten()
-        .filter(|n| *n > 0)
+        .filter(|n| i64::from(*n) <= MAX_ID)
+}
+
+/// [`digits`], more than 0.
+fn count(text: &str) -> Option<u32> {
+    digits(text).filter(|n| *n > 0)
 }
 
 /// One of Iceberg's primitive types (format version 2), as its readers
@@ -212,8 +222,8 @@ fn primitive(name: &str) -> Option<(String, &'static str)> {
         .strip_prefix("decimal(")
         .and_then(|rest| rest.strip_suffix(')'))?
         .split_once(',')?;
-    let (precision, scale) = (count(precision)?, scale.trim_start_matches(' '));
-    let scale = if scale == "0" { 0 } else { count(scale)? };
+    // `decimal\((\d+),\s*(\d+)\)`, as Iceberg's readers parse it.
+    let (precision, scale) = (count(precision)?, digits(scale.trim_start())?);
     ((1..=38).contains(&precision) && scale <= precision)
         .then(|| (format!("decimal({precision}, {scale})"), "decimal"))
 }
@@ -237,6 +247,7 @@ fn schema_v1(schema: &Value, columns: &mut Columns) -> Result<Value, String> {
         if !columns.names.insert(name.to_string()) {
             return Err(format!("The field {name} is named more than once."));
         }
+        columns.short_names.insert(name.to_string());
         let field_id = id(field.get("id"), &format!("{what}.id"))?;
         if let Some(field_id) = field_id {
             add_id(&mut columns.ids, field_id)?;
@@ -283,7 +294,7 @@ fn schema_v2(schema: &Value, columns: &mut Columns) -> Result<Value, String> {
             .ok_or_else(|| format!("{what}.schema-id is a whole number."))?,
     };
     let fields = array(map.get("fields"), &format!("{what}.fields"))?;
-    let fields = struct_fields(fields, what, "", columns, (true, true))?;
+    let fields = struct_fields(fields, what, ("", ""), columns, (true, true))?;
     let mut out = json!({ "type": "struct", "schema-id": schema_id, "fields": fields });
     if let Some(identifiers) = map.get("identifier-field-ids") {
         let what = format!("{what}.identifier-field-ids");
@@ -304,13 +315,14 @@ fn schema_v2(schema: &Value, columns: &mut Columns) -> Result<Value, String> {
     Ok(out)
 }
 
-/// A struct's fields (their names under `prefix`), canonical; each id new.
+/// A struct's fields (their full and short names under `prefixes`),
+/// canonical; each id and full name new.
 /// `(sources, identifiers)`: whether its primitive fields may be sources
 /// (in no list or map) and identifier fields (through required structs).
 fn struct_fields(
     fields: &[Value],
     what: &str,
-    prefix: &str,
+    (prefix, short_prefix): (&str, &str),
     columns: &mut Columns,
     (sources, identifiers): (bool, bool),
 ) -> Result<Vec<Value>, String> {
@@ -325,7 +337,8 @@ fn struct_fields(
             return Err(format!("The field {name} is named more than once."));
         }
         let full = format!("{prefix}{name}");
-        columns.names.insert(full.clone());
+        let short = format!("{short_prefix}{name}");
+        named(columns, (&full, &short))?;
         let field_id = id(field.get("id"), &format!("{what}.id"))?
             .ok_or_else(|| format!("{what}.id is required."))?;
         if !field.get("required").is_some_and(Value::is_boolean) {
@@ -342,7 +355,7 @@ fn struct_fields(
         let (kind, base) = nested_type(
             kind,
             &what,
-            &full,
+            (&full, &short),
             columns,
             (sources, identifiers && required),
         )?;
@@ -361,13 +374,34 @@ fn struct_fields(
     Ok(out)
 }
 
+/// A field's full name (one field's only: Iceberg's readers refuse a schema
+/// with two of a name) and short name.
+fn named(columns: &mut Columns, (full, short): (&str, &str)) -> Result<(), String> {
+    if !columns.names.insert(full.to_string()) {
+        return Err(format!("The schema has more than one field named {full}."));
+    }
+    columns.short_names.insert(short.to_string());
+    Ok(())
+}
+
+/// The short name of a list's element or a map's value under `short`: a
+/// struct's leaves its `element` or `value` out.
+fn short_of(short: &str, part: &str, kind: &Value) -> String {
+    let structured = kind.get("type").and_then(Value::as_str) == Some("struct");
+    if structured && part != "key" {
+        short.to_string()
+    } else {
+        format!("{short}.{part}")
+    }
+}
+
 /// A field's (or element's, key's, value's) type, canonical, and its kind
 /// if it is primitive. What is in a list or a map is no partition or sort
 /// source ("cannot be contained in a map or list") nor identifier field.
 fn nested_type(
     kind: &Value,
     what: &str,
-    path: &str,
+    (path, short): (&str, &str),
     columns: &mut Columns,
     (sources, identifiers): (bool, bool),
 ) -> Result<(Value, Option<&'static str>), String> {
@@ -386,7 +420,7 @@ fn nested_type(
             let fields = struct_fields(
                 fields,
                 &what,
-                &format!("{path}."),
+                (&format!("{path}."), &format!("{short}.")),
                 columns,
                 (sources, identifiers),
             )?;
@@ -407,10 +441,18 @@ fn nested_type(
             let element_type = map
                 .get("element")
                 .ok_or_else(|| format!("{what}.element is required."))?;
-            let path = format!("{path}.element");
-            columns.names.insert(path.clone());
-            let (element_type, _) =
-                nested_type(element_type, &what, &path, columns, (false, false))?;
+            let (path, short) = (
+                format!("{path}.element"),
+                short_of(short, "element", element_type),
+            );
+            named(columns, (&path, &short))?;
+            let (element_type, _) = nested_type(
+                element_type,
+                &what,
+                (&path, &short),
+                columns,
+                (false, false),
+            )?;
             out.insert("element".to_string(), element_type);
         }
         Some("map") => {
@@ -433,9 +475,13 @@ fn nested_type(
                 let part_type = map
                     .get(type_name)
                     .ok_or_else(|| format!("{what}.{type_name} is required."))?;
-                let path = format!("{path}.{type_name}");
-                columns.names.insert(path.clone());
-                let (part_type, _) = nested_type(part_type, &what, &path, columns, (false, false))?;
+                let (path, short) = (
+                    format!("{path}.{type_name}"),
+                    short_of(short, type_name, part_type),
+                );
+                named(columns, (&path, &short))?;
+                let (part_type, _) =
+                    nested_type(part_type, &what, (&path, &short), columns, (false, false))?;
                 out.insert(type_name.to_string(), part_type);
             }
             if !map.get("value-required").is_some_and(Value::is_boolean) {
@@ -536,8 +582,11 @@ fn partition_spec(spec: &Value, columns: &Columns) -> Result<(Value, i64), Strin
                 "The partition field {name} is named more than once."
             ));
         }
-        // A schema field's name only for that field's identity.
-        if columns.names.contains(name) && !(transform == "identity" && source_name == name) {
+        // A schema field's name (full or short) only for that field's
+        // identity or void.
+        if (columns.names.contains(name) || columns.short_names.contains(name))
+            && !(matches!(transform, "identity" | "void") && source_name == name)
+        {
             return Err(format!(
                 "The partition field {name} has a schema field's name."
             ));
@@ -729,6 +778,24 @@ mod tests {
         .unwrap();
         assert_eq!(low["partition-specs"][0]["fields"][1]["field-id"], 1000);
         assert_eq!(low["last-partition-id"], 1000);
+        // Decimals as Iceberg's readers parse them (any space after the
+        // comma, a scale of leading zeros), and a void partition named as
+        // its source.
+        let spelled = made(json!({"iceberg": {
+            "schema": {"fields": [
+                {"name": "a", "type": "decimal(10,\t2)", "id": 1},
+                {"name": "b", "type": "decimal(10,00)", "id": 2},
+            ]},
+            "partitionSpec": {"fields": [{"source-id": 1, "transform": "void", "name": "a"}]},
+        }}))
+        .unwrap();
+        let types: Vec<&Value> = spelled["schemas"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| &field["type"])
+            .collect();
+        assert_eq!(types, [&json!("decimal(10, 2)"), &json!("decimal(10, 0)")]);
         // The unsorted order, said.
         let unsorted = made(json!({"iceberg": {
             "schema": {"fields": [{"name": "id", "type": "long"}]},
@@ -798,6 +865,33 @@ mod tests {
             (
                 schema(json!([{"name": "x", "type": "fixed[+4]"}])),
                 "is not",
+            ),
+            // Past a 32-bit int, as Java parses them.
+            (
+                schema(json!([{"name": "x", "type": "fixed[3000000000]"}])),
+                "is not",
+            ),
+            (
+                partitioned(
+                    json!({"source-id": 1, "transform": "bucket[3000000000]", "name": "p"}),
+                ),
+                "not an Iceberg transform",
+            ),
+            // Two fields of one full name (a dotted name and a struct's
+            // field, a list's element): Iceberg's readers refuse the schema.
+            (
+                json!({"iceberg": {"schemaV2": {"type": "struct", "fields": [
+                {"id": 1, "name": "a.b", "required": false, "type": "int"},
+                {"id": 2, "name": "a", "required": false, "type": {"type": "struct", "fields": [
+                    {"id": 3, "name": "b", "required": false, "type": "int"}]}}]}}}),
+                "more than one field named a.b",
+            ),
+            (
+                json!({"iceberg": {"schemaV2": {"type": "struct", "fields": [
+                {"id": 1, "name": "t.element", "required": false, "type": "int"},
+                {"id": 2, "name": "t", "required": false, "type":
+                    {"type": "list", "element-id": 3, "element": "int", "element-required": false}}]}}}),
+                "more than one field named t.element",
             ),
             (
                 schema(json!([{"name": "x", "type": "int", "id": 1},
@@ -899,6 +993,16 @@ mod tests {
             ),
             (
                 partitioned(json!({"source-id": 1, "transform": "identity", "name": "day"})),
+                "has a schema field's name",
+            ),
+            // A short name too (a list of structs' field, without `element`).
+            (
+                json!({"iceberg": {"schemaV2": {"type": "struct", "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"},
+                {"id": 2, "name": "t", "required": false, "type": {"type": "list", "element-id": 3,
+                    "element-required": false, "element": {"type": "struct", "fields": [
+                        {"id": 4, "name": "x", "required": false, "type": "int"}]}}}]},
+                "partitionSpec": {"fields": [{"source-id": 1, "transform": "bucket[4]", "name": "t.x"}]}}}),
                 "has a schema field's name",
             ),
             // In a list (a struct's field in it too): no source.
