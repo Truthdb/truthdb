@@ -551,6 +551,30 @@ impl ObjTxn<'_, '_> {
             .transpose()
     }
 
+    /// The version token of the table of id `id`, read in this transaction
+    /// (none if it is gone).
+    pub fn table_version(
+        &mut self,
+        (account, bucket): (&str, &str),
+        id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let Some(at) = self
+            .trees
+            .tree(TABLE_IDS_TREE)
+            .get(self.ctx, &key(&[account, bucket, id]))?
+        else {
+            return Ok(None);
+        };
+        let place = String::from_utf8(at).map_err(|_| corrupt("table id row"))?;
+        let Some((namespace, name)) = place.split_once('\0') else {
+            return Err(corrupt("table id row"));
+        };
+        Ok(self
+            .table_in((account, bucket), (namespace, name))?
+            .filter(|table| table.id == id)
+            .map(|table| table.version_token))
+    }
+
     /// Deletes the table of id `id` at that name, if `version_token` (when
     /// given) is its own: one of the name made since is not it.
     pub fn delete_table(

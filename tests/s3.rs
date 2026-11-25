@@ -19127,30 +19127,52 @@ time.sleep(3)
 removal(1, 1)
 time.sleep(3)
 assert not gone("data/later.puffin")
+# A manifest list outside the table's storage: what it names is not known,
+# so nothing is removed (the job fails).
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "add-snapshot", "snapshot": {"snapshot-id": 77, "sequence-number": 77,
+    "timestamp-ms": int(time.time() * 1000), "summary": {"operation": "append"},
+    "manifest-list": "s3://elsewhere/metadata/snap-77.avro"}}]}).raise_for_status()
+s3.put_object(Bucket=store, Key="data/hidden.parquet", Body=b"PAR1")
+for _ in range(300):
+    if "outside the table's storage" in files_job("files").get("failureMessage", ""):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"never refused: {files_job('files')}")
+time.sleep(3)
+assert not gone("data/hidden.parquet")
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "remove-snapshots", "snapshot-ids": [77]}]}).raise_for_status()
 # gc.enabled false: unreferenced file removal fails for the table.
 c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [],
     "updates": [{"action": "set-properties", "updates": {"gc.enabled": "false"}}]}).raise_for_status()
 for _ in range(300):
-    if files_job("files")["status"] == "Failed":
+    if "gc.enabled" in files_job("files").get("failureMessage", ""):
         break
     time.sleep(0.1)
-assert "gc.enabled" in files_job("files").get("failureMessage", ""), files_job("files")
+else:
+    raise SystemExit(f"never failed for gc.enabled: {files_job('files')}")
 c.purge_table(("sales", "files"))
 # Now only files marked noncurrent at once are removed soon.
 t.put_table_bucket_maintenance_configuration(tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
     value={"status": "enabled", "settings": {"icebergUnreferencedFileRemoval": {"unreferencedDays": 1000,
     "nonCurrentDays": 1}}})
 # A table with snapshots of three and two days ago, and of now: their
-# manifest lists real (copies of another table's, naming its manifests).
+# manifest lists real (empty ones, written by PyIceberg).
+import os, tempfile
+from pyiceberg.io.pyarrow import PyArrowFileIO
+from pyiceberg.manifest import write_manifest_list
+def empty_list(i):
+    path = os.path.join(tempfile.mkdtemp(), "list.avro")
+    with write_manifest_list(format_version=2, output_file=PyArrowFileIO().new_output(path), snapshot_id=i,
+            parent_snapshot_id=i - 1 if i > 1 else None, sequence_number=i, avro_compression="null") as writer:
+        writer.add_manifests([])
+    return open(path, "rb").read()
 aged = c.create_table(("sales", "aged"), schema=schema)
-donor = c.create_table(("sales", "donor"), schema=schema)
-donor.append(rows([5]))
-donor_list = c.load_table(("sales", "donor")).current_snapshot().manifest_list
-donor_store, donor_key = donor_list.removeprefix("s3://").split("/", 1)
-list_bytes = s3.get_object(Bucket=donor_store, Key=donor_key)["Body"].read()
 aged_store = aged.location().removeprefix("s3://")
 for i in (1, 2, 3):
-    s3.put_object(Bucket=aged_store, Key=f"metadata/snap-{i}.avro", Body=list_bytes)
+    s3.put_object(Bucket=aged_store, Key=f"metadata/snap-{i}.avro", Body=empty_list(i))
 # Unreferenced but young (1000 days): it stays.
 s3.put_object(Bucket=aged_store, Key="data/young.parquet", Body=b"PAR1")
 day, now = 86_400_000, int(time.time() * 1000)
@@ -19209,7 +19231,6 @@ t.put_table_maintenance_configuration(**at, name="aged", type="icebergSnapshotMa
     value={"status": "disabled"})
 until(lambda: job()["status"] == "Disabled", "disabled")
 c.purge_table(("sales", "aged"))
-c.purge_table(("sales", "donor"))
 # Dropped only with its files purged; a namespace with tables is not.
 refused(lambda: c.drop_table(("sales", "bare")), BadRequestError)
 refused(lambda: c.drop_namespace("sales"), NamespaceNotEmptyError)

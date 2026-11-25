@@ -463,7 +463,11 @@ async fn expire(
         next["snapshots"].as_array().map_or(&[], Vec::as_slice),
         false,
     )
-    .await?;
+    .await;
+    // What is kept not known (a list outside its storage): nothing marked.
+    let Ok(kept) = kept else {
+        return Ok(());
+    };
     let marked: Vec<String> = gone.difference(&kept).cloned().collect();
     mark(state, (account, bucket), table, &marked, now).await
 }
@@ -483,7 +487,26 @@ async fn references(
     tolerant: bool,
 ) -> Result<HashSet<String>, String> {
     let prefix = format!("{}/", table.warehouse_location);
-    let key_of = |location: &str| location.strip_prefix(&prefix).map(str::to_string);
+    // `s3a://` and `s3n://` name the same objects as `s3://`.
+    let key_of = |location: &str| {
+        let location = ["s3a://", "s3n://"]
+            .iter()
+            .find_map(|scheme| location.strip_prefix(scheme))
+            .map_or_else(|| location.to_string(), |rest| format!("s3://{rest}"));
+        location.strip_prefix(&prefix).map(str::to_string)
+    };
+    // A list or manifest not read hides the files it names: outside the
+    // table's storage (or of no form known) it fails the job, unless what
+    // is sought is files no longer referenced (`tolerant`: fewer found).
+    let unread = |what: String| -> Result<(), String> {
+        if tolerant {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what}: what it names is not known, so no file is removed."
+            ))
+        }
+    };
     let mut keys = HashSet::new();
     if let Some((location, metadata)) = metadata {
         keys.extend(key_of(location));
@@ -501,25 +524,48 @@ async fn references(
     }
     let mut manifests = HashSet::new();
     for snapshot in snapshots {
-        let Some(list) = snapshot["manifest-list"].as_str() else {
-            continue;
-        };
-        let Some(list_key) = key_of(list) else {
-            continue;
-        };
-        keys.insert(list_key);
-        let named = stored(state, list)
-            .await
-            .and_then(|bytes| crate::iceberg_manifests::manifest_list(&bytes));
-        let listed = match named {
-            Ok(listed) => listed,
-            Err(_) if tolerant => continue,
-            Err(err) => return Err(err),
+        // Its manifest list's manifests, or (format version 1) its own.
+        let listed = match (
+            snapshot["manifest-list"].as_str(),
+            snapshot["manifests"].as_array(),
+        ) {
+            (Some(list), _) => {
+                let Some(list_key) = key_of(list) else {
+                    unread(format!(
+                        "The manifest list {list} is outside the table's storage"
+                    ))?;
+                    continue;
+                };
+                keys.insert(list_key);
+                let named = stored(state, list)
+                    .await
+                    .and_then(|bytes| crate::iceberg_manifests::manifest_list(&bytes));
+                match named {
+                    Ok(listed) => listed,
+                    Err(_) if tolerant => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            (None, Some(inline)) => inline
+                .iter()
+                .filter_map(|manifest| manifest.as_str().map(str::to_string))
+                .collect(),
+            (None, None) => {
+                unread(format!(
+                    "The snapshot {} has no manifest list",
+                    snapshot["snapshot-id"]
+                ))?;
+                continue;
+            }
         };
         for manifest in listed {
-            if let Some(manifest_key) = key_of(&manifest)
-                && manifests.insert(manifest_key.clone())
-            {
+            let Some(manifest_key) = key_of(&manifest) else {
+                unread(format!(
+                    "The manifest {manifest} is outside the table's storage"
+                ))?;
+                continue;
+            };
+            if manifests.insert(manifest_key.clone()) {
                 keys.insert(manifest_key);
                 let files = stored(state, &manifest)
                     .await
@@ -717,7 +763,9 @@ async fn unmark(
 }
 
 /// Deletes noncurrent object `key` (its version `version`) of `table`'s
-/// storage for good, and its mark.
+/// storage for good, and its mark, if the table is still as it was read
+/// (a commit since may reference it again: then the pass stops, retried
+/// on the next).
 async fn delete(
     state: &S3State,
     (account, bucket): (&str, &str),
@@ -731,7 +779,11 @@ async fn delete(
         table.id.clone(),
         key.to_string(),
     );
+    let token = table.version_token.clone();
     write(state, move |tx| {
+        if tx.table_version((&owner, &bucket), &id)?.as_deref() != Some(token.as_str()) {
+            return Ok(Err(truthdb_object::TableError::VersionMismatch));
+        }
         // Gone since (or written again: its version another) is no error.
         let _ = tx.delete_object(
             &truthdb_object::warehouse_bucket(&id),
@@ -749,5 +801,11 @@ async fn delete(
         .map(Ok)
     })
     .await
-    .map_err(|err| err.message)
+    .map_err(|err| {
+        if err.status == 409 {
+            STALE.to_string()
+        } else {
+            err.message
+        }
+    })
 }
