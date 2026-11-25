@@ -184,8 +184,11 @@ async fn pass(state: &S3State) -> Result<(), TError> {
             return Ok(());
         };
         after = Some(last.clone());
+        // One table's failure stops no other's.
         for (_, account, bucket, table) in tables {
-            manage_snapshots(state, (&account, &bucket), &table).await?;
+            if let Err(err) = manage_snapshots(state, (&account, &bucket), &table).await {
+                eprintln!("table maintenance of {}: {}", table.id, err.message);
+            }
         }
     }
 }
@@ -246,6 +249,11 @@ async fn manage_snapshots(
             .saturating_mul(3_600_000);
         match expire(state, (account, bucket), table, (keep, age_ms), now).await {
             Ok(()) => status_record("Successful", Some(now), None),
+            // Lost to another commit: retried on the next pass ("at the
+            // next available opportunity"), its last run as it was.
+            Err(failure) if failure == STALE => {
+                status_record("Failed", (last != 0).then_some(last), Some(&failure))
+            }
             Err(failure) => status_record("Failed", Some(now), Some(&failure)),
         }
     };
@@ -341,11 +349,13 @@ async fn expire(
         .metadata_location
         .clone()
         .expect("read: it has a metadata file");
-    // As a commit: only from the table as read.
-    let requirements = [
-        json!({"type": "assert-table-uuid", "uuid": base["table-uuid"]}),
-        json!({"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": current}),
-    ];
+    // As a commit: only from the table as read (its main branch where it
+    // has one; the version token swapped holds it either way).
+    let mut requirements = vec![json!({"type": "assert-table-uuid", "uuid": base["table-uuid"]})];
+    if refs.is_some_and(|refs| refs.contains_key("main")) {
+        requirements
+            .push(json!({"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": current}));
+    }
     let updates = [json!({"action": "remove-snapshots", "snapshot-ids": expired})];
     let next = match crate::iceberg_commit::apply(&base, &location, &requirements, &updates, now) {
         Ok(Some(next)) => next,

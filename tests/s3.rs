@@ -19064,6 +19064,14 @@ aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_202
 aws_refused(lambda: t.put_table_bucket_maintenance_configuration(tableBucketARN=arn,
     type="icebergUnreferencedFileRemoval", value={"status": "enabled"}), "NotImplemented")
 assert t.get_table_bucket_maintenance_configuration(tableBucketARN=arn)["configuration"] == {}
+# Authorized before the configuration is looked at.
+stranger = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=nobody_key, aws_secret_access_key=nobody_secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+aws_refused(lambda: stranger.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
+    value={"status": "enabled"}), "ForbiddenException")
+aws_refused(lambda: stranger.put_table_bucket_maintenance_configuration(tableBucketARN=arn,
+    type="icebergUnreferencedFileRemoval", value={"status": "enabled"}), "ForbiddenException")
 # (A client that does not check what it sends: the server refuses it.)
 unchecked = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
     aws_access_key_id=key, aws_secret_access_key=secret,

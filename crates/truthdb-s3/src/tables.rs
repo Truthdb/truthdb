@@ -516,12 +516,12 @@ async fn serve(
             }
             (&Method::PUT, ["buckets", arn, "maintenance", kind]) => {
                 let bucket = caller.bucket_of(arn)?;
-                if *kind != maintenance::UNREFERENCED_FILE_REMOVAL {
-                    return Err(TError::bad("type is icebergUnreferencedFileRemoval."));
-                }
                 let weighed = policies(state, &caller, &bucket, None).await?;
                 check("PutTableBucketMaintenanceConfiguration", arn, &weighed)?;
                 find_bucket(state, &caller, &bucket).await?;
+                if *kind != maintenance::UNREFERENCED_FILE_REMOVAL {
+                    return Err(TError::bad("type is icebergUnreferencedFileRemoval."));
+                }
                 Err(TError::not_implemented("Unreferenced file removal"))
             }
             (method, ["buckets", arn, "policy"]) => {
@@ -816,11 +816,7 @@ async fn serve(
                     (&Method::GET, ["policy"]) => "GetTablePolicy",
                     (&Method::DELETE, ["policy"]) => "DeleteTablePolicy",
                     (&Method::GET, ["maintenance"]) => "GetTableMaintenanceConfiguration",
-                    (&Method::PUT, ["maintenance", kind]) => {
-                        // Checked (and a kind not built refused) first.
-                        maintenance::put_value(kind, &input)?;
-                        "PutTableMaintenanceConfiguration"
-                    }
+                    (&Method::PUT, ["maintenance", _]) => "PutTableMaintenanceConfiguration",
                     (&Method::GET, ["maintenance-job-status"]) => "GetTableMaintenanceJobStatus",
                     _ => return Err(TError::not_implemented("This table operation")),
                 };
