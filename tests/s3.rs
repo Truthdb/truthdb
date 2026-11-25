@@ -18472,6 +18472,10 @@ fn s3_tables_keep_table_buckets_namespaces_and_tables_as_aws_does() {
         {"Effect": "Allow", "Action": "s3tables:*", "Resource": "*"}]}"#
         .replace('\n', " ");
     let (maker_key, maker_secret) = user_with_key(&server, &account, "maker", Some(&policy));
+    let creates = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:CreateTable", "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (creator_key, creator_secret) = user_with_key(&server, &account, "creator", Some(&creates));
     let script = server.dir.join("tables.py");
     std::fs::write(&script, TABLES_SCRIPT).expect("script");
     let output = Command::new(&python)
@@ -18486,6 +18490,8 @@ fn s3_tables_keep_table_buckets_namespaces_and_tables_as_aws_does() {
             &nobody_secret,
             &maker_key,
             &maker_secret,
+            &creator_key,
+            &creator_secret,
         ])
         .output()
         .expect("run python");
@@ -18845,9 +18851,9 @@ print("ok", warehouse)
 "#;
 
 const TABLES_SCRIPT: &str = r#"
-import sys
+import json, sys
 import boto3, botocore.config, botocore.exceptions
-port, account, key, secret, other_account, nobody_key, nobody_secret, maker_key, maker_secret = sys.argv[1:10]
+port, account, key, secret, other_account, nobody_key, nobody_secret, maker_key, maker_secret, creator_key, creator_secret = sys.argv[1:12]
 def client(access, secret_key):
     return boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
         aws_access_key_id=access, aws_secret_access_key=secret_key,
@@ -18891,8 +18897,31 @@ refused(lambda: t.create_table(tableBucketARN=arn, namespace="sales", name="orde
     "ConflictException")
 refused(lambda: t.create_table(tableBucketARN=arn, namespace="none", name="x", format="ICEBERG"),
     "NotFoundException")
-refused(lambda: t.create_table(tableBucketARN=arn, namespace="sales", name="x", format="ICEBERG",
-    metadata={"iceberg": {"schema": {"fields": [{"name": "id", "type": "int"}]}}}), "NotImplemented")
+# With a schema: its first metadata file is written into its storage, and
+# it points at it (which needs PutTableData too).
+schema = {"iceberg": {"schema": {"fields": [{"name": "id", "type": "long", "required": True},
+    {"name": "at", "type": "timestamptz"}]}, "properties": {"owner": "sales"}}}
+refused(lambda: t.create_table(tableBucketARN=arn, namespace="sales", name="bad", format="ICEBERG",
+    metadata={"iceberg": {"schema": {"fields": [{"name": "id", "type": "varchar"}]}}}), "BadRequestException")
+refused(lambda: t.get_table(tableBucketARN=arn, namespace="sales", name="bad"), "NotFoundException")
+creator = client(creator_key, creator_secret)
+refused(lambda: creator.create_table(tableBucketARN=arn, namespace="sales", name="schemed",
+    format="ICEBERG", metadata=schema), "ForbiddenException")
+schemed = t.create_table(tableBucketARN=arn, namespace="sales", name="schemed", format="ICEBERG", metadata=schema)
+got_schemed = t.get_table(tableArn=schemed["tableARN"])
+where = got_schemed["metadataLocation"]
+assert where.startswith(got_schemed["warehouseLocation"] + "/metadata/00000-") and where.endswith(".metadata.json"), got_schemed
+assert t.get_table_metadata_location(tableBucketARN=arn, namespace="sales", name="schemed")["metadataLocation"] == where
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret)
+bucket_name, key_name = where.removeprefix("s3://").split("/", 1)
+document = json.loads(s3.get_object(Bucket=bucket_name, Key=key_name)["Body"].read())
+assert (document["format-version"], document["location"], document["last-column-id"]) == (
+    2, got_schemed["warehouseLocation"], 2), document
+assert [(f["id"], f["name"], f["type"], f["required"]) for f in document["schemas"][0]["fields"]] == [
+    (1, "id", "long", True), (2, "at", "timestamptz", False)], document
+assert document["properties"] == {"owner": "sales"} and document["partition-specs"] == [{"spec-id": 0, "fields": []}]
+t.delete_table(tableBucketARN=arn, namespace="sales", name="schemed")
 by_name = t.get_table(tableBucketARN=arn, namespace="sales", name="orders")
 by_arn = t.get_table(tableArn=table_arn)
 assert by_name == by_arn | {"ResponseMetadata": by_name["ResponseMetadata"]}, (by_name, by_arn)
