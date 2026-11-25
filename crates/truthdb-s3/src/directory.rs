@@ -139,6 +139,7 @@ pub(crate) fn check(request: &mut Request<Incoming>, target: &Target) -> Result<
         (Target::Object(..), &Method::POST, Some("uploads")) => true,
         (Target::Object(..), _, Some("uploadId")) => true,
         (Target::Object(..), &Method::GET, Some("attributes")) => true,
+        (Target::Object(..), &Method::PUT, Some("renameObject")) => true,
         _ => false,
     };
     if !supported {

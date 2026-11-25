@@ -1015,6 +1015,7 @@ pub async fn get_object(
         trail_flush: state.trail_flush,
         trail_selectors: state.trail_selectors.clone(),
         sessions: state.sessions.clone(),
+        rename_tokens: state.rename_tokens.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {

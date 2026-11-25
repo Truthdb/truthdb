@@ -247,6 +247,7 @@ fn data_event(
             _ => return None,
         },
         (true, Some("uploads")) if *method == Method::POST => "CreateMultipartUpload",
+        (true, Some("renameObject")) if *method == Method::PUT => "RenameObject",
         (true, Some("uploadId")) => match *method {
             Method::PUT if copy => "UploadPartCopy",
             Method::PUT => "UploadPart",

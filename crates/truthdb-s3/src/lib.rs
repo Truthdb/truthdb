@@ -36,6 +36,7 @@ pub mod payload;
 pub mod policy;
 pub mod post;
 pub mod public_access;
+pub mod rename;
 pub mod replication_config;
 pub mod replication_run;
 pub mod restore;

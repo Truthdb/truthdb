@@ -8142,3 +8142,91 @@ fn a_directory_bucket_keeps_its_zone_and_its_objects_their_express_class() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_rename_moves_a_version_whole_and_replaces_its_destination() {
+    use crate::{ObjectAttrs, ObjectError, StorageClass, VersionSel};
+    let path = temp_path("rename");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_directory_bucket("d--use1-az4--x-s3", DEFAULT_ACCOUNT, 1))
+        .unwrap()
+        .unwrap();
+    let put = |key: &str, data: &[u8], attrs: &ObjectAttrs, at: u64| {
+        let mut writer = BodyWriter::begin(&storage, at).unwrap();
+        writer.write(&storage, data, at).unwrap();
+        let sealed = writer.finish(&storage, at).unwrap();
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_object(
+                    "d--use1-az4--x-s3",
+                    key,
+                    &sealed,
+                    attrs,
+                    StorageClass::Standard,
+                    at,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let attrs = ObjectAttrs {
+        content_type: Some("text/plain".to_string()),
+        ..ObjectAttrs::default()
+    };
+    let source = put("dir/a", b"the source", &attrs, 1_000);
+    put(
+        "dir/b",
+        b"the old destination",
+        &ObjectAttrs::default(),
+        2_000,
+    );
+    let head = |key: &str| {
+        ObjFile::new(&mut storage.lock())
+            .head_object("d--use1-az4--x-s3", key, VersionSel::Latest)
+            .unwrap()
+    };
+    let renamed = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.rename_object(
+                "d--use1-az4--x-s3",
+                ("dir/a", &source),
+                &attrs,
+                "dir/b",
+                3_000,
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    // Its body, ETag, class, attributes and Last-Modified; the source gone.
+    let moved = head("dir/b").unwrap();
+    assert_eq!(moved, renamed);
+    assert_eq!(
+        (moved.size, moved.md5, moved.mtime_ms, moved.storage_class),
+        (source.size, source.md5, 1_000, StorageClass::ExpressOnezone)
+    );
+    assert_eq!(moved.attrs.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(head("dir/a"), Err(ObjectError::NoSuchKey));
+    // Counted once: the old destination went, and the source.
+    let usage: u64 = ObjFile::new(&mut storage.lock())
+        .bucket_usage()
+        .unwrap()
+        .iter()
+        .map(|row| row.objects)
+        .sum();
+    assert_eq!(usage, 1);
+    // Its body stays (the source let go of its reference, the rename took
+    // one): collected far later, it reads whole.
+    ObjFile::new(&mut storage.lock())
+        .collect_garbage(u64::MAX / 2, ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(
+        read(&storage, head("dir/b").unwrap().body, 0, 10).unwrap(),
+        b"the source"
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

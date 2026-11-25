@@ -120,7 +120,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "metadataInventoryTable",
     "metadataJournalTable",
     "metadataTable",
-    "renameObject",
     "requestPayment",
     "select",
     "torrent",
@@ -146,6 +145,7 @@ const SUBRESOURCES: &[&str] = &[
     "policy",
     "policyStatus",
     "publicAccessBlock",
+    "renameObject",
     "replication",
     "restore",
     "retention",
@@ -953,6 +953,18 @@ async fn route(
         {
             creating(authz, &request, true).check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::complete_upload(state, request, auth, bucket, key).await
+        }
+        // A directory bucket's only (S3 Express One Zone's).
+        (Target::Object(bucket, key), Method::PUT) if has_param(&request, "renameObject") => {
+            if authz.zone(&bucket).is_none() {
+                return Err(S3Error::not_implemented(
+                    "RenameObject is supported for directory buckets only",
+                ));
+            }
+            // A write in the bucket: a ReadWrite session's.
+            authz.check("s3:RenameObject", Object(&bucket, &key))?;
+            let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
+            crate::rename::rename_object(state, request, &principal.account, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) if has_param(&request, "tagging") => {
             let action = versioned(
