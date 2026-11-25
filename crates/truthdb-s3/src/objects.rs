@@ -494,20 +494,42 @@ pub async fn put_object(
     crate::sse::check_write(request.headers(), encrypted_at_rest)?;
     let customer = crate::ssec::provided(request.headers(), false)?;
     let condition = crate::conditional::Condition::of_write(request.headers())?;
+    // An append (a directory bucket's), at the object's current size.
+    let offset = crate::append::offset(request.headers())?;
+    let appended_len = crate::append::appended_len(request.headers());
     // Fail before writing anything when the bucket or key is wrong, or the
     // condition does not hold.
+    let mut append_algorithm = None;
     {
         let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-        let (check, blocked, (bucket_lock, default)) = object(state, move |file| {
+        let (check, blocked, (bucket_lock, default), directory) = object(state, move |file| {
             Ok((
                 file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)?,
                 crate::sse::sse_c_blocked(file, &lookup_bucket)?,
                 crate::object_lock::bucket_state(file, &lookup_bucket)?,
+                file.bucket(&lookup_bucket)?
+                    .is_some_and(|info| info.zone.is_some()),
             ))
         })
         .await?;
         if let Err(err @ (ObjectError::NoSuchBucket | ObjectError::InvalidKey(_))) = check {
             return Err(object_error(err, &bucket, &key));
+        }
+        if let Some(offset) = offset {
+            if !directory {
+                return Err(S3Error::not_implemented(
+                    "Appends (x-amz-write-offset-bytes) are supported for directory buckets only",
+                ));
+            }
+            let current = check.as_ref().ok();
+            if current.map_or(0, |current| current.size) != offset {
+                return Err(crate::append::invalid_offset());
+            }
+            crate::append::check_request(request.headers(), current.is_some())?;
+            // The appended part's checksum is of the object's algorithm.
+            append_algorithm = current
+                .and_then(|current| current.attrs.checksum.as_ref())
+                .map(|checksum| checksum.algorithm.clone());
         }
         if let Some(condition) = &condition {
             condition.check(check.as_ref().ok().map(ObjectInfo::etag).as_deref())?;
@@ -521,8 +543,15 @@ pub async fn put_object(
     }
     attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
     let headers = request.headers().clone();
-    let (sealed, checksum) =
-        receive_body(state, request, auth, customer.as_ref(), class, None).await?;
+    let (sealed, checksum) = receive_body(
+        state,
+        request,
+        auth,
+        customer.as_ref(),
+        class,
+        append_algorithm.as_deref(),
+    )
+    .await?;
     attrs.checksum = Some(checksum);
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (stored, versioning, expiration) =
@@ -542,6 +571,63 @@ pub async fn put_object(
                 Ok(lock) => lock,
                 Err(err) => return Ok(Err(err)),
             };
+            // An append: to the object as it is in this lock hold, its size
+            // the offset still (0 and none there: a new object).
+            let appending = match offset {
+                None => None,
+                Some(offset) => {
+                    match file.head_object(&bucket_name, &key_name, VersionSel::Latest)? {
+                        Ok(current) if current.size == offset => Some(current),
+                        Err(_) if offset == 0 => None,
+                        _ => return Ok(Err(crate::append::invalid_offset())),
+                    }
+                }
+            };
+            if let Some(current) = appending {
+                if let Some(condition) = &condition
+                    && let Err(err) = condition.recheck(Some(&current.etag()))
+                {
+                    return Ok(Err(err));
+                }
+                let part = attrs.checksum.clone();
+                let whole = match (&part, appended_len) {
+                    (Some(part), Some(len)) => crate::append::appended_checksum(
+                        file,
+                        (&bucket_name, &key_name),
+                        &current,
+                        part,
+                        len,
+                    )?,
+                    _ => None,
+                };
+                // Its attributes stay (an append sets none), with the
+                // checksum of all of it.
+                let mut kept = file.version_attrs(&bucket_name, &key_name, current.version)?;
+                kept.checksum = whole;
+                let appended = file.transaction(|tx| {
+                    tx.append_object(
+                        (&bucket_name, &key_name),
+                        &current,
+                        &sealed,
+                        &kept,
+                        part.as_ref(),
+                        now,
+                        DROP_GRACE_MS,
+                    )
+                })?;
+                let stored = match appended {
+                    Ok(info) => Ok(info),
+                    Err(truthdb_object::AppendError::Object(err)) => Err(err),
+                    Err(truthdb_object::AppendError::TooManyParts) => {
+                        return Ok(Err(S3Error::new(
+                            400,
+                            "TooManyParts",
+                            "An object has at most 10,000 parts: it cannot be appended to again.",
+                        )));
+                    }
+                };
+                return Ok(Ok((stored, versioning_of(file, &bucket_name)?, None)));
+            }
             let stored = file.transaction(|tx| {
                 // Held again at the write, in its own transaction.
                 if let Some(condition) = &condition {
@@ -603,6 +689,10 @@ pub async fn put_object(
     }
     if let Some(expiration) = expiration {
         response = response.header("x-amz-expiration", expiration);
+    }
+    // An append's answer says how large the object now is.
+    if offset.is_some() {
+        response = response.header("x-amz-object-size", info.size.to_string());
     }
     Ok(response.body(full(Bytes::new())).expect("a valid response"))
 }

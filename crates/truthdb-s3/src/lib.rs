@@ -5,6 +5,7 @@ pub mod access_log;
 pub mod activity;
 pub mod admin;
 pub mod api;
+pub mod append;
 pub mod attributes;
 pub mod authz;
 pub mod batch;

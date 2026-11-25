@@ -13,6 +13,7 @@
 
 mod accounts;
 mod activity;
+mod append;
 mod body;
 mod buckets;
 mod codec;
@@ -56,6 +57,7 @@ use truthdb_core::wal::records::RelRecord;
 
 pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_account_id};
 pub use activity::{ACTIVITY_KEEP_MS, ActivityEvent, MAX_ACTIVITY_RECORD};
+pub use append::{AppendError, MAX_APPEND_PARTS};
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning, validate_directory_bucket_name};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
