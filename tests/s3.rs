@@ -18500,6 +18500,133 @@ fn s3_tables_keep_table_buckets_namespaces_and_tables_as_aws_does() {
     assert!(refused.contains("table buckets"), "{refused}");
 }
 
+#[test]
+fn s3_tables_policies_grant_other_accounts_and_users_a_tables_deny_winning() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "owner");
+    let (other, other_key, other_secret) = account_with_key(&server, "partner");
+    let (nobody_key, nobody_secret) = user_with_key(&server, &account, "nobody", None);
+    let script = server.dir.join("table_policies.py");
+    std::fs::write(&script, TABLE_POLICIES_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other,
+            &other_key,
+            &other_secret,
+            &nobody_key,
+            &nobody_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const TABLE_POLICIES_SCRIPT: &str = r#"
+import json, sys
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other, other_key, other_secret, nobody_key, nobody_secret = sys.argv[1:10]
+def client(access, secret_key):
+    return boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+t, them, nobody = client(key, secret), client(other_key, other_secret), client(nobody_key, nobody_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+arn = t.create_table_bucket(name="shared")["arn"]
+t.create_namespace(tableBucketARN=arn, namespace=["sales"])
+table_arn = t.create_table(tableBucketARN=arn, namespace="sales", name="orders", format="ICEBERG")["tableARN"]
+# Another account, and a user with no policies: nothing until a policy grants.
+refused(lambda: them.get_table_bucket(tableBucketARN=arn), "ForbiddenException")
+refused(lambda: them.list_tables(tableBucketARN=arn), "ForbiddenException")
+refused(lambda: them.get_table(tableArn=table_arn), "ForbiddenException")
+refused(lambda: nobody.get_table(tableArn=table_arn), "ForbiddenException")
+# Another account's table bucket that is not there: forbidden, not missing.
+refused(lambda: them.get_table_bucket(tableBucketARN=arn.replace("shared", "absent")), "ForbiddenException")
+refused(lambda: t.get_table_bucket_policy(tableBucketARN=arn), "NotFoundException")
+# Policies: well formed, and never public.
+refused(lambda: t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy="{"), "BadRequestException")
+def policy(effect, principal, actions, resources):
+    return json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": effect,
+        "Principal": principal, "Action": actions, "Resource": resources}]})
+refused(lambda: t.put_table_bucket_policy(tableBucketARN=arn,
+    resourcePolicy=policy("Allow", "*", "s3tables:*", [arn, arn + "/table/*"])), "ForbiddenException")
+refused(lambda: them.put_table_bucket_policy(tableBucketARN=arn,
+    resourcePolicy=policy("Allow", {"AWS": other}, "s3tables:*", [arn, arn + "/table/*"])), "ForbiddenException")
+granting = policy("Allow", {"AWS": [other, f"arn:aws:iam::{account}:user/nobody"]},
+    ["s3tables:GetTableBucket", "s3tables:ListTables", "s3tables:GetTable", "s3tables:CreateNamespace",
+     "s3tables:GetNamespace", "s3tables:DeleteTable", "s3tables:DeleteNamespace"],
+    [arn, arn + "/table/*"])
+t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=granting)
+assert t.get_table_bucket_policy(tableBucketARN=arn)["resourcePolicy"] == granting
+# Granted: the other account sees the owner's bucket and tables, and makes
+# a namespace in it (by it).
+got = them.get_table_bucket(tableBucketARN=arn)
+assert (got["ownerAccountId"], got["name"]) == (account, "shared"), got
+assert [x["tableARN"] for x in them.list_tables(tableBucketARN=arn)["tables"]] == [table_arn]
+assert them.get_table(tableArn=table_arn)["ownerAccountId"] == account
+assert nobody.get_table(tableArn=table_arn)["name"] == "orders"
+them.create_namespace(tableBucketARN=arn, namespace=["theirs"])
+space = them.get_namespace(tableBucketARN=arn, namespace="theirs")
+assert (space["createdBy"], space["ownerAccountId"]) == (other, account), space
+refused(lambda: them.get_table(tableBucketARN=arn, namespace="sales", name="missing"), "NotFoundException")
+# Not granted: their own policy changes on it, and what the policy leaves out.
+refused(lambda: them.get_table_bucket_policy(tableBucketARN=arn), "ForbiddenException")
+refused(lambda: them.delete_table_bucket(tableBucketARN=arn), "ForbiddenException")
+# A table's Deny wins over the bucket's Allow, for that table only.
+kept_arn = t.create_table(tableBucketARN=arn, namespace="sales", name="kept", format="ICEBERG")["tableARN"]
+t.put_table_policy(tableBucketARN=arn, namespace="sales", name="kept",
+    resourcePolicy=policy("Deny", {"AWS": other}, "s3tables:GetTable", kept_arn))
+refused(lambda: them.get_table(tableArn=kept_arn), "ForbiddenException")
+assert t.get_table(tableArn=kept_arn)["name"] == "kept"
+denying = policy("Deny", {"AWS": other}, "s3tables:DeleteTable", arn + "/table/*")
+t.put_table_policy(tableBucketARN=arn, namespace="sales", name="orders", resourcePolicy=denying)
+assert t.get_table_policy(tableBucketARN=arn, namespace="sales", name="orders")["resourcePolicy"] == denying
+assert "s3tables:GetTable" in t.get_table_policy(tableBucketARN=arn, namespace="sales", name="kept")["resourcePolicy"]
+refused(lambda: them.delete_table(tableBucketARN=arn, namespace="sales", name="orders"), "ForbiddenException")
+them.delete_table(tableBucketARN=arn, namespace="sales", name="kept")
+assert them.get_table(tableArn=table_arn)["name"] == "orders"
+t.delete_table_policy(tableBucketARN=arn, namespace="sales", name="orders")
+refused(lambda: t.get_table_policy(tableBucketARN=arn, namespace="sales", name="orders"), "NotFoundException")
+them.delete_table(tableBucketARN=arn, namespace="sales", name="orders")
+# The bucket's policy deleted: the other account is refused again.
+t.delete_table_bucket_policy(tableBucketARN=arn)
+refused(lambda: them.get_table_bucket(tableBucketARN=arn), "ForbiddenException")
+refused(lambda: t.get_table_bucket_policy(tableBucketARN=arn), "NotFoundException")
+# A policy goes with its bucket: one made again of the name has none.
+t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=granting)
+for name in ["sales", "theirs"]:
+    t.delete_namespace(tableBucketARN=arn, namespace=name)
+t.delete_table_bucket(tableBucketARN=arn)
+try:
+    t.get_table_bucket_policy(tableBucketARN=arn)
+    raise SystemExit("not refused")
+except botocore.exceptions.ClientError as error:
+    assert error.response["Error"]["Message"] == "The table bucket does not exist.", error.response
+t.create_table_bucket(name="shared")
+refused(lambda: t.get_table_bucket_policy(tableBucketARN=arn), "NotFoundException")
+refused(lambda: them.get_table_bucket(tableBucketARN=arn), "ForbiddenException")
+print("ok")
+"#;
+
 const TABLES_SCRIPT: &str = r#"
 import sys
 import boto3, botocore.config, botocore.exceptions
@@ -18615,7 +18742,6 @@ refused(lambda: t.delete_table(tableBucketARN=arn, namespace="archive", name="or
 t.delete_table(tableBucketARN=arn, namespace="archive", name="orders_2024", versionToken=moved["versionToken"])
 refused(lambda: t.get_table(tableArn=table_arn), "NotFoundException")
 # Not built here: refused, not ignored.
-refused(lambda: t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy="{}"), "NotImplemented")
 refused(lambda: t.get_table_bucket_encryption(tableBucketARN=arn), "NotImplemented")
 # Another account's ARN, and a user with no policies: forbidden.
 theirs = arn.replace(account, other_account)
