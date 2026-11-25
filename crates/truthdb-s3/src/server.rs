@@ -70,6 +70,8 @@ pub struct S3State {
     pub trail_flush: std::time::Duration,
     /// How often each S3 Tables table's maintenance runs.
     pub table_maintenance: std::time::Duration,
+    /// How long a day of its settings (unreferencedDays, nonCurrentDays) is.
+    pub table_maintenance_day: std::time::Duration,
     /// Each account's logging trails, for data events.
     pub trail_selectors: std::sync::Arc<crate::trails::TrailCache>,
     /// Directory buckets' sessions (CreateSession), in memory.

@@ -508,10 +508,29 @@ async fn serve(
                 let weighed = policies(state, &caller, &bucket, None).await?;
                 check("GetTableBucketMaintenanceConfiguration", arn, &weighed)?;
                 find_bucket(state, &caller, &bucket).await?;
-                // Unreferenced file removal, its one kind, is not built.
+                let account = caller.account.to_string();
+                let stored = read(state, move |file| {
+                    file.maintenance(
+                        (&account, &bucket),
+                        None,
+                        (
+                            truthdb_object::MaintenanceRecord::Configuration,
+                            maintenance::UNREFERENCED_FILE_REMOVAL,
+                        ),
+                    )
+                })
+                .await?;
                 Ok((
                     StatusCode::OK,
-                    Some(json!({ "tableBucketARN": arn, "configuration": {} })),
+                    Some(json!({
+                        "tableBucketARN": arn,
+                        "configuration": {
+                            maintenance::UNREFERENCED_FILE_REMOVAL: maintenance::configuration(
+                                maintenance::UNREFERENCED_FILE_REMOVAL,
+                                stored.as_deref(),
+                            ),
+                        },
+                    })),
                 ))
             }
             (&Method::PUT, ["buckets", arn, "maintenance", kind]) => {
@@ -519,10 +538,20 @@ async fn serve(
                 let weighed = policies(state, &caller, &bucket, None).await?;
                 check("PutTableBucketMaintenanceConfiguration", arn, &weighed)?;
                 find_bucket(state, &caller, &bucket).await?;
-                if *kind != maintenance::UNREFERENCED_FILE_REMOVAL {
-                    return Err(TError::bad("type is icebergUnreferencedFileRemoval."));
-                }
-                Err(TError::not_implemented("Unreferenced file removal"))
+                let value = maintenance::put_bucket_value(kind, &input)?.to_string();
+                let (account, kind) = (caller.account.to_string(), kind.to_string());
+                write(state, move |tx| {
+                    guarded(tx, (&account, &bucket), weighed.bucket_id.as_deref(), |tx| {
+                        tx.put_maintenance(
+                            (&account, &bucket),
+                            None,
+                            (truthdb_object::MaintenanceRecord::Configuration, &kind),
+                            value.as_bytes(),
+                        )
+                    })
+                })
+                .await?;
+                Ok((StatusCode::NO_CONTENT, None))
             }
             (method, ["buckets", arn, "policy"]) => {
                 let bucket = caller.bucket_of(arn)?;
@@ -855,7 +884,7 @@ async fn serve(
                                 "tableARN": table_arn,
                                 "configuration": {
                                     maintenance::SNAPSHOT_MANAGEMENT:
-                                        maintenance::snapshot_configuration(stored.as_deref()),
+                                        maintenance::configuration(maintenance::SNAPSHOT_MANAGEMENT, stored.as_deref()),
                                 },
                             })),
                         ))
@@ -878,15 +907,22 @@ async fn serve(
                     }
                     (&Method::GET, ["maintenance-job-status"]) => {
                         let (looked, id) = (bucket.clone(), id.clone());
-                        let stored = read(state, move |file| {
-                            file.maintenance(
-                                (&account, &looked),
-                                Some(&id),
-                                (
-                                    truthdb_object::MaintenanceRecord::JobStatus,
-                                    maintenance::SNAPSHOT_MANAGEMENT,
-                                ),
-                            )
+                        let (snapshots, files) = read(state, move |file| {
+                            let of = |kind| {
+                                (truthdb_object::MaintenanceRecord::JobStatus, kind)
+                            };
+                            Ok((
+                                file.maintenance(
+                                    (&account, &looked),
+                                    Some(&id),
+                                    of(maintenance::SNAPSHOT_MANAGEMENT),
+                                )?,
+                                file.maintenance(
+                                    (&account, &looked),
+                                    Some(&id),
+                                    of(maintenance::UNREFERENCED_FILE_REMOVAL),
+                                )?,
+                            ))
                         })
                         .await?;
                         Ok((
@@ -895,7 +931,9 @@ async fn serve(
                                 "tableARN": table_arn,
                                 "status": {
                                     maintenance::SNAPSHOT_MANAGEMENT:
-                                        maintenance::job_status(stored.as_deref()),
+                                        maintenance::job_status(snapshots.as_deref()),
+                                    maintenance::UNREFERENCED_FILE_REMOVAL:
+                                        maintenance::job_status(files.as_deref()),
                                 },
                             })),
                         ))

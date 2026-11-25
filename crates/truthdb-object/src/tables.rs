@@ -103,6 +103,17 @@ pub type ListedTable = (Vec<u8>, String, String, TableInfo);
 pub enum MaintenanceRecord {
     Configuration,
     JobStatus,
+    /// An object of a table's storage marked noncurrent (its `kind` the
+    /// object's key, its value when it was marked).
+    Noncurrent,
+}
+
+fn record_byte(record: MaintenanceRecord) -> u8 {
+    match record {
+        MaintenanceRecord::Configuration => 1,
+        MaintenanceRecord::JobStatus => 2,
+        MaintenanceRecord::Noncurrent => 3,
+    }
 }
 
 /// The key prefix of a table bucket's (`table` none) or a table's
@@ -127,10 +138,7 @@ fn maintenance_key(
     kind: &str,
 ) -> Vec<u8> {
     let mut row_key = maintenance_prefix(account, bucket, table);
-    row_key.push(match record {
-        MaintenanceRecord::Configuration => 1,
-        MaintenanceRecord::JobStatus => 2,
-    });
+    row_key.push(record_byte(record));
     row_key.extend_from_slice(kind.as_bytes());
     row_key
 }
@@ -298,6 +306,22 @@ impl ObjTxn<'_, '_> {
         let mut upper = prefix.to_vec();
         upper.push(0xff);
         for (row_key, _) in tree.scan_range(self.ctx, Some(prefix), Some(&upper))? {
+            tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes a maintenance record [`ObjTxn::put_maintenance`] set (none is
+    /// no error).
+    pub fn delete_maintenance_record(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+        (record, kind): (MaintenanceRecord, &str),
+    ) -> Result<(), StorageError> {
+        let tree = self.trees.tree(TABLE_MAINTENANCE_TREE);
+        let row_key = maintenance_key((account, bucket), table, record, kind);
+        if tree.get(self.ctx, &row_key)?.is_some() {
             tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
         }
         Ok(())
@@ -527,6 +551,30 @@ impl ObjTxn<'_, '_> {
             .transpose()
     }
 
+    /// The version token of the table of id `id`, read in this transaction
+    /// (none if it is gone).
+    pub fn table_version(
+        &mut self,
+        (account, bucket): (&str, &str),
+        id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let Some(at) = self
+            .trees
+            .tree(TABLE_IDS_TREE)
+            .get(self.ctx, &key(&[account, bucket, id]))?
+        else {
+            return Ok(None);
+        };
+        let place = String::from_utf8(at).map_err(|_| corrupt("table id row"))?;
+        let Some((namespace, name)) = place.split_once('\0') else {
+            return Err(corrupt("table id row"));
+        };
+        Ok(self
+            .table_in((account, bucket), (namespace, name))?
+            .filter(|table| table.id == id)
+            .map(|table| table.version_token))
+    }
+
     /// Deletes the table of id `id` at that name, if `version_token` (when
     /// given) is its own: one of the name made since is not it.
     pub fn delete_table(
@@ -682,6 +730,31 @@ impl ObjFile<'_> {
             &mut self.core.page_ctx(0),
             &maintenance_key((account, bucket), table, record, kind),
         )
+    }
+
+    /// Every maintenance record of one kind of `account`'s table bucket
+    /// `bucket` (or of its table of id `table`): each one's kind and value.
+    pub fn maintenance_records(
+        &mut self,
+        (account, bucket): (&str, &str),
+        table: Option<&str>,
+        record: MaintenanceRecord,
+    ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+        let Some(tree) = self.existing_tree(TABLE_MAINTENANCE_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let mut lower = maintenance_prefix(account, bucket, table);
+        lower.push(record_byte(record));
+        let mut upper = lower.clone();
+        *upper.last_mut().expect("a record byte") += 1;
+        tree.scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
+            .into_iter()
+            .map(|(row_key, value)| {
+                let kind = String::from_utf8(row_key[lower.len()..].to_vec())
+                    .map_err(|_| corrupt("table maintenance key"))?;
+                Ok((kind, value))
+            })
+            .collect()
     }
 
     /// Every account's tables after `after` (a key this answers; none:

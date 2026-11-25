@@ -496,6 +496,7 @@ async fn read(
         trail_logs: state.trail_logs.clone(),
         trail_flush: state.trail_flush,
         table_maintenance: state.table_maintenance,
+        table_maintenance_day: state.table_maintenance_day,
         trail_selectors: state.trail_selectors.clone(),
         sessions: state.sessions.clone(),
         rename_tokens: state.rename_tokens.clone(),

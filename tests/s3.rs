@@ -195,7 +195,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\ntrail_flush_seconds = 1\ntable_maintenance_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\ntrail_flush_seconds = 1\ntable_maintenance_seconds = 1\ntable_maintenance_day_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -19061,9 +19061,9 @@ assert default == {"icebergSnapshotManagement": {"status": "enabled", "settings"
 # Not built: refused, not ignored.
 aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
     value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 256}}}), "NotImplemented")
-aws_refused(lambda: t.put_table_bucket_maintenance_configuration(tableBucketARN=arn,
-    type="icebergUnreferencedFileRemoval", value={"status": "enabled"}), "NotImplemented")
-assert t.get_table_bucket_maintenance_configuration(tableBucketARN=arn)["configuration"] == {}
+bucket_default = t.get_table_bucket_maintenance_configuration(tableBucketARN=arn)["configuration"]
+assert bucket_default == {"icebergUnreferencedFileRemoval": {"status": "enabled", "settings":
+    {"icebergUnreferencedFileRemoval": {"unreferencedDays": 3, "nonCurrentDays": 10}}}}, bucket_default
 # Authorized before the configuration is looked at.
 stranger = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
     aws_access_key_id=nobody_key, aws_secret_access_key=nobody_secret,
@@ -19079,8 +19079,122 @@ unchecked = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", re
 aws_refused(lambda: unchecked.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergSnapshotManagement",
     value={"status": "enabled", "settings": {"icebergSnapshotManagement": {"minSnapshotsToKeep": 0}}}),
     "BadRequestException")
-# A table with snapshots of three and two days ago, and of now.
+# Unreferenced file removal (a day here is a second): a file of a table's
+# storage no snapshot references, deleted after unreferencedDays and
+# nonCurrentDays; what the table references stays.
+files = c.create_table(("sales", "files"), schema=schema)
+files.append(rows([1, 2]))
+store = files.location().removeprefix("s3://")
+s3.put_object(Bucket=store, Key="data/orphan.parquet", Body=b"PAR1")
+t.put_table_bucket_maintenance_configuration(tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
+    value={"status": "enabled", "settings": {"icebergUnreferencedFileRemoval": {"unreferencedDays": 1,
+    "nonCurrentDays": 1}}})
+def gone(key, where=None):
+    try:
+        s3.head_object(Bucket=where or store, Key=key)
+        return False
+    except botocore.exceptions.ClientError as error:
+        return error.response["Error"]["Code"] == "404"
+def files_job(name):
+    return t.get_table_maintenance_job_status(**at, name=name)["status"]["icebergUnreferencedFileRemoval"]
+for _ in range(300):
+    if gone("data/orphan.parquet"):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"the orphan was never removed: {files_job('files')}")
+assert files_job("files")["status"] == "Successful", files_job("files")
+current = c.load_table(("sales", "files"))
+assert sorted(current.scan().to_arrow().column("id").to_pylist()) == [1, 2]
+# Its metadata log's files are referenced too.
+earlier = current.metadata.metadata_log[0].metadata_file.removeprefix(f"s3://{store}/")
+assert not gone(earlier), earlier
+# Marked noncurrent, then referenced again (a commit naming it): current
+# again, so not deleted once nonCurrentDays are short.
+def removal(unreferenced, noncurrent):
+    t.put_table_bucket_maintenance_configuration(tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
+        value={"status": "enabled", "settings": {"icebergUnreferencedFileRemoval": {
+        "unreferencedDays": unreferenced, "nonCurrentDays": noncurrent}}})
+removal(1, 1000)
+s3.put_object(Bucket=store, Key="data/later.puffin", Body=b"PFA1")
+written = time.time()
+# A successful run more than a (1 s) day after the write: it is marked.
+for _ in range(300):
+    job = files_job("files")
+    if job["status"] == "Successful" and job["lastRunTimestamp"].timestamp() > written + 1.5:
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"later.puffin was never marked: {job}")
+snapshot_id = current.metadata.current_snapshot_id
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "set-statistics", "statistics": {"snapshot-id": snapshot_id,
+    "statistics-path": f"s3://{store}/data/later.puffin", "file-size-in-bytes": 4,
+    "file-footer-size-in-bytes": 4, "blob-metadata": []}}]}).raise_for_status()
+time.sleep(3)
+removal(1, 1)
+time.sleep(3)
+assert not gone("data/later.puffin")
+# A manifest list outside the table's storage: what it names is not known,
+# so nothing is removed (the job fails).
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "add-snapshot", "snapshot": {"snapshot-id": 77, "sequence-number": 77,
+    "timestamp-ms": int(time.time() * 1000), "summary": {"operation": "append"},
+    "manifest-list": "s3://elsewhere/metadata/snap-77.avro"}}]}).raise_for_status()
+s3.put_object(Bucket=store, Key="data/hidden.parquet", Body=b"PAR1")
+for _ in range(300):
+    if "outside the table's storage" in files_job("files").get("failureMessage", ""):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"never refused: {files_job('files')}")
+time.sleep(3)
+assert not gone("data/hidden.parquet")
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "remove-snapshots", "snapshot-ids": [77]}]}).raise_for_status()
+# A location not understood (no scheme): it fails the job too.
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "set-statistics", "statistics": {"snapshot-id": snapshot_id, "statistics-path": "stats.puffin",
+    "file-size-in-bytes": 4, "file-footer-size-in-bytes": 4, "blob-metadata": []}}]}).raise_for_status()
+for _ in range(300):
+    if "not understood" in files_job("files").get("failureMessage", ""):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"never refused the location: {files_job('files')}")
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [], "updates": [
+    {"action": "remove-statistics", "snapshot-id": snapshot_id}]}).raise_for_status()
+# gc.enabled false: unreferenced file removal fails for the table.
+c._session.post(base + "/namespaces/sales/tables/files", json={"requirements": [],
+    "updates": [{"action": "set-properties", "updates": {"gc.enabled": "FALSE"}}]}).raise_for_status()
+for _ in range(300):
+    if "gc.enabled" in files_job("files").get("failureMessage", ""):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"never failed for gc.enabled: {files_job('files')}")
+c.purge_table(("sales", "files"))
+# Now only files marked noncurrent at once are removed soon.
+t.put_table_bucket_maintenance_configuration(tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
+    value={"status": "enabled", "settings": {"icebergUnreferencedFileRemoval": {"unreferencedDays": 1000,
+    "nonCurrentDays": 1}}})
+# A table with snapshots of three and two days ago, and of now: their
+# manifest lists real (empty ones, written by PyIceberg).
+import os, tempfile
+from pyiceberg.io.pyarrow import PyArrowFileIO
+from pyiceberg.manifest import write_manifest_list
+def empty_list(i):
+    path = os.path.join(tempfile.mkdtemp(), "list.avro")
+    with write_manifest_list(format_version=2, output_file=PyArrowFileIO().new_output(path), snapshot_id=i,
+            parent_snapshot_id=i - 1 if i > 1 else None, sequence_number=i, avro_compression="null") as writer:
+        writer.add_manifests([])
+    return open(path, "rb").read()
 aged = c.create_table(("sales", "aged"), schema=schema)
+aged_store = aged.location().removeprefix("s3://")
+for i in (1, 2, 3):
+    s3.put_object(Bucket=aged_store, Key=f"metadata/snap-{i}.avro", Body=empty_list(i))
+# Unreferenced but young (1000 days): it stays.
+s3.put_object(Bucket=aged_store, Key="data/young.parquet", Body=b"PAR1")
 day, now = 86_400_000, int(time.time() * 1000)
 def commit(updates):
     answer = c._session.post(base + "/namespaces/sales/tables/aged", json={"requirements": [], "updates": updates})
@@ -19107,6 +19221,12 @@ def until(done, what):
     raise SystemExit(f"never {what}: {job()}")
 # Expired: older than 24 hours and not the last one kept.
 until(lambda: [s.snapshot_id for s in c.load_table(("sales", "aged")).metadata.snapshots] == [3], "expired")
+# The manifest lists only they referenced: noncurrent at once, so removed
+# (though young); the kept one's stays.
+until(lambda: gone("metadata/snap-1.avro", aged_store) and gone("metadata/snap-2.avro", aged_store),
+    "expired files removed")
+assert not gone("metadata/snap-3.avro", aged_store)
+assert not gone("data/young.parquet", aged_store)
 until(lambda: job()["status"] == "Successful" and "lastRunTimestamp" in job(), "successful")
 # A snapshot younger than 24 hours stays, though not the last one kept.
 commit([{"action": "add-snapshot", "snapshot": {"snapshot-id": 4, "sequence-number": 4, "parent-snapshot-id": 3,
