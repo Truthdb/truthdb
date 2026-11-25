@@ -195,7 +195,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\ntrail_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\ntrail_flush_seconds = 1\ntable_maintenance_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -18887,7 +18887,7 @@ fn pyiceberg_keeps_namespaces_and_tables_in_s3_tables_through_its_rest_catalog()
 }
 
 const PYICEBERG_SCRIPT: &str = r#"
-import gzip, json, sys
+import gzip, json, sys, time
 import boto3, botocore.config
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import (BadRequestError, CommitFailedException, ForbiddenError,
@@ -19046,6 +19046,91 @@ theirs = catalog(other_key, other_secret)
 refused(lambda: theirs.load_table(("sales", "orders_2024")).append(rows([7])), ForbiddenError)
 refused(lambda: theirs.purge_table(("sales", "bare")), ForbiddenError)
 t.delete_table_bucket_policy(tableBucketARN=arn)
+# Maintenance: snapshot management (by default enabled, 1 kept, 120 hours).
+def aws_refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+import botocore.exceptions
+at = {"tableBucketARN": arn, "namespace": "sales"}
+default = t.get_table_maintenance_configuration(**at, name="orders_2024")["configuration"]
+assert default == {"icebergSnapshotManagement": {"status": "enabled", "settings": {"icebergSnapshotManagement":
+    {"minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 120}}}}, default
+# Not built: refused, not ignored.
+aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
+    value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 256}}}), "NotImplemented")
+aws_refused(lambda: t.put_table_bucket_maintenance_configuration(tableBucketARN=arn,
+    type="icebergUnreferencedFileRemoval", value={"status": "enabled"}), "NotImplemented")
+assert t.get_table_bucket_maintenance_configuration(tableBucketARN=arn)["configuration"] == {}
+# Authorized before the configuration is looked at.
+stranger = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=nobody_key, aws_secret_access_key=nobody_secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+aws_refused(lambda: stranger.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
+    value={"status": "enabled"}), "ForbiddenException")
+aws_refused(lambda: stranger.put_table_bucket_maintenance_configuration(tableBucketARN=arn,
+    type="icebergUnreferencedFileRemoval", value={"status": "enabled"}), "ForbiddenException")
+# (A client that does not check what it sends: the server refuses it.)
+unchecked = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}, parameter_validation=False))
+aws_refused(lambda: unchecked.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergSnapshotManagement",
+    value={"status": "enabled", "settings": {"icebergSnapshotManagement": {"minSnapshotsToKeep": 0}}}),
+    "BadRequestException")
+# A table with snapshots of three and two days ago, and of now.
+aged = c.create_table(("sales", "aged"), schema=schema)
+day, now = 86_400_000, int(time.time() * 1000)
+def commit(updates):
+    answer = c._session.post(base + "/namespaces/sales/tables/aged", json={"requirements": [], "updates": updates})
+    assert answer.status_code == 200, answer.text
+for i, ts in [(1, now - 3 * day), (2, now - 2 * day), (3, now)]:
+    snapshot = {"snapshot-id": i, "sequence-number": i, "timestamp-ms": ts, "summary": {"operation": "append"},
+        "manifest-list": f"{aged.location()}/metadata/snap-{i}.avro"}
+    if i > 1:
+        snapshot["parent-snapshot-id"] = i - 1
+    commit([{"action": "add-snapshot", "snapshot": snapshot},
+            {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": i}])
+t.put_table_maintenance_configuration(**at, name="aged", type="icebergSnapshotManagement",
+    value={"status": "enabled", "settings": {"icebergSnapshotManagement": {"minSnapshotsToKeep": 1,
+    "maxSnapshotAgeHours": 24}}})
+stored = t.get_table_maintenance_configuration(**at, name="aged")["configuration"]["icebergSnapshotManagement"]
+assert stored["settings"]["icebergSnapshotManagement"]["maxSnapshotAgeHours"] == 24, stored
+def job():
+    return t.get_table_maintenance_job_status(**at, name="aged")["status"]["icebergSnapshotManagement"]
+def until(done, what):
+    for _ in range(300):
+        if done():
+            return
+        time.sleep(0.1)
+    raise SystemExit(f"never {what}: {job()}")
+# Expired: older than 24 hours and not the last one kept.
+until(lambda: [s.snapshot_id for s in c.load_table(("sales", "aged")).metadata.snapshots] == [3], "expired")
+until(lambda: job()["status"] == "Successful" and "lastRunTimestamp" in job(), "successful")
+# A snapshot younger than 24 hours stays, though not the last one kept.
+commit([{"action": "add-snapshot", "snapshot": {"snapshot-id": 4, "sequence-number": 4, "parent-snapshot-id": 3,
+    "timestamp-ms": int(time.time() * 1000), "summary": {"operation": "append"},
+    "manifest-list": f"{aged.location()}/metadata/snap-4.avro"}},
+    {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 4}])
+ran = job()["lastRunTimestamp"]
+until(lambda: job()["status"] == "Successful" and job()["lastRunTimestamp"] != ran, "run again")
+assert [s.snapshot_id for s in c.load_table(("sales", "aged")).metadata.snapshots] == [3, 4]
+# Iceberg's own retention properties, or gc.enabled false: it fails.
+for prop, why in [("gc.enabled", "gc.enabled"), ("history.expire.min-snapshots-to-keep", "history.expire")]:
+    commit([{"action": "set-properties", "updates": {prop: "false" if prop == "gc.enabled" else "5"}}])
+    until(lambda: job()["status"] == "Failed" and why in job()["failureMessage"], f"failed ({prop})")
+    commit([{"action": "remove-properties", "removals": [prop]}])
+    until(lambda: job()["status"] == "Successful", f"successful again ({prop})")
+# A user-defined tag: snapshot management fails for the table.
+commit([{"action": "set-snapshot-ref", "ref-name": "v1", "type": "tag", "snapshot-id": 3}])
+until(lambda: job()["status"] == "Failed", "failed")
+assert "tags or branches" in job()["failureMessage"], job()
+# Disabled.
+t.put_table_maintenance_configuration(**at, name="aged", type="icebergSnapshotManagement",
+    value={"status": "disabled"})
+until(lambda: job()["status"] == "Disabled", "disabled")
+c.purge_table(("sales", "aged"))
 # Dropped only with its files purged; a namespace with tables is not.
 refused(lambda: c.drop_table(("sales", "bare")), BadRequestError)
 refused(lambda: c.drop_namespace("sales"), NamespaceNotEmptyError)

@@ -519,13 +519,18 @@ async fn load_table(
 /// The table's current metadata file, read from its storage (a gzipped
 /// one decompressed).
 async fn current_file(ctx: &Ctx<'_>, table: &TableInfo) -> Result<Value, TError> {
+    read_current(ctx.state, table).await
+}
+
+/// [`current_file`], for any caller in a scope.
+pub(super) async fn read_current(state: &S3State, table: &TableInfo) -> Result<Value, TError> {
     let Some(location) = table.metadata_location.clone() else {
         return Err(TError::not_found(
             "The table does not exist as an Iceberg table yet: it has no metadata file.",
         ));
     };
     let gzipped = location.ends_with(".gz");
-    let file = read(ctx.state, move |file| metadata_file(file, &location))
+    let file = read(state, move |file| metadata_file(file, &location))
         .await?
         .map_err(TError::bad)?;
     // A gzipped one (`.metadata.json.gz`), read as far as the limit.
@@ -652,6 +657,32 @@ async fn commit_table(
             return Err(TError::bad(message));
         }
     };
+    let next_location = write_next(
+        ctx.state,
+        (ctx.caller.account, bucket),
+        ctx.caller.who,
+        (&table, &at),
+        (&location, &next),
+        now,
+    )
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Some(json!({ "metadata-location": next_location, "metadata": next })),
+    ))
+}
+
+/// Writes `next` (the metadata after the file at `location`) as the table's
+/// next metadata file and points the table at it, if it has not changed
+/// since it was read (409 CommitFailed otherwise): the next file's location.
+pub(super) async fn write_next(
+    state: &S3State,
+    (account, bucket): (&str, &str),
+    who: &str,
+    (table, at): (&TableInfo, &(String, String)),
+    (location, next): (&str, &Value),
+    now: u64,
+) -> Result<String, TError> {
     // `<version>-<uuid>.metadata.json`, the version after the current's.
     let version = location
         .rsplit('/')
@@ -675,16 +706,12 @@ async fn commit_table(
             "A metadata.json file over 50MB is not supported.",
         ));
     }
-    let body = super::metadata_body(ctx.state, file, now).await?;
-    let (account, bucket, who) = (
-        ctx.caller.account.to_string(),
-        bucket.to_string(),
-        ctx.caller.who.to_string(),
-    );
-    let (namespace, name) = at;
+    let body = super::metadata_body(state, file, now).await?;
+    let (account, bucket, who) = (account.to_string(), bucket.to_string(), who.to_string());
+    let (namespace, name) = at.clone();
     let (token, new_token) = (table.version_token.clone(), super::uuid().replace('-', ""));
     let (id, pointed) = (table.id.clone(), next_location.clone());
-    write_with(ctx.state, move |tx| {
+    write_with(state, move |tx| {
         // Only from the token read (the table has not changed since); a
         // refusal writes nothing.
         let pointed_at = tx.update_metadata_location(
@@ -721,10 +748,7 @@ async fn commit_table(
         Ok(pointed_at)
     })
     .await?;
-    Ok((
-        StatusCode::OK,
-        Some(json!({ "metadata-location": next_location, "metadata": next })),
-    ))
+    Ok(next_location)
 }
 
 async fn table_exists(

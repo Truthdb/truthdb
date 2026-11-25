@@ -19,6 +19,7 @@ use crate::error::S3Error;
 use crate::server::{Body, Connection, S3State, full};
 
 mod iceberg;
+pub(crate) mod maintenance;
 
 /// The largest request body (S3 Tables' are small JSON documents).
 const MAX_BODY: usize = 1 << 20;
@@ -502,6 +503,27 @@ async fn serve(
                 }
                 Ok((StatusCode::OK, Some(answer)))
             }
+            (&Method::GET, ["buckets", arn, "maintenance"]) => {
+                let bucket = caller.bucket_of(arn)?;
+                let weighed = policies(state, &caller, &bucket, None).await?;
+                check("GetTableBucketMaintenanceConfiguration", arn, &weighed)?;
+                find_bucket(state, &caller, &bucket).await?;
+                // Unreferenced file removal, its one kind, is not built.
+                Ok((
+                    StatusCode::OK,
+                    Some(json!({ "tableBucketARN": arn, "configuration": {} })),
+                ))
+            }
+            (&Method::PUT, ["buckets", arn, "maintenance", kind]) => {
+                let bucket = caller.bucket_of(arn)?;
+                let weighed = policies(state, &caller, &bucket, None).await?;
+                check("PutTableBucketMaintenanceConfiguration", arn, &weighed)?;
+                find_bucket(state, &caller, &bucket).await?;
+                if *kind != maintenance::UNREFERENCED_FILE_REMOVAL {
+                    return Err(TError::bad("type is icebergUnreferencedFileRemoval."));
+                }
+                Err(TError::not_implemented("Unreferenced file removal"))
+            }
             (method, ["buckets", arn, "policy"]) => {
                 let bucket = caller.bucket_of(arn)?;
                 let action = match *method {
@@ -793,6 +815,9 @@ async fn serve(
                     (&Method::PUT, ["policy"]) => "PutTablePolicy",
                     (&Method::GET, ["policy"]) => "GetTablePolicy",
                     (&Method::DELETE, ["policy"]) => "DeleteTablePolicy",
+                    (&Method::GET, ["maintenance"]) => "GetTableMaintenanceConfiguration",
+                    (&Method::PUT, ["maintenance", _]) => "PutTableMaintenanceConfiguration",
+                    (&Method::GET, ["maintenance-job-status"]) => "GetTableMaintenanceJobStatus",
                     _ => return Err(TError::not_implemented("This table operation")),
                 };
                 let (account, looked) = (caller.account.to_string(), bucket.clone());
@@ -811,6 +836,70 @@ async fn serve(
                 let account = caller.account.to_string();
                 let id = table.id.clone();
                 match (method, rest) {
+                    (&Method::GET, ["maintenance"]) => {
+                        let (looked, id) = (bucket.clone(), id.clone());
+                        let stored = read(state, move |file| {
+                            file.maintenance(
+                                (&account, &looked),
+                                Some(&id),
+                                (
+                                    truthdb_object::MaintenanceRecord::Configuration,
+                                    maintenance::SNAPSHOT_MANAGEMENT,
+                                ),
+                            )
+                        })
+                        .await?;
+                        Ok((
+                            StatusCode::OK,
+                            Some(json!({
+                                "tableARN": table_arn,
+                                "configuration": {
+                                    maintenance::SNAPSHOT_MANAGEMENT:
+                                        maintenance::snapshot_configuration(stored.as_deref()),
+                                },
+                            })),
+                        ))
+                    }
+                    (&Method::PUT, ["maintenance", kind]) => {
+                        let value = maintenance::put_value(kind, &input)?.to_string();
+                        let kind = kind.to_string();
+                        write(state, move |tx| {
+                            guarded(tx, (&account, &bucket), weighed.bucket_id.as_deref(), |tx| {
+                                tx.put_maintenance(
+                                    (&account, &bucket),
+                                    Some(&id),
+                                    (truthdb_object::MaintenanceRecord::Configuration, &kind),
+                                    value.as_bytes(),
+                                )
+                            })
+                        })
+                        .await?;
+                        Ok((StatusCode::NO_CONTENT, None))
+                    }
+                    (&Method::GET, ["maintenance-job-status"]) => {
+                        let (looked, id) = (bucket.clone(), id.clone());
+                        let stored = read(state, move |file| {
+                            file.maintenance(
+                                (&account, &looked),
+                                Some(&id),
+                                (
+                                    truthdb_object::MaintenanceRecord::JobStatus,
+                                    maintenance::SNAPSHOT_MANAGEMENT,
+                                ),
+                            )
+                        })
+                        .await?;
+                        Ok((
+                            StatusCode::OK,
+                            Some(json!({
+                                "tableARN": table_arn,
+                                "status": {
+                                    maintenance::SNAPSHOT_MANAGEMENT:
+                                        maintenance::job_status(stored.as_deref()),
+                                },
+                            })),
+                        ))
+                    }
                     (_, ["policy"]) => {
                         resource_policy(
                             state,

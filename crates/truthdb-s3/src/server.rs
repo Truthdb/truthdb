@@ -68,6 +68,8 @@ pub struct S3State {
     /// The trails' log files being kept, and how often they are written.
     pub trail_logs: std::sync::Arc<crate::trails::TrailLogs>,
     pub trail_flush: std::time::Duration,
+    /// How often each S3 Tables table's maintenance runs.
+    pub table_maintenance: std::time::Duration,
     /// Each account's logging trails, for data events.
     pub trail_selectors: std::sync::Arc<crate::trails::TrailCache>,
     /// Directory buckets' sessions (CreateSession), in memory.
@@ -137,6 +139,10 @@ pub async fn serve(
         shutdown.clone(),
     ));
     tokio::spawn(crate::replication_run::run(
+        Arc::clone(&state),
+        shutdown.clone(),
+    ));
+    tokio::spawn(crate::tables::maintenance::run(
         Arc::clone(&state),
         shutdown.clone(),
     ));

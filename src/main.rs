@@ -326,6 +326,9 @@ async fn main() -> ExitCode {
                     trail_flush: std::time::Duration::from_secs(
                         config.s3.trail_flush_seconds.max(1),
                     ),
+                    table_maintenance: std::time::Duration::from_secs(
+                        config.s3.table_maintenance_seconds.max(1),
+                    ),
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(

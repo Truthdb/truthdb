@@ -171,6 +171,10 @@ pub struct S3Config {
     /// How often CloudTrail trails' log files are written (seconds).
     #[serde(default = "default_trail_flush_seconds")]
     pub trail_flush_seconds: u64,
+
+    /// How often each S3 Tables table's maintenance runs (seconds).
+    #[serde(default = "default_table_maintenance_seconds")]
+    pub table_maintenance_seconds: u64,
 }
 
 fn default_metrics_flush_seconds() -> u64 {
@@ -187,6 +191,10 @@ fn default_activity_flush_seconds() -> u64 {
 
 fn default_trail_flush_seconds() -> u64 {
     300
+}
+
+fn default_table_maintenance_seconds() -> u64 {
+    3600
 }
 
 impl S3Config {
@@ -242,6 +250,7 @@ impl Default for S3Config {
             access_log_flush_seconds: default_access_log_flush_seconds(),
             activity_flush_seconds: default_activity_flush_seconds(),
             trail_flush_seconds: default_trail_flush_seconds(),
+            table_maintenance_seconds: default_table_maintenance_seconds(),
         }
     }
 }
