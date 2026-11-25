@@ -29,6 +29,9 @@ const REKEY_ROWS: usize = 512;
 /// How long a body that a lifecycle expiration dropped outlives it: readers
 /// that resolved the version just before may still be reading.
 const LIFECYCLE_DROP_GRACE_MS: u64 = 15 * 60 * 1000;
+/// Versions (or uploads) a step of removing a deleted table's files removes
+/// at most, in one transaction.
+const WAREHOUSE_PURGE_BATCH: usize = 64;
 
 impl Engine {
     /// One step of the object jobs; returns whether work remains.
@@ -43,7 +46,10 @@ impl Engine {
             .object(|file| file.lifecycle_step(now_ms, LIFECYCLE_DROP_GRACE_MS, LIFECYCLE_STEP));
         let usage = self.object(|file| file.usage_backfill(USAGE_BACKFILL_ROWS));
         let rekey = self.object(|file| file.rekey_versions(REKEY_ROWS));
-        Ok(packed? | lifecycle? | usage? | rekey?)
+        let purge = self.object(|file| {
+            file.warehouse_purge_step(now_ms, LIFECYCLE_DROP_GRACE_MS, WAREHOUSE_PURGE_BATCH)
+        });
+        Ok(packed? | lifecycle? | usage? | rekey? | purge?)
     }
 
     /// One packing step; returns whether there was one.
