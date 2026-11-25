@@ -870,3 +870,51 @@ fn without_public_grants_keeps_the_principals_a_statement_names() {
         "a deny stays"
     );
 }
+
+#[test]
+fn a_resources_policies_are_weighed_together_a_deny_in_either_winning() {
+    // An S3 Tables table: its table bucket's policy grants another account,
+    // its own denies that account deletes.
+    let arn = "arn:aws:s3tables:us-east-1:111111111111:bucket/b/table/t-1";
+    let bucket = bucket_policy(&format!(
+        r#"{{"Version": "2012-10-17", "Statement": [{{"Effect": "Allow",
+          "Principal": {{"AWS": "{OTHER}"}}, "Action": "s3tables:*", "Resource": "{arn}"}}]}}"#
+    ));
+    let table = bucket_policy(&format!(
+        r#"{{"Version": "2012-10-17", "Statement": [{{"Effect": "Deny",
+          "Principal": {{"AWS": "{OTHER}"}}, "Action": "s3tables:DeleteTable", "Resource": "{arn}"}}]}}"#
+    ));
+    let mine = identity_policy(
+        r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3tables:*", "Resource": "*"}]}"#,
+    );
+    let other = user(OTHER, "reader");
+    let decide = |action: &str, policies: &[&Policy]| {
+        let ctx = Context::default();
+        let request = Request {
+            identity: &other,
+            action,
+            resource: arn,
+            context: &ctx,
+        };
+        evaluate_all(&request, &[&mine], Some(OWNER), policies)
+    };
+    assert_eq!(
+        decide("s3tables:GetTable", &[&bucket, &table]),
+        Decision::Allow
+    );
+    assert_eq!(
+        decide("s3tables:DeleteTable", &[&bucket, &table]),
+        Decision::ExplicitDeny
+    );
+    assert_eq!(decide("s3tables:DeleteTable", &[&bucket]), Decision::Allow);
+    assert_eq!(
+        decide("s3tables:GetTable", &[&table]),
+        Decision::ImplicitDeny
+    );
+    assert_eq!(decide("s3tables:GetTable", &[]), Decision::ImplicitDeny);
+    // A grant in the second policy counts as one in the first does.
+    assert_eq!(
+        decide("s3tables:GetTable", &[&table, &bucket]),
+        Decision::Allow
+    );
+}

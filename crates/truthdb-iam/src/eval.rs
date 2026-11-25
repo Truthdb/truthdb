@@ -100,6 +100,19 @@ pub fn evaluate(
     bucket_owner: Option<&str>,
     bucket_policy: Option<&Policy>,
 ) -> Decision {
+    let resource_policies: Vec<&Policy> = bucket_policy.into_iter().collect();
+    evaluate_all(request, identity_policies, bucket_owner, &resource_policies)
+}
+
+/// [`evaluate`], with the resource's policies all weighed as its one bucket
+/// policy would be (an S3 Tables table's: its table bucket's and its own; a
+/// Deny in either wins).
+pub fn evaluate_all(
+    request: &Request<'_>,
+    identity_policies: &[&Policy],
+    bucket_owner: Option<&str>,
+    resource_policies: &[&Policy],
+) -> Decision {
     let mut identity_allow = matches!(request.identity, Identity::Root { .. });
     for policy in identity_policies {
         for statement in &policy.statements {
@@ -113,7 +126,7 @@ pub fn evaluate(
         }
     }
     let (mut direct, mut by_account) = (false, false);
-    if let Some(policy) = bucket_policy {
+    for policy in resource_policies {
         for statement in &policy.statements {
             let named = named(&statement.principals, request.identity);
             if named == Named::No || !applies(policy, statement, request) {
