@@ -20,6 +20,7 @@ pub mod delete;
 pub mod directory;
 pub mod error;
 pub mod iam_api;
+mod iceberg_metadata;
 pub mod inventory_config;
 pub mod inventory_run;
 pub mod lifecycle;

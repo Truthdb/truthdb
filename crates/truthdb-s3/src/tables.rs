@@ -587,7 +587,7 @@ async fn serve(
             (&Method::PUT, ["tables", arn, namespace]) => {
                 let bucket = caller.bucket_of(arn)?;
                 let namespace = namespace_name(namespace)?.to_string();
-                refuse_extras(&input, &["name", "format"])?;
+                refuse_extras(&input, &["name", "format", "metadata"])?;
                 let name = table_name(required(&input, "name")?)?.to_string();
                 if required(&input, "format")? != "ICEBERG" {
                     return Err(TError::bad("format is ICEBERG."));
@@ -600,6 +600,27 @@ async fn serve(
                     .map_err(|_| TError::forbidden())?;
                 let id = uuid();
                 let now = crate::objects::now_ms();
+                let location = format!("s3://{}", truthdb_object::warehouse_bucket(&id));
+                // With `metadata`, its first metadata file is written into
+                // its storage (which "requires s3tables:PutTableData"), and
+                // it points at it.
+                let first = match input.get("metadata") {
+                    None => None,
+                    Some(metadata) => {
+                        authz
+                            .check_arn_with(
+                                "s3tables:PutTableData",
+                                &caller.table_arn(&bucket, &id),
+                                caller.account,
+                                &policies,
+                            )
+                            .map_err(|_| TError::forbidden())?;
+                        let file = crate::iceberg_metadata::initial(metadata, &location, &uuid(), now)
+                            .map_err(TError::bad)?;
+                        let key = format!("metadata/00000-{}.metadata.json", uuid());
+                        Some((key, metadata_body(state, file.to_string(), now).await?))
+                    }
+                };
                 let table = TableInfo {
                     namespace,
                     name,
@@ -608,15 +629,42 @@ async fn serve(
                     created_by: caller.who.to_string(),
                     modified_ms: now,
                     modified_by: caller.who.to_string(),
-                    metadata_location: None,
+                    metadata_location: first.as_ref().map(|(key, _)| format!("{location}/{key}")),
                     version_token: uuid().replace('-', ""),
-                    warehouse_location: format!("s3://{}", truthdb_object::warehouse_bucket(&id)),
+                    warehouse_location: location,
                 };
                 let (account, made) = (caller.account.to_string(), table.clone());
                 let bucket_id = weighed.bucket_id.clone();
                 write(state, move |tx| {
                     guarded(tx, (&account, &bucket), bucket_id.as_deref(), |tx| {
-                        tx.create_table((&account, &bucket), &made)
+                        if let Err(err) = tx.create_table((&account, &bucket), &made)? {
+                            return Ok(Err(err));
+                        }
+                        if let Some((key, body)) = &first {
+                            let attrs = truthdb_object::ObjectAttrs {
+                                content_type: Some("application/json".to_string()),
+                                ..truthdb_object::ObjectAttrs::default()
+                            };
+                            let warehouse = truthdb_object::warehouse_bucket(&made.id);
+                            // Its bucket was just made with it.
+                            if tx
+                                .put_object(
+                                    &warehouse,
+                                    key,
+                                    body,
+                                    &attrs,
+                                    truthdb_object::StorageClass::Standard,
+                                    now,
+                                    0,
+                                )?
+                                .is_err()
+                            {
+                                return Err(truthdb_core::storage::StorageError::InvalidFile(
+                                    "a new table's storage refused its metadata file".to_string(),
+                                ));
+                            }
+                        }
+                        Ok(Ok(()))
                     })
                 })
                 .await?;
@@ -898,14 +946,14 @@ async fn serve(
 }
 
 /// Refuses (501) the request fields not built here (encryption, storage
-/// class, tags, a table's initial metadata), and any unknown one (400).
+/// class, tags), and any unknown one (400).
 fn refuse_extras(input: &Map<String, Value>, taken: &[&str]) -> Result<(), TError> {
     for field in input.keys() {
         if taken.contains(&field.as_str()) {
             continue;
         }
         return Err(match field.as_str() {
-            "encryptionConfiguration" | "storageClassConfiguration" | "tags" | "metadata" => {
+            "encryptionConfiguration" | "storageClassConfiguration" | "tags" => {
                 TError::not_implemented(field)
             }
             _ => TError::bad(format!("{field} is not a field of this request.")),
@@ -1035,6 +1083,24 @@ async fn resource_policy(
             Ok((StatusCode::NO_CONTENT, None))
         }
     }
+}
+
+/// A table's metadata file, written as a body (sealed: an object of it is
+/// made in the table's transaction).
+async fn metadata_body(
+    state: &S3State,
+    file: String,
+    now: u64,
+) -> Result<truthdb_object::SealedBody, TError> {
+    let storage = std::sync::Arc::clone(&state.storage);
+    tokio::task::spawn_blocking(move || {
+        let mut writer = truthdb_object::BodyWriter::begin(&storage, now)?;
+        writer.write(&storage, file.as_bytes(), now)?;
+        writer.finish(&storage, now)
+    })
+    .await
+    .map_err(|_| TError::from(S3Error::internal("The metadata file was not written.")))?
+    .map_err(|err| TError::from(S3Error::internal(err.to_string())))
 }
 
 async fn find_bucket(
