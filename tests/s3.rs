@@ -18890,8 +18890,9 @@ const PYICEBERG_SCRIPT: &str = r#"
 import gzip, json, sys
 import boto3, botocore.config
 from pyiceberg.catalog.rest import RestCatalog
-from pyiceberg.exceptions import (BadRequestError, ForbiddenError, NamespaceAlreadyExistsError,
-    NamespaceNotEmptyError, NoSuchNamespaceError, NoSuchTableError, TableAlreadyExistsError)
+from pyiceberg.exceptions import (BadRequestError, CommitFailedException, ForbiddenError,
+    NamespaceAlreadyExistsError, NamespaceNotEmptyError, NoSuchNamespaceError, NoSuchTableError,
+    TableAlreadyExistsError)
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import DayTransform
@@ -18905,7 +18906,9 @@ def catalog(access, secret_key):
     return RestCatalog("lake", **{
         "uri": f"http://127.0.0.1:{port}/iceberg", "warehouse": arn,
         "rest.sigv4-enabled": "true", "rest.signing-name": "s3tables", "rest.signing-region": "us-east-1",
-        "client.access-key-id": access, "client.secret-access-key": secret_key, "client.region": "us-east-1"})
+        "client.access-key-id": access, "client.secret-access-key": secret_key, "client.region": "us-east-1",
+        "s3.endpoint": f"http://127.0.0.1:{port}", "s3.access-key-id": access,
+        "s3.secret-access-key": secret_key, "s3.region": "us-east-1"})
 def refused(call, error):
     try:
         call()
@@ -18943,7 +18946,9 @@ for path, kind in [("/namespaces/none", "NoSuchNamespaceException"),
 schema = Schema(NestedField(1, "id", LongType(), required=True), NestedField(2, "at", TimestamptzType()),
     NestedField(3, "who", StringType()), identifier_field_ids=[1])
 spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=DayTransform(), name="at_day"))
-table = c.create_table(("sales", "orders"), schema=schema, partition_spec=spec, properties={"owner": "sales"})
+# (No retries of a refused commit: a refusal is seen.)
+table = c.create_table(("sales", "orders"), schema=schema, partition_spec=spec,
+    properties={"owner": "sales", "commit.retry.num-retries": "0"})
 assert table.metadata.format_version == 2, table.metadata
 assert table.schema().find_field("id").required and table.schema().identifier_field_ids == [1]
 assert [f.name for f in table.spec().fields] == ["at_day"] and table.properties["owner"] == "sales"
@@ -18951,9 +18956,40 @@ location = table.metadata_location
 assert location.startswith(table.location() + "/metadata/") and location.endswith(".metadata.json"), location
 loaded = c.load_table(("sales", "orders"))
 assert (loaded.metadata.table_uuid, loaded.metadata_location) == (table.metadata.table_uuid, location)
+# Data: appended through the catalog (files written into its storage, then
+# a commit), and read back.
+import pyarrow as pa
+from datetime import datetime, timezone
+from pyiceberg.types import StringType as Text
+arrow = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("at", pa.timestamp("us", tz="UTC")),
+    pa.field("who", pa.string())])
+def rows(ids):
+    return pa.Table.from_pylist([{"id": i, "at": datetime(2026, 1, i, tzinfo=timezone.utc), "who": f"w{i}"}
+        for i in ids], schema=arrow)
+loaded.append(rows([1, 2, 3]))
+stale = c.load_table(("sales", "orders"))
+loaded.append(rows([4]))
+again = c.load_table(("sales", "orders"))
+assert sorted(again.scan().to_arrow().column("id").to_pylist()) == [1, 2, 3, 4]
+assert len(again.metadata.snapshots) == 2 and again.metadata.current_snapshot_id == again.metadata.snapshots[-1].snapshot_id
+assert again.metadata_location.split("/")[-1].startswith("00002-"), again.metadata_location
+assert [entry.metadata_file for entry in again.metadata.metadata_log][0] == location
+assert t.get_table_metadata_location(tableBucketARN=arn, namespace="sales", name="orders")["metadataLocation"] == again.metadata_location
+# A writer from before the last commit: refused (its main branch moved).
+refused(lambda: stale.append(rows([9])), CommitFailedException)
+assert sorted(c.load_table(("sales", "orders")).scan().to_arrow().column("id").to_pylist()) == [1, 2, 3, 4]
+# The schema evolves, and properties change.
+with again.update_schema() as update:
+    update.add_column("note", Text())
+with again.transaction() as change:
+    change.set_properties(stage="two")
+evolved = c.load_table(("sales", "orders"))
+assert [f.name for f in evolved.schema().fields] == ["id", "at", "who", "note"], evolved.schema()
+assert evolved.properties["stage"] == "two" and evolved.properties["owner"] == "sales"
+assert sorted(evolved.scan(selected_fields=("id",)).to_arrow().column("id").to_pylist()) == [1, 2, 3, 4]
 # The S3 Tables API sees the same table, pointing at the same file.
 got = t.get_table(tableBucketARN=arn, namespace="sales", name="orders")
-assert (got["metadataLocation"], got["warehouseLocation"]) == (location, table.location()), got
+assert (got["metadataLocation"], got["warehouseLocation"]) == (evolved.metadata_location, table.location()), got
 assert c.table_exists(("sales", "orders")) and not c.table_exists(("sales", "none"))
 assert c.list_tables("sales") == [("sales", "orders")]
 refused(lambda: c.create_table(("sales", "orders"), schema=schema), TableAlreadyExistsError)
@@ -19000,6 +19036,14 @@ t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=json.dumps({"Versio
 assert sorted(theirs.list_tables("sales")) == [("sales", "bare"), ("sales", "orders_2024")]
 assert theirs.load_table(("sales", "orders_2024")).metadata.table_uuid == table.metadata.table_uuid
 refused(lambda: theirs.list_namespaces(), ForbiddenError)
+# Writing its data files (PutTableData) does not commit them: that is
+# UpdateTableMetadataLocation's.
+t.put_table_bucket_policy(tableBucketARN=arn, resourcePolicy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"AWS": other},
+    "Action": ["s3tables:GetTableBucket", "s3tables:ListTables", "s3tables:GetTableMetadataLocation",
+               "s3tables:GetTableData", "s3tables:PutTableData"], "Resource": [arn, arn + "/table/*"]}]}))
+theirs = catalog(other_key, other_secret)
+refused(lambda: theirs.load_table(("sales", "orders_2024")).append(rows([7])), ForbiddenError)
 refused(lambda: theirs.purge_table(("sales", "bare")), ForbiddenError)
 t.delete_table_bucket_policy(tableBucketARN=arn)
 # Dropped only with its files purged; a namespace with tables is not.
