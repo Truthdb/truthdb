@@ -129,7 +129,7 @@ pub(crate) fn check(request: &mut Request<Incoming>, target: &Target) -> Result<
         (Target::Bucket(_), &Method::PUT | &Method::DELETE | &Method::HEAD, None) => true,
         (Target::Bucket(_), &Method::GET, None) => param("list-type") == Some("2"),
         (Target::Bucket(_), _, Some("policy" | "encryption" | "inventory" | "lifecycle")) => true,
-        (Target::Bucket(_), &Method::GET, Some("uploads")) => true,
+        (Target::Bucket(_), &Method::GET, Some("uploads" | "session")) => true,
         (Target::Bucket(_), &Method::POST, Some("delete")) => true,
         (
             Target::Object(..),

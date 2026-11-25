@@ -17903,6 +17903,8 @@ def upload(numbers):
         UploadId=made["UploadId"], MultipartUpload={"Parts": listed})
 gapped, complete = upload([1, 3])
 refused(complete, "InvalidPart")
+# An upload in progress is EXPRESS_ONEZONE too.
+assert d.list_parts(Bucket=B, Key="dir/big", UploadId=gapped)["StorageClass"] == "EXPRESS_ONEZONE"
 # A refused completion leaves its upload, as at S3.
 d.abort_multipart_upload(Bucket=B, Key="dir/big", UploadId=gapped)
 upload([1, 2])[1]()
@@ -17996,5 +17998,204 @@ assert copied["resources"][0]["type"] == "AWS::S3Express::Object", copied
 # Looked up by its bucket's name.
 named = trail.lookup_events(LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": B}])["Events"]
 assert "CreateBucket" in {e["EventName"] for e in named}, named
+print("ok")
+"#;
+
+#[test]
+fn directory_bucket_sessions_sign_requests_in_their_bucket_and_mode() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "sessions");
+    let reader = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3express:CreateSession", "Resource": "*", "Condition": {"StringEquals": {"s3express:SessionMode": "ReadOnly"}}}}"#;
+    let (reader_key, reader_secret) = user_with_key(&server, &account, "reader", Some(reader));
+    let (none_key, none_secret) = user_with_key(&server, &account, "nobody", None);
+    // Sessions of the one bucket only.
+    let one = format!(
+        r#"{{"Version": "2012-10-17", "Statement": {{"Effect": "Allow", "Action": "s3express:CreateSession", "Resource": "arn:aws:s3express:us-east-1:{account}:bucket/data--use1-az4--x-s3"}}}}"#
+    );
+    let (one_key, one_secret) = user_with_key(&server, &account, "one", Some(&one));
+    let (_, other_key, other_secret) = account_with_key(&server, "others");
+    let script = server.dir.join("sessions.py");
+    std::fs::write(&script, SESSIONS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &key,
+            &secret,
+            &reader_key,
+            &reader_secret,
+            &none_key,
+            &none_secret,
+            &one_key,
+            &one_secret,
+            &account,
+            &other_key,
+            &other_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const SESSIONS_SCRIPT: &str = r#"
+import sys
+import boto3, botocore.config, botocore.exceptions
+(port, key, secret, reader_key, reader_secret, none_key, none_secret, one_key, one_secret, account,
+    other_key, other_secret) = sys.argv[1:13]
+def client(access, secret_key, sessions=True):
+    s3 = {"addressing_style": "path"}
+    if not sessions:
+        s3["disable_s3_express_session_auth"] = True
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3=s3))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+B, OTHER = "data--use1-az4--x-s3", "other--use1-az4--x-s3"
+plain = client(key, secret, sessions=False)
+for name in [B, OTHER]:
+    plain.create_bucket(Bucket=name, CreateBucketConfiguration={
+        "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+        "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+plain.create_bucket(Bucket="general")
+# The SDK as it is: a session per bucket, its requests signed with it.
+sent = []
+s3 = client(key, secret)
+s3.meta.events.register("before-send.s3", lambda request, **_: sent.append(
+    (request.url, request.headers.get("x-amz-s3session-token"))))
+s3.put_object(Bucket=B, Key="dir/a", Body=b"one")
+assert s3.get_object(Bucket=B, Key="dir/a")["Body"].read() == b"one"
+assert [o["Key"] for o in s3.list_objects_v2(Bucket=B, Prefix="dir/")["Contents"]] == ["dir/a"]
+s3.head_object(Bucket=B, Key="dir/a")
+s3.put_object(Bucket=OTHER, Key="x", Body=b"x")
+s3.delete_object(Bucket=OTHER, Key="x")
+sessions = [url for url, token in sent if url.endswith("?session")]
+assert len(sessions) == 2, sent
+assert all(token for url, token in sent if not url.endswith("?session")), sent
+# The general purpose bucket's requests are no session's.
+s3.put_object(Bucket="general", Key="g", Body=b"g")
+assert sent[-1][1] is None, sent[-1]
+# A user allowed ReadOnly sessions only: it reads, and writes nothing.
+r = client(reader_key, reader_secret)
+assert r.get_object(Bucket=B, Key="dir/a")["Body"].read() == b"one"
+refused(lambda: r.put_object(Bucket=B, Key="dir/r", Body=b"r"), "AccessDenied")
+# A user allowed none gets none.
+refused(lambda: client(none_key, none_secret, sessions=False).create_session(Bucket=B), "AccessDenied")
+# A session asked for: ReadOnly, for five minutes.
+made = plain.create_session(Bucket=B, SessionMode="ReadOnly")["Credentials"]
+assert made["AccessKeyId"].startswith("TDBS"), made
+left = (made["Expiration"] - made["Expiration"].now(made["Expiration"].tzinfo)).total_seconds()
+assert 290 < left <= 300, left
+def with_session(credentials, token):
+    c = client(credentials["AccessKeyId"], credentials["SecretAccessKey"], sessions=False)
+    def add(request, **_):
+        request.headers["x-amz-s3session-token"] = token
+    c.meta.events.register("before-sign.s3", add)
+    return c
+ro = with_session(made, made["SessionToken"])
+assert ro.get_object(Bucket=B, Key="dir/a")["Body"].read() == b"one"
+refused(lambda: ro.put_object(Bucket=B, Key="dir/ro", Body=b"x"), "AccessDenied")
+refused(lambda: ro.delete_object(Bucket=B, Key="dir/a"), "AccessDenied")
+# Its bucket's only: not another directory bucket, a general one, or the
+# service's operations.
+refused(lambda: ro.get_object(Bucket=OTHER, Key="x"), "AccessDenied")
+refused(lambda: ro.get_object(Bucket="general", Key="g"), "AccessDenied")
+refused(lambda: ro.list_directory_buckets(), "AccessDenied")
+# Nor S3 Control's (signed by hand: no client sends a session there).
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
+import urllib.request, urllib.error
+control = AWSRequest(method="GET", url=f"http://127.0.0.1:{port}/v20180820/configuration/publicAccessBlock",
+    headers={"x-amz-account-id": account, "x-amz-s3session-token": made["SessionToken"],
+        "x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+SigV4Auth(Credentials(made["AccessKeyId"], made["SecretAccessKey"]), "s3", "us-east-1").add_auth(control)
+try:
+    urllib.request.urlopen(urllib.request.Request(control.url, headers=dict(control.headers)))
+    raise SystemExit("a session reached S3 Control")
+except urllib.error.HTTPError as error:
+    assert error.code == 403 and b"AccessDenied" in error.read(), error.code
+# A wrong token; a key no session has.
+refused(lambda: with_session(made, "not-the-token").get_object(Bucket=B, Key="dir/a"), "InvalidToken")
+refused(lambda: with_session(dict(made, AccessKeyId="TDBSNOSUCHKEY0000000"), made["SessionToken"])
+    .get_object(Bucket=B, Key="dir/a"), "InvalidAccessKeyId")
+# A ReadWrite session writes.
+rw = plain.create_session(Bucket=B, SessionMode="ReadWrite")["Credentials"]
+with_session(rw, rw["SessionToken"]).put_object(Bucket=B, Key="dir/rw", Body=b"rw")
+# A session is its bucket's: a copy into it from another directory bucket
+# reads that one as its creator may (here: not at all).
+plain.put_object(Bucket=OTHER, Key="src", Body=b"s")
+own = client(one_key, one_secret, sessions=False).create_session(Bucket=B)["Credentials"]
+mine = with_session(own, own["SessionToken"])
+mine.put_object(Bucket=B, Key="dir/own", Body=b"o")
+refused(lambda: mine.copy_object(Bucket=B, Key="dir/copy", CopySource={"Bucket": OTHER, "Key": "src"}),
+    "AccessDenied")
+# A ReadOnly session makes no session (of any mode), and changes nothing of
+# its bucket's: not its lifecycle, its policy or the bucket itself.
+refused(lambda: ro.create_session(Bucket=B, SessionMode="ReadWrite"), "AccessDenied")
+refused(lambda: ro.put_bucket_lifecycle_configuration(Bucket=B, LifecycleConfiguration={"Rules": [
+    {"ID": "e", "Status": "Enabled", "Filter": {"Prefix": ""}, "Expiration": {"Days": 1}}]}), "AccessDenied")
+refused(lambda: ro.delete_bucket_policy(Bucket=B), "AccessDenied")
+refused(lambda: ro.delete_bucket(Bucket=B), "AccessDenied")
+# Nor does a ReadWrite one make a session.
+refused(lambda: with_session(rw, rw["SessionToken"]).create_session(Bucket=B), "AccessDenied")
+# Nor does any session make a bucket (CreateBucket is Regional).
+refused(lambda: with_session(rw, rw["SessionToken"]).create_bucket(Bucket=B, CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}}), "AccessDenied")
+# A session is its bucket's, not its name's: deleted, and made again by
+# another account, the bucket is not the session's.
+GONE = "gone--use1-az4--x-s3"
+configuration = {"Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}}
+plain.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+old = plain.create_session(Bucket=GONE, SessionMode="ReadWrite")["Credentials"]
+stale = with_session(old, old["SessionToken"])
+stale.put_object(Bucket=GONE, Key="mine", Body=b"m")
+stale.delete_object(Bucket=GONE, Key="mine")
+plain.delete_bucket(Bucket=GONE)
+theirs = client(other_key, other_secret, sessions=False)
+theirs.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+theirs.put_object(Bucket=GONE, Key="secret", Body=b"theirs")
+# (DeleteBucket ends its sessions.)
+refused(lambda: stale.get_object(Bucket=GONE, Key="secret"), "InvalidAccessKeyId")
+refused(lambda: stale.put_object(Bucket=GONE, Key="planted", Body=b"x"), "InvalidAccessKeyId")
+# Nor when its own account makes it again.
+theirs.delete_object(Bucket=GONE, Key="secret")
+theirs.delete_bucket(Bucket=GONE)
+plain.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+again = plain.create_session(Bucket=GONE, SessionMode="ReadWrite")["Credentials"]
+plain.delete_bucket(Bucket=GONE)
+plain.create_bucket(Bucket=GONE, CreateBucketConfiguration=configuration)
+refused(lambda: with_session(again, again["SessionToken"]).put_object(Bucket=GONE, Key="k", Body=b"x"),
+    "InvalidAccessKeyId")
+# Refused: a general purpose bucket's session, a missing bucket's, a mode
+# S3 does not name.
+refused(lambda: plain.create_session(Bucket="general"), "NotImplemented")
+refused(lambda: plain.create_session(Bucket="missing--use1-az4--x-s3"), "NoSuchBucket")
+refused(lambda: plain.create_session(Bucket=B, SessionMode="WriteOnly"), "InvalidArgument")
+# The SDK creates a directory bucket's session before creating it: the
+# bucket is not there, so that fails (CreateBucket needs no session).
+try:
+    s3.create_bucket(Bucket="new--use1-az4--x-s3", CreateBucketConfiguration={
+        "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+        "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+    raise SystemExit("created with a session")
+except botocore.exceptions.ClientError as error:
+    assert error.response["Error"]["Code"] == "NoSuchBucket", error.response
 print("ok")
 "#;
