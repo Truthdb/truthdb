@@ -444,6 +444,18 @@ impl Authz {
             Resource::Bucket(bucket) => (format!("arn:aws:s3:::{bucket}"), Some(bucket)),
             Resource::Object(bucket, key) => (format!("arn:aws:s3:::{bucket}/{key}"), Some(bucket)),
         };
+        // A session's bucket is the very one it was made for (its name,
+        // owner and creation): one of its name made since is refused it
+        // outright, for every operation.
+        if let (Some(scope), Some(bucket)) = (&self.session, bucket)
+            && scope.bucket == bucket
+            && let Some(grant) = self.buckets.get(bucket)
+            && grant.owner.is_some()
+            && (grant.owner.as_deref() != Some(scope.owner.as_str())
+                || grant.created_ms != Some(scope.created_ms))
+        {
+            return Err(S3Error::access_denied("Access Denied"));
+        }
         // Creating a bucket is the caller's own policies' to allow (one that
         // exists already is the operation's conflict to report).
         let grant = bucket
@@ -505,7 +517,7 @@ impl Authz {
         if let (Some(grant), Some(owner), Some(bucket)) = (grant, owner, bucket)
             && grant.zone.is_some()
         {
-            return self.check_directory(action, (bucket, grant), owner, policy, context);
+            return self.check_directory(action, bucket, owner, policy, context);
         }
         self.decide(action, &arn, owner, policy, context)
     }
@@ -518,7 +530,7 @@ impl Authz {
     fn check_directory(
         &self,
         action: &str,
-        (bucket, grant): (&str, &BucketGrant),
+        bucket: &str,
         owner: &str,
         policy: Option<&Policy>,
         context: &Context,
@@ -557,16 +569,12 @@ impl Authz {
         if action == "s3express:CreateSession" {
             return self.decide(action, &arn, Some(owner), policy, context);
         }
-        // A session of this bucket allows what its mode does: S3 Express
-        // authorizes its requests at CreateSession. Only the very bucket it
-        // was made for (its name, owner and creation): one made again since
-        // is refused it outright.
+        // A session of this bucket (the very one: see `check_with`) allows
+        // what its mode does: S3 Express authorizes its requests at
+        // CreateSession.
         if let Some(scope) = &self.session
             && scope.bucket == bucket
         {
-            if scope.owner != owner || grant.created_ms != Some(scope.created_ms) {
-                return Err(S3Error::access_denied("Access Denied"));
-            }
             return match !scope.read_only || READS.contains(&action) {
                 true => Ok(()),
                 false => Err(S3Error::access_denied("Access Denied")),

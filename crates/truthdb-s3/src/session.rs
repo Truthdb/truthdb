@@ -64,15 +64,16 @@ struct Kept {
 
 impl Kept {
     /// Keeps the sessions `keep` takes, and counts them again.
+    /// Keeps the sessions `keep` takes, uncounting the others.
     fn retain(&mut self, keep: impl Fn(&Session) -> bool) {
-        self.by_id.retain(|_, session| keep(session));
-        self.of_account.clear();
-        for session in self.by_id.values() {
-            *self
-                .of_account
-                .entry(session.principal.account.clone())
-                .or_default() += 1;
-        }
+        let Kept { by_id, of_account } = self;
+        by_id.retain(|_, session| {
+            let kept = keep(session);
+            if !kept && let Some(count) = of_account.get_mut(&session.principal.account) {
+                *count -= 1;
+            }
+            kept
+        });
     }
 
     fn full(&self, account: &str) -> bool {
