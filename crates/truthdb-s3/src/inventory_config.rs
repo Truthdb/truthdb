@@ -330,6 +330,10 @@ pub async fn bucket_inventory(
                             "The destination bucket is not the source bucket owner's",
                         ));
                     }
+                    // Its files are written only as its table allows.
+                    Some(target) if target.warehouse.is_some() => {
+                        return Ok(Some("The destination bucket is a table's storage"));
+                    }
                     Some(_) => {}
                 }
                 file.transaction(|tx| {

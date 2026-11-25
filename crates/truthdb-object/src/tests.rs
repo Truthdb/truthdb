@@ -8778,3 +8778,89 @@ fn a_tables_storage_bucket_comes_with_it_and_is_emptied_and_removed_after_it() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_deleted_tables_files_are_removed_from_where_a_reopened_file_left_off() {
+    use crate::{AccountError, TableError, TableInfo};
+    let path = temp_path("table-storage-reopen");
+    let at = ("111122223333", "lake");
+    let name = crate::warehouse_bucket("t-1");
+    {
+        let storage = create(&path);
+        let tx = |op: &dyn Fn(
+            &mut crate::ObjTxn<'_, '_>,
+        ) -> Result<Result<(), TableError>, StorageError>| {
+            ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
+        };
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.create_account(at.0, "lakes", 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tx(&|tx| tx.create_table_bucket(at.0, at.1, "b", 1)), Ok(()));
+        assert_eq!(
+            tx(&|tx| tx.create_namespace(at, "sales", "n", ("me", 1))),
+            Ok(())
+        );
+        let table = TableInfo {
+            namespace: "sales".to_string(),
+            name: "orders".to_string(),
+            id: "t-1".to_string(),
+            created_ms: 2,
+            created_by: "me".to_string(),
+            modified_ms: 2,
+            modified_by: "me".to_string(),
+            metadata_location: None,
+            version_token: "v".to_string(),
+            warehouse_location: format!("s3://{name}"),
+        };
+        assert_eq!(tx(&|tx| tx.create_table(at, &table)), Ok(()));
+        for index in 0..150 {
+            put_text(&storage, &name, &format!("data/{index:03}.parquet"), "rows");
+        }
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| tx.delete_table(at, ("sales", "orders", "t-1"), None))
+                .unwrap()
+                .map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(tx(&|tx| tx.delete_namespace(at, "sales")), Ok(()));
+        assert_eq!(tx(&|tx| tx.delete_table_bucket(at.0, at.1)), Ok(()));
+        // One step, then the file is closed.
+        assert!(
+            ObjFile::new(&mut storage.lock())
+                .warehouse_purge_step(now(), 0, 64)
+                .unwrap()
+        );
+    }
+    let storage = open(&path);
+    // Its account waits for the removal, and says so.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.drop_account(at.0))
+            .unwrap(),
+        Err(AccountError::NotEmpty(
+            "deleted tables' storage (being removed)"
+        ))
+    );
+    let mut steps = 0;
+    while ObjFile::new(&mut storage.lock())
+        .warehouse_purge_step(now(), 0, 64)
+        .unwrap()
+    {
+        steps += 1;
+    }
+    assert_eq!(steps, 3, "the 86 versions left in 2, then the bucket");
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).bucket(&name).unwrap(),
+        None
+    );
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.drop_account(at.0))
+            .unwrap(),
+        Ok(())
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

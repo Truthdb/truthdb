@@ -286,7 +286,8 @@ fn bucket_problem(
             "S3BucketDoesNotExistException",
             format!("S3 bucket {bucket} does not exist."),
         )),
-        Some(info) if info.owner != account => Some(CtError::new(
+        // A table's storage takes only what its table allows.
+        Some(info) if info.owner != account || info.warehouse.is_some() => Some(CtError::new(
             400,
             "InsufficientS3BucketPolicyException",
             format!("Incorrect S3 bucket policy is detected for bucket: {bucket}"),

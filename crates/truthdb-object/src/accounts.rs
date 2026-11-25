@@ -211,8 +211,15 @@ impl ObjTxn<'_, '_> {
             return Ok(Err(AccountError::NotEmpty("remote buckets")));
         }
         for (_, row) in self.trees.buckets().scan(self.ctx)? {
-            if BucketRow::decode(&row)?.owner == id {
-                return Ok(Err(AccountError::NotEmpty("buckets")));
+            let row = BucketRow::decode(&row)?;
+            if row.owner == id {
+                // A deleted table's storage, not yet removed, is not one of
+                // its buckets to delete: it goes soon.
+                return Ok(Err(AccountError::NotEmpty(if row.warehouse.is_some() {
+                    "deleted tables' storage (being removed)"
+                } else {
+                    "buckets"
+                })));
             }
         }
         self.trees

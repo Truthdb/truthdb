@@ -18809,6 +18809,17 @@ refused(lambda: s3.put_bucket_policy(Bucket=warehouse, Policy=json.dumps({"Versi
 refused(lambda: s3.get_bucket_versioning(Bucket=warehouse), "AccessDenied")
 refused(lambda: s3.create_bucket(Bucket=warehouse), "InvalidBucketName")
 assert warehouse not in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+# Nor do the server's own deliveries write into it.
+s3.create_bucket(Bucket="plain")
+refused(lambda: s3.put_bucket_logging(Bucket="plain", BucketLoggingStatus={"LoggingEnabled": {
+    "TargetBucket": warehouse, "TargetPrefix": "metadata/"}}), "InvalidTargetBucketForLogging")
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="plain", Id="lists", InventoryConfiguration={
+    "Id": "lists", "IsEnabled": True, "IncludedObjectVersions": "Current",
+    "Schedule": {"Frequency": "Daily"},
+    "Destination": {"S3BucketDestination": {"Bucket": f"arn:aws:s3:::{warehouse}", "Format": "CSV"}}}),
+    "InvalidArgument")
+refused(lambda: client("cloudtrail", key, secret).create_trail(Name="trail", S3BucketName=warehouse),
+    "InsufficientS3BucketPolicyException")
 # GetTableData reads, PutTableData writes: a user allowed only to read.
 assert reader.get_object(Bucket=warehouse, Key="data/00000.parquet")["Body"].read() == b"PAR1"
 refused(lambda: reader.put_object(Bucket=warehouse, Key="data/x.parquet", Body=b"x"), "AccessDenied")

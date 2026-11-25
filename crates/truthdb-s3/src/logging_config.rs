@@ -179,6 +179,12 @@ pub async fn bucket_logging(
                                 "A bucket with Object Lock enabled cannot be a target for logging",
                             ));
                         }
+                        // Its files are written only as its table allows.
+                        Some(target) if target.warehouse.is_some() => {
+                            return Ok(Some(
+                                "A table's storage bucket cannot be a target for logging",
+                            ));
+                        }
                         Some(_) => {}
                     }
                 }
