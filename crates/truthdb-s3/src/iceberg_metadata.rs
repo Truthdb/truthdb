@@ -308,7 +308,10 @@ fn schema_v2(schema: &Value, columns: &mut Columns) -> Result<Value, String> {
                     "The identifier field {identifier} is not a required primitive field (not float or double) of the schema's required structs."
                 ));
             }
-            kept.push(identifier);
+            // Once each (Iceberg keeps them as a set).
+            if !kept.contains(&identifier) {
+                kept.push(identifier);
+            }
         }
         out["identifier-field-ids"] = json!(kept);
     }
@@ -721,7 +724,7 @@ mod tests {
     #[test]
     fn a_nested_schema_a_partition_spec_and_a_write_order_are_checked_and_kept() {
         let file = made(json!({"iceberg": {
-            "schemaV2": {"type": "struct", "schema-id": 3, "identifier-field-ids": [1, 11], "fields": [
+            "schemaV2": {"type": "struct", "schema-id": 3, "identifier-field-ids": [1, 11, 1], "fields": [
                 {"id": 1, "name": "id", "required": true, "type": "long"},
                 {"id": 2, "name": "day", "required": false, "type": "date"},
                 {"id": 3, "name": "tags", "required": false, "type":
@@ -835,7 +838,8 @@ mod tests {
                 schema(json!([{"name": "x", "type": "list"}])),
                 "list is not",
             ),
-            // Types as Iceberg's readers parse them, and no other way.
+            // Types as Iceberg's readers parse them (a fixed of no bytes and
+            // a scale past the precision refused too, which mean nothing).
             (
                 schema(json!([{"name": "x", "type": "decimal(40, 2)"}])),
                 "is not",
