@@ -1708,6 +1708,7 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
                 owner: DEFAULT_ACCOUNT.to_string(),
                 object_lock: false,
                 zone: None,
+                warehouse: None,
             };
             tx.trees
                 .buckets()
@@ -1780,6 +1781,7 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
                 owner: DEFAULT_ACCOUNT.to_string(),
                 object_lock: false,
                 zone: None,
+                warehouse: None,
             };
             tx.trees
                 .buckets()
@@ -3116,6 +3118,7 @@ fn a_bucket_row_has_its_object_lock_byte_only_when_enabled() {
         owner: DEFAULT_ACCOUNT.to_string(),
         object_lock: false,
         zone: None,
+        warehouse: None,
     };
     assert_eq!(row.encode().len(), 29, "readable by earlier releases");
     assert!(!BucketRow::decode(&row.encode()).unwrap().object_lock);
@@ -3137,7 +3140,25 @@ fn a_bucket_row_has_its_object_lock_byte_only_when_enabled() {
     let mut bad = bytes.clone();
     bad[29] = 1;
     assert!(BucketRow::decode(&bad).is_err());
-    bad[29] = 3;
+    bad[29] = 5;
+    assert!(BucketRow::decode(&bad).is_err());
+    // A table's storage: 3 (4 once dropped), then its table bucket.
+    row.zone = None;
+    for dropped in [false, true] {
+        row.warehouse = Some(crate::Warehouse {
+            table_bucket: "lake".to_string(),
+            dropped,
+        });
+        let bytes = row.encode();
+        assert_eq!((bytes.len(), bytes[29]), (34, if dropped { 4 } else { 3 }));
+        let read = BucketRow::decode(&bytes).unwrap();
+        assert_eq!(
+            (read.warehouse, read.zone, read.object_lock),
+            (row.warehouse.clone(), None, false)
+        );
+    }
+    let mut bad = row.encode();
+    bad.truncate(30);
     assert!(BucketRow::decode(&bad).is_err());
 }
 
@@ -8662,6 +8683,98 @@ fn table_policies_are_kept_per_table_bucket_and_table_and_go_with_them() {
         Ok(())
     );
     assert_eq!(policy(None), None);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_tables_storage_bucket_comes_with_it_and_is_emptied_and_removed_after_it() {
+    use crate::{ObjectAttrs, TableError, TableInfo, Versioning, Warehouse};
+    let path = temp_path("table-storage");
+    let storage = create(&path);
+    let tx = |op: &dyn Fn(
+        &mut crate::ObjTxn<'_, '_>,
+    ) -> Result<Result<(), TableError>, StorageError>| {
+        ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
+    };
+    let at = ("111122223333", "lake");
+    assert_eq!(tx(&|tx| tx.create_table_bucket(at.0, at.1, "b", 1)), Ok(()));
+    assert_eq!(
+        tx(&|tx| tx.create_namespace(at, "sales", "n", ("me", 1))),
+        Ok(())
+    );
+    let table = TableInfo {
+        namespace: "sales".to_string(),
+        name: "orders".to_string(),
+        id: "t-1".to_string(),
+        created_ms: 2,
+        created_by: "me".to_string(),
+        modified_ms: 2,
+        modified_by: "me".to_string(),
+        metadata_location: None,
+        version_token: "v".to_string(),
+        warehouse_location: "s3://t-1--table-s3".to_string(),
+    };
+    assert_eq!(tx(&|tx| tx.create_table(at, &table)), Ok(()));
+    let name = crate::warehouse_bucket("t-1");
+    assert_eq!(name, "t-1--table-s3");
+    let bucket = || ObjFile::new(&mut storage.lock()).bucket(&name).unwrap();
+    let made = bucket().expect("made with the table");
+    assert_eq!(
+        (made.owner.as_str(), made.warehouse, made.versioning),
+        (
+            at.0,
+            Some(Warehouse {
+                table_bucket: "lake".to_string(),
+                dropped: false
+            }),
+            Versioning::Unversioned
+        )
+    );
+    for index in 0..150 {
+        put_text(&storage, &name, &format!("data/{index:03}.parquet"), "rows");
+    }
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_upload(
+                &name,
+                "data/big.parquet",
+                &ObjectAttrs::default(),
+                crate::StorageClass::Standard,
+                now(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let step = || {
+        ObjFile::new(&mut storage.lock())
+            .warehouse_purge_step(now(), 0, 64)
+            .unwrap()
+    };
+    // Nothing to remove while its table is there.
+    assert!(!step());
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_table(at, ("sales", "orders", "t-1"), None))
+            .unwrap()
+            .map(|_| ()),
+        Ok(())
+    );
+    assert!(bucket().unwrap().warehouse.unwrap().dropped);
+    // Its versions 64 at a time (one written meanwhile too), its upload,
+    // then the bucket.
+    assert!(step());
+    put_text(&storage, &name, "late.json", "{}");
+    let mut steps = 1;
+    while step() {
+        steps += 1;
+    }
+    assert_eq!(steps, 5, "151 versions in 3, the upload, the bucket");
+    assert_eq!(bucket(), None);
+    let (uploads, _) = ObjFile::new(&mut storage.lock())
+        .list_uploads(&name, "", None, 10)
+        .unwrap();
+    assert!(uploads.is_empty());
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
