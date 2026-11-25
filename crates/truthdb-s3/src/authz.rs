@@ -34,6 +34,19 @@ pub struct BucketGrant {
     /// When the bucket was created: with its owner, which bucket of its
     /// name it is (one deleted and made again is another).
     pub created_ms: Option<u64>,
+    /// An S3 Tables table's storage bucket: its table, and the policies of
+    /// its table bucket and table (its own has none).
+    pub warehouse: Option<WarehouseGrant>,
+}
+
+/// An S3 Tables table's storage bucket, as authorization sees it.
+#[derive(Debug, Clone)]
+pub struct WarehouseGrant {
+    pub table_bucket: String,
+    pub table_id: String,
+    /// Its table was deleted: the bucket is no longer there.
+    pub dropped: bool,
+    pub policies: Vec<Policy>,
 }
 
 /// What a request is authorized against.
@@ -151,6 +164,33 @@ fn load(
     for bucket in buckets {
         let info = file.bucket(bucket)?;
         let zone = info.as_ref().and_then(|info| info.zone.clone());
+        let warehouse = match &info {
+            Some(info) => match &info.warehouse {
+                Some(warehouse) => {
+                    let table_id = bucket.strip_suffix("--table-s3").unwrap_or(bucket);
+                    let mut policies = Vec::new();
+                    for table in [None, Some(table_id)] {
+                        if let Some(document) =
+                            file.table_policy((&info.owner, &warehouse.table_bucket), table)?
+                        {
+                            let text = String::from_utf8_lossy(&document);
+                            policies.push(
+                                Policy::parse(&text, PolicyKind::Bucket)
+                                    .map_err(|err| corrupt_policy("table policy", err))?,
+                            );
+                        }
+                    }
+                    Some(WarehouseGrant {
+                        table_bucket: warehouse.table_bucket.clone(),
+                        table_id: table_id.to_string(),
+                        dropped: warehouse.dropped,
+                        policies,
+                    })
+                }
+                None => None,
+            },
+            None => None,
+        };
         let created_ms = info.as_ref().map(|info| info.created_ms);
         let owner = info.map(|info| info.owner);
         let policy = match owner {
@@ -179,6 +219,7 @@ fn load(
                 public_block,
                 zone,
                 created_ms,
+                warehouse,
             },
         );
     }
@@ -465,6 +506,11 @@ impl Authz {
         if grant.is_some() && owner.is_none() {
             return Ok(());
         }
+        if let (Some(warehouse), Some(owner)) =
+            (grant.and_then(|grant| grant.warehouse.as_ref()), owner)
+        {
+            return self.check_warehouse(action, owner, warehouse, context);
+        }
         // An object's own tags, as `s3:ExistingObjectTag/...`.
         let tagged;
         let context = match resource {
@@ -520,6 +566,42 @@ impl Authz {
             return self.check_directory(action, bucket, owner, policy, context);
         }
         self.decide(action, &arn, owner, policy, context)
+    }
+
+    /// An S3 Tables table's storage bucket's check: reading its files
+    /// (GetObject, HeadObject, ListParts) is `s3tables:GetTableData` on its
+    /// table, writing them (PutObject and the multipart uploads') is
+    /// `s3tables:PutTableData`, with its table bucket's and table's
+    /// policies; nothing else is allowed on it. Once its table is deleted,
+    /// it is not there.
+    fn check_warehouse(
+        &self,
+        action: &str,
+        owner: &str,
+        warehouse: &WarehouseGrant,
+        context: &Context,
+    ) -> Result<(), S3Error> {
+        if warehouse.dropped {
+            let bucket = format!("{}--table-s3", warehouse.table_id);
+            return Err(crate::api::bucket_error(
+                truthdb_object::BucketError::NoSuchBucket,
+                &bucket,
+            ));
+        }
+        let table_action = match action {
+            "s3:GetObject" | "s3:ListMultipartUploadParts" => "s3tables:GetTableData",
+            "s3:PutObject" | "s3:AbortMultipartUpload" => "s3tables:PutTableData",
+            _ => return Err(S3Error::access_denied("Access Denied")),
+        };
+        let Some(region) = &self.region else {
+            return Err(S3Error::access_denied("Access Denied"));
+        };
+        let arn = format!(
+            "arn:aws:s3tables:{region}:{owner}:bucket/{}/table/{}",
+            warehouse.table_bucket, warehouse.table_id
+        );
+        let policies: Vec<&Policy> = warehouse.policies.iter().collect();
+        self.decide_all(table_action, &arn, Some(owner), &policies, context)
     }
 
     /// A directory bucket's check: its bucket operations are S3 Express's
