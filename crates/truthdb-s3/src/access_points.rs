@@ -372,17 +372,25 @@ async fn create(
     let body = read_body(request, auth, MAX_BODY).await?;
     let create = parse_create(&body)?;
     let bucket = create.bucket.clone();
-    let owner = crate::scope::object(state, move |file| {
-        file.bucket(&bucket).map(|info| info.map(|info| info.owner))
-    })
-    .await?
-    .ok_or_else(|| {
+    let info = crate::scope::object(state, move |file| file.bucket(&bucket)).await?;
+    let no_such_bucket = || {
         S3Error::new(
             404,
             "NoSuchBucket",
             format!("The bucket {} does not exist", create.bucket),
         )
-    })?;
+    };
+    // A general purpose bucket's ("exactly one Amazon S3 general purpose
+    // bucket"): a table's storage is reached through S3 Tables only.
+    let info = info
+        .filter(|info| info.warehouse.is_none())
+        .ok_or_else(no_such_bucket)?;
+    if info.zone.is_some() {
+        return Err(S3Error::not_implemented(
+            "An access point of a directory bucket",
+        ));
+    }
+    let owner = info.owner;
     // Another account's bucket only as that account's, named.
     match &create.bucket_account {
         Some(named) if *named != owner => {
@@ -480,8 +488,11 @@ fn param(query: &str, name: &str) -> Option<String> {
 }
 
 async fn list(state: &S3State, account: &str, query: &str) -> Result<Response<Body>, S3Error> {
+    // 0 (as none) gives the most: none would give a page no client could
+    // go on from.
     let max = match param(query, "maxResults") {
         None => MAX_LISTED,
+        Some(max) if max == "0" => MAX_LISTED,
         Some(max) => max
             .parse::<usize>()
             .ok()

@@ -20266,6 +20266,24 @@ refused(lambda: control.create_access_point(AccountId=account, Name="reader", Bu
 for bad in ["Bad-Name", "bad_name", "ends-", "-starts", "ends-s3alias", "a" * 51]:
     refused(lambda: control.create_access_point(AccountId=account, Name=bad, Bucket="points"), "InvalidRequest")
 refused(lambda: control.create_access_point(AccountId=account, Name="nowhere", Bucket="missing"), "NoSuchBucket")
+# A general purpose bucket's: not a directory bucket's (not built), nor a
+# table's storage (S3 Tables' only).
+s3x = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret, config=botocore.config.Config(
+    retries={"max_attempts": 1}, s3={"addressing_style": "path", "disable_s3_express_session_auth": True}))
+s3x.create_bucket(Bucket="fast--use1-az4--x-s3", CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+refused(lambda: control.create_access_point(AccountId=account, Name="fast", Bucket="fast--use1-az4--x-s3"),
+    "NotImplemented")
+tables = client("s3tables", key, secret)
+lake = tables.create_table_bucket(name="lake")["arn"]
+tables.create_namespace(tableBucketARN=lake, namespace=["sales"])
+table_storage = tables.create_table(tableBucketARN=lake, namespace="sales", name="orders",
+    format="ICEBERG")["tableARN"]
+store = tables.get_table(tableBucketARN=lake, namespace="sales", name="orders")["warehouseLocation"].removeprefix("s3://")
+refused(lambda: control.create_access_point(AccountId=account, Name="store", Bucket=store), "NoSuchBucket")
+assert len(control.list_access_points(AccountId=account, MaxResults=0)["AccessPointList"]) == 1
 # Not built: refused, not ignored.
 refused(lambda: control.create_access_point(AccountId=account, Name="private", Bucket="points",
     VpcConfiguration={"VpcId": "vpc-1"}), "NotImplemented")
