@@ -34,6 +34,7 @@ pub mod metric_history;
 pub mod metrics_config;
 pub mod multipart;
 pub mod notification;
+pub mod object_lambda;
 pub mod object_lock;
 pub mod objects;
 pub(crate) mod part_checksums;
