@@ -265,7 +265,8 @@ pub fn canonical_request(
 }
 
 /// [`canonical_request`] for `service`: every service but S3 (and S3
-/// Express, a directory bucket's) encodes the path twice.
+/// Express, a directory bucket's, and S3 Object Lambda, signed as S3 is)
+/// encodes the path twice.
 pub fn canonical_request_for(
     service: &str,
     method: &str,
@@ -291,7 +292,7 @@ pub fn canonical_request_for(
     }
     Ok(format!(
         "{method}\n{}\n{}\n{canonical_headers}\n{}\n{payload_hash}",
-        if service == "s3" || service == "s3express" {
+        if service == "s3" || service == "s3express" || service == "s3-object-lambda" {
             canonical_uri(raw_path)
         } else {
             double_encoded_uri(raw_path)

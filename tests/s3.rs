@@ -20739,7 +20739,7 @@ print(f"PORT {functions.server_address[1]}", flush=True)
 sys.stdin.readline()
 s3, control = client("s3", key, secret), client("s3control", key, secret)
 s3.create_bucket(Bucket="data")
-for name, body in [("doc", b"hello"), ("secret", b"x"), ("unsized", b"u"), ("cookie", b"c")]:
+for name, body in [("doc", b"hello"), ("secret", b"x"), ("unsized", b"u"), ("cookie", b"c"), ("a b+c.txt", b"odd")]:
     s3.put_object(Bucket="data", Key=name, Body=body)
 supporting = control.create_access_point(AccountId=account, Name="reader", Bucket="data")["Alias"]
 # The bucket delegating to its account's access points.
@@ -20766,6 +20766,8 @@ assert "authorization" not in {k.lower() for k in event["userRequest"]["headers"
 assert event["userRequest"]["url"].endswith(f"/{alias}/doc"), event
 lambdas = client("s3", key, secret, "s3-object-lambda.us-east-1.s3.test")
 assert lambdas.get_object(Bucket=arn, Key="doc")["Body"].read() == b"HELLO"
+# A key S3 encodes, signed as S3 signs it (once).
+assert lambdas.get_object(Bucket=arn, Key="a b+c.txt")["Body"].read() == b"ODD"
 # A caller's own presigned URL: the function is not told its signature.
 own = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
     aws_access_key_id=key, aws_secret_access_key=secret,
