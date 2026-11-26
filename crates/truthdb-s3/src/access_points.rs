@@ -577,7 +577,7 @@ async fn put_policy(
     account: &str,
     name: &str,
 ) -> Result<Response<Body>, S3Error> {
-    let point = find(state, account, name).await?;
+    find(state, account, name).await?;
     let body = read_body(request, auth, MAX_BODY).await?;
     let elements = elements(&body)?;
     if elements.first().map(|(path, _)| path.as_str()) != Some("PutAccessPointPolicyRequest") {
@@ -597,19 +597,22 @@ async fn put_policy(
     }
     let policy = Policy::parse(&text, PolicyKind::Bucket)
         .map_err(|err| S3Error::new(400, "MalformedPolicy", err.0))?;
-    // BlockPublicPolicy refuses a public policy, as a bucket's does.
-    if point.block_public[2] && truthdb_iam::is_public(&policy) {
-        return Err(S3Error::access_denied(
-            "Block Public Access forbids a public access point policy",
-        ));
-    }
+    // BlockPublicPolicy refuses a public policy, as a bucket's does
+    // (checked with the write).
+    let public = truthdb_iam::is_public(&policy);
     let (of, named) = (account.to_string(), name.to_string());
     let put = crate::scope::object(state, move |file| {
-        file.transaction(|tx| tx.set_access_point_policy(&of, &named, Some(&text)))
+        file.transaction(|tx| tx.set_access_point_policy(&of, &named, Some((&text, public))))
     })
     .await?;
-    if !put {
-        return Err(no_such_access_point());
+    match put {
+        truthdb_object::SetPolicy::Set => {}
+        truthdb_object::SetPolicy::NoAccessPoint => return Err(no_such_access_point()),
+        truthdb_object::SetPolicy::Blocked => {
+            return Err(S3Error::access_denied(
+                "Block Public Access forbids a public access point policy",
+            ));
+        }
     }
     Ok(empty(StatusCode::OK))
 }
@@ -645,7 +648,7 @@ async fn delete_policy(
         file.transaction(|tx| tx.set_access_point_policy(&of, &named, None))
     })
     .await?;
-    if !deleted {
+    if deleted == truthdb_object::SetPolicy::NoAccessPoint {
         return Err(no_such_access_point());
     }
     Ok(empty(StatusCode::OK))

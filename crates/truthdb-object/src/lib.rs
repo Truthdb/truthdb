@@ -57,7 +57,7 @@ use truthdb_core::storage::{
 };
 use truthdb_core::wal::records::RelRecord;
 
-pub use access_points::AccessPoint;
+pub use access_points::{AccessPoint, SetPolicy};
 pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_account_id};
 pub use activity::{ACTIVITY_KEEP_MS, ActivityEvent, MAX_ACTIVITY_RECORD};
 pub use append::{AppendError, MAX_APPEND_PARTS};

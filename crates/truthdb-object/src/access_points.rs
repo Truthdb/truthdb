@@ -195,21 +195,26 @@ impl ObjTxn<'_, '_> {
             .len())
     }
 
-    /// Puts (or, with none, deletes) the policy of `account`'s access point
-    /// `name`; false if there is no such access point.
+    /// Puts policy `policy` (whether it is public with it; none: deletes
+    /// the policy) of `account`'s access point `name`, unless its Block
+    /// Public Access refuses a public one (checked here, with the write).
     pub fn set_access_point_policy(
         &mut self,
         account: &str,
         name: &str,
-        policy: Option<&str>,
-    ) -> Result<bool, StorageError> {
+        policy: Option<(&str, bool)>,
+    ) -> Result<SetPolicy, StorageError> {
         let tree = self.trees.tree(ACCESS_POINTS_TREE);
-        if tree.get(self.ctx, &point_key(account, name))?.is_none() {
-            return Ok(false);
+        let Some(row) = tree.get(self.ctx, &point_key(account, name))? else {
+            return Ok(SetPolicy::NoAccessPoint);
+        };
+        let point = AccessPoint::decode(account, name, &row)?;
+        if policy.is_some_and(|(_, public)| public) && point.block_public[2] {
+            return Ok(SetPolicy::Blocked);
         }
         let key = policy_key(account, name);
         tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
-        if let Some(policy) = policy {
+        if let Some((policy, _)) = policy {
             tree.insert_unique(
                 self.ctx,
                 &mut OpMode::Txn(self.txn),
@@ -217,8 +222,17 @@ impl ObjTxn<'_, '_> {
                 policy.as_bytes(),
             )?;
         }
-        Ok(true)
+        Ok(SetPolicy::Set)
     }
+}
+
+/// What putting an access point's policy did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetPolicy {
+    Set,
+    NoAccessPoint,
+    /// A public policy its BlockPublicPolicy refuses.
+    Blocked,
 }
 
 impl ObjFile<'_> {

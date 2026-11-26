@@ -20332,6 +20332,21 @@ refused(lambda: control.get_access_point(AccountId=other, Name="reader"), "Acces
 nobody = client("s3control", nobody_key, nobody_secret)
 refused(lambda: nobody.get_access_point(AccountId=account, Name="reader"), "AccessDenied")
 refused(lambda: nobody.list_access_points(AccountId=account), "AccessDenied")
+# CloudTrail records each call's access point: its name, account and ARN.
+import time
+trail = client("cloudtrail", key, secret)
+for _ in range(60):
+    events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
+        "AttributeValue": "PutAccessPointPolicy"}])["Events"]
+    if events:
+        break
+    time.sleep(0.5)
+assert events, events
+put = json.loads(events[0]["CloudTrailEvent"])
+assert put["requestParameters"]["name"] in ("reader", "open"), put
+assert put["requestParameters"]["x-amz-account-id"] == account, put
+assert put["resources"] == [{"accountId": account, "type": "AWS::S3::AccessPoint",
+    "ARN": f"arn:aws:s3:us-east-1:{account}:accesspoint/{put['requestParameters']['name']}"}], put
 # Gone with its policy; then it does not exist.
 control.delete_access_point(AccountId=account, Name="open")
 refused(lambda: control.get_access_point(AccountId=account, Name="open"), "NoSuchAccessPoint")
