@@ -410,10 +410,7 @@ pub(crate) async fn serve(
             "payload": transformation.payload.clone().unwrap_or_default(),
         },
         "userRequest": {
-            "url": format!(
-                "{scheme}://{host}{}",
-                request.uri().path_and_query().map_or("/", |path| path.as_str())
-            ),
+            "url": user_url(scheme, &host, &request),
             "headers": user_headers(&request),
         },
         "userIdentity": identity(&principal),
@@ -576,6 +573,30 @@ fn user_headers<B>(request: &Request<B>) -> serde_json::Map<String, serde_json::
             ))
         })
         .collect()
+}
+
+/// The caller's request URL, as the event tells it: "excluding any
+/// authorization-related query parameters" (a presigned URL's signature,
+/// which the function must not be able to replay).
+fn user_url<B>(scheme: &str, host: &str, request: &Request<B>) -> String {
+    let kept: Vec<&str> = request
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            !crate::server::QUERY_AUTH_PARAMS
+                .iter()
+                .any(|auth| name.eq_ignore_ascii_case(auth))
+        })
+        .collect();
+    let query = match kept.is_empty() {
+        true => String::new(),
+        false => format!("?{}", kept.join("&")),
+    };
+    format!("{scheme}://{host}{}{query}", request.uri().path())
 }
 
 /// The caller, as the event's `userIdentity`.

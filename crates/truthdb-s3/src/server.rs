@@ -561,6 +561,9 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
         // Object Lambda: a request through an Object Lambda access point's
         // host, or a function's WriteGetObjectResponse.
         Some("s3-object-lambda") => {
+            if encoded_name(&request) {
+                return Err(encoded_name_refused());
+            }
             let auth = authenticate(state, &request).await?;
             if let Some(who) = request.extensions().get::<crate::activity::Who>() {
                 who.set(auth.principal.clone(), auth.signed);
@@ -569,19 +572,8 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
         }
         _ => {}
     }
-    // The signature covers parameter names decoded, while operations are
-    // told apart by their names as written: a name must not be encoded, or
-    // `%74agging` would be signed as `tagging` and served as something else.
-    if request.uri().query().unwrap_or("").split('&').any(|pair| {
-        pair.split('=')
-            .next()
-            .is_some_and(|name| name.contains('%'))
-    }) {
-        return Err(S3Error::new(
-            400,
-            "InvalidArgument",
-            "A query parameter name must not be percent-encoded",
-        ));
+    if encoded_name(&request) {
+        return Err(encoded_name_refused());
     }
     // A CORS preflight: answered from the bucket's configuration, before
     // (and without) any authentication, as a browser sends it.
@@ -619,8 +611,28 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
     crate::api::dispatch(state, request, auth).await
 }
 
+/// Whether a query parameter name is percent-encoded. The signature covers
+/// parameter names decoded, while operations are told apart by their names
+/// as written: a name must not be encoded, or `%74agging` would be signed as
+/// `tagging` and served as something else.
+fn encoded_name(request: &Request<Incoming>) -> bool {
+    request.uri().query().unwrap_or("").split('&').any(|pair| {
+        pair.split('=')
+            .next()
+            .is_some_and(|name| name.contains('%'))
+    })
+}
+
+fn encoded_name_refused() -> S3Error {
+    S3Error::new(
+        400,
+        "InvalidArgument",
+        "A query parameter name must not be percent-encoded",
+    )
+}
+
 /// The query parameters of a presigned URL that authenticate it.
-const QUERY_AUTH_PARAMS: [&str; 8] = [
+pub(crate) const QUERY_AUTH_PARAMS: [&str; 8] = [
     "x-amz-algorithm",
     "x-amz-credential",
     "x-amz-date",

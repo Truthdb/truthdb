@@ -20766,6 +20766,18 @@ assert "authorization" not in {k.lower() for k in event["userRequest"]["headers"
 assert event["userRequest"]["url"].endswith(f"/{alias}/doc"), event
 lambdas = client("s3", key, secret, "s3-object-lambda.us-east-1.s3.test")
 assert lambdas.get_object(Bucket=arn, Key="doc")["Body"].read() == b"HELLO"
+# A caller's own presigned URL: the function is not told its signature.
+own = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+presigned = own.generate_presigned_url("get_object", Params={"Bucket": alias, "Key": "doc", "VersionId": "null"})
+assert urllib.request.urlopen(presigned).read() == b"HELLO"
+told = events[-1][1]["userRequest"]["url"]
+assert "versionId=null" in told and "X-Amz-" not in told and "x-amz-" not in told, told
+# A query parameter name encoded: refused, as on any request.
+status, _, answer = send(signed("GET", "/doc", "partN%75mber=2", (key, secret), service="s3-object-lambda",
+    host=f"shaper-{account}.s3-object-lambda.us-east-1.s3.test:{port}"))
+assert status == 400 and b"<Code>InvalidArgument</Code>" in answer, (status, answer)
 # A user its own policies allow: through Object Lambda only (the supporting
 # access point's grant needs aws:CalledVia).
 reader = client("s3", reader_key, reader_secret)
