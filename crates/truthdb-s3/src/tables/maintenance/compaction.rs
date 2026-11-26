@@ -264,11 +264,13 @@ pub(super) async fn compact(
         }
     }
     // The deletes that apply to each data file ("Scan Planning"): a
-    // position delete not older than it, naming it if it names one file
-    // (one of any partition or spec is read, and applied by path: positions
-    // never hang on partitions comparing equal); an equality delete to one
-    // of its partition, or of an unpartitioned spec, newer than it. A data
-    // file a delete applies to that cannot be read here is left as it is.
+    // position delete not older than it, that names it (one naming a single
+    // file applies to that file alone, whatever spec or partition it is
+    // written in, as Iceberg's Java keys it by path) or is of its partition
+    // (or of an unpartitioned spec, read by path all the same); an equality
+    // delete to one of its partition, or of an unpartitioned spec, newer
+    // than it. A data file a delete applies to that cannot be read here is
+    // left as it is.
     data.retain_mut(|file| {
         let spec = manifests[file.manifest].spec;
         let partition = partition_key(&file.partition);
@@ -281,7 +283,10 @@ pub(super) async fn compact(
                 match delete.content {
                     1 => {
                         file.sequence <= delete.sequence
-                            && delete.scoped.as_ref().is_none_or(|one| *one == file.path)
+                            && match &delete.scoped {
+                                Some(one) => *one == file.path,
+                                None => scope,
+                            }
                     }
                     _ => scope && file.sequence < delete.sequence,
                 }

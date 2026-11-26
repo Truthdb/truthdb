@@ -19892,21 +19892,37 @@ ran("voidpos", since)
 voidpos = c.load_table(("lake", "voidpos"))
 assert voidpos.current_snapshot().summary.operation == Operation.REPLACE
 assert len(compacted_rows(voidpos)) == 13 and sorted(row["id"] for row in voidpos.scan().to_arrow().to_pylist()) == expected
-# One written in another partition of the same spec, naming a file of
-# partition a: applied by its path.
+# A position delete naming no single file is its partition's (as Iceberg's
+# Java keys it): one that cannot be read leaves that partition's files as
+# they are, not another's.
 otherpos = table("otherpos", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
     transform=IdentityTransform(), name="region")))
-for i in range(5):
-    otherpos.append(rows(i * 3, "a"))
-otherpos.append(rows(100, "b"))
-[first, *_] = sorted(data_files(otherpos, "a"), key=lambda f: f.file_path)
-otherpos = add_deletes(otherpos, "otherpos", 93, [positions(otherpos, data_files(otherpos, "b")[0].partition,
-    [(first.file_path, [0, 2])])])
+for region in ["a", "b"]:
+    for i in range(5):
+        otherpos.append(rows(i * 3, region))
+in_b = data_files(otherpos, "b")[0]
+otherpos = add_deletes(otherpos, "otherpos", 93, [positions(otherpos, in_b.partition,
+    [(in_b.file_path, [0])], outside=True)])
 since = time.time()
 configure("otherpos", targetFileSizeMB=64)
 ran("otherpos", since)
 otherpos = c.load_table(("lake", "otherpos"))
-assert sorted((f["partition"]["region"], f["record_count"]) for f in files(otherpos)) == [("a", 13), ("b", 3)]
+assert sorted((f["partition"]["region"], f["record_count"]) for f in files(otherpos)) == [("a", 15)] + [("b", 3)] * 5
+# One naming a single file applies to it by path, though written in
+# another partition.
+scopedpos = table("scopedpos", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for i in range(5):
+    scopedpos.append(rows(i * 3, "a"))
+scopedpos.append(rows(100, "b"))
+[first, *_] = sorted(data_files(scopedpos, "a"), key=lambda f: f.file_path)
+scopedpos = add_deletes(scopedpos, "scopedpos", 94, [positions(scopedpos, data_files(scopedpos, "b")[0].partition,
+    [(first.file_path, [0, 2])], scoped=first.file_path)])
+since = time.time()
+configure("scopedpos", targetFileSizeMB=64)
+ran("scopedpos", since)
+scopedpos = c.load_table(("lake", "scopedpos"))
+assert sorted((f["partition"]["region"], f["record_count"]) for f in files(scopedpos)) == [("a", 13), ("b", 3)]
 
 # Iceberg's delete ratio: a single file whose file-scoped position deletes
 # delete 30% of its rows is rewritten without them; at 20% it is not.
