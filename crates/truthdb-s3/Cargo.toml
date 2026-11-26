@@ -18,6 +18,8 @@ ring = "0.17"
 parquet = { version = "60.0.0", default-features = false, features = ["snap", "zstd", "arrow"] }
 arrow-array = "60.0.0"
 arrow-schema = "60.0.0"
+arrow-select = "60.0.0"
+arrow-row = "60.0.0"
 apache-avro = { version = "0.23.0", features = ["snappy"] }
 percent-encoding = "2.3.2"
 base64 = "0.22.1"

@@ -11,16 +11,23 @@
 //! are rewritten when there are at least 5 of them, or more than one
 //! holding more than the target, or more than 180% of it in all.
 //!
-//! Not built yet: applying row-level deletes (a data file a delete file
-//! may apply to is left as it is), the sort and z-order strategies, and
-//! Avro or ORC data files (left as they are). A file of an older partition
+//! A rewritten file's deletes are applied ("compaction also applies the
+//! effects of row-level deletes"): the rows its position and equality
+//! delete files delete are left out, and a file whose file-scoped position
+//! deletes delete 30% of its rows or more is a candidate too (Iceberg's
+//! delete ratio). A data file a delete applies to that cannot be read here
+//! (one not in Parquet, or outside the table's storage) is left as it is.
+//!
+//! Not built yet: the sort and z-order strategies, and Avro or ORC data
+//! files (left as they are). A file of an older partition
 //! spec is rewritten within its own spec and partition, where Iceberg
 //! rewrites such files into the current spec.
 //!
 //! Data files are written by their writers, so they are read as untrusted
 //! (see `truthdb_engine::engine::open_arrow_parquet`); a file that cannot
 //! be read within those limits is left as it is. The rewrite commits only
-//! when its outputs hold exactly the rows its inputs' manifests count.
+//! when each input holds exactly the rows its manifest counts, and the
+//! outputs hold those rows but the deleted ones.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -43,6 +50,7 @@ const MIN_RATIO: f64 = 0.75;
 const MAX_RATIO: f64 = 1.80;
 const MIN_INPUT_FILES: usize = 5;
 const SPLIT_OVERHEAD: u64 = 5 * 1024;
+const DELETE_RATIO: f64 = 0.3;
 /// "S3 Tables applies the parquet's row-group-default size of 128 MB."
 const ROW_GROUP_BYTES: usize = 128 << 20;
 /// What an output file's bytes are buffered in before they are written.
@@ -69,9 +77,32 @@ struct DataFile {
     manifest: usize,
     entry: usize,
     key: String,
+    /// Its location as manifests name it (position deletes name it so).
+    path: String,
     partition: Avro,
     records: i64,
     size: i64,
+    /// Its data sequence number.
+    sequence: i64,
+}
+
+/// A live delete file: what decides which data files it applies to, and
+/// how it is read.
+struct DeleteFile {
+    spec: i32,
+    partition: String,
+    /// 1: position deletes, 2: equality deletes.
+    content: i64,
+    sequence: i64,
+    /// Its key in the table's storage, if it is a Parquet file there (one
+    /// that is not cannot be applied here).
+    key: Option<String>,
+    /// The field ids an equality delete compares rows by.
+    equality: Vec<i32>,
+    /// The one data file a position delete file's deletes are all in, if it
+    /// says (`referenced_data_file`, or equal `file_path` bounds).
+    scoped: Option<String>,
+    records: i64,
 }
 
 /// A rewritten group: its files (indexes into the data files) and its
@@ -152,13 +183,20 @@ pub(super) async fn compact(
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|spec| spec["fields"].as_array().is_none_or(Vec::is_empty))
+        // Unpartitioned as Iceberg's Java has it: no field that is not
+        // `void` (a field a version 1 table dropped).
+        .filter(|spec| {
+            spec["fields"].as_array().is_none_or(|fields| {
+                fields
+                    .iter()
+                    .all(|field| field["transform"].as_str() == Some("void"))
+            })
+        })
         .filter_map(|spec| spec["spec-id"].as_i64())
         .collect();
-    // The live data files, and the partitions live delete files are in.
+    // The live data files and delete files.
     let mut data = Vec::new();
-    let mut deleted_in: HashSet<(i32, String)> = HashSet::new();
-    let mut global_deletes = false;
+    let mut deletes: Vec<DeleteFile> = Vec::new();
     for (at, manifest) in manifests.iter().enumerate() {
         let schema = &manifest.file.schema;
         let entry_ids = ids(schema, schema)?;
@@ -173,29 +211,128 @@ pub(super) async fn compact(
                 .ok_or_else(|| "A manifest entry has no data_file.".to_string())?;
             let content = int(get(file, &file_ids, 134)).unwrap_or_default();
             let partition = get(file, &file_ids, 102).cloned().unwrap_or(Avro::Null);
-            if content != 0 {
-                global_deletes |= unpartitioned.contains(&i64::from(manifest.spec));
-                deleted_in.insert((manifest.spec, partition_key(&partition)));
-                continue;
-            }
             let format = text(get(file, &file_ids, 101)).unwrap_or_default();
             let path = text(get(file, &file_ids, 100)).unwrap_or_default();
-            let Place::Own(keys) = place(path, &warehouse) else {
-                continue;
+            // Its data sequence number, as inherited when not written.
+            let sequence = int(get(record, &entry_ids, 3)).unwrap_or(manifest.sequence);
+            let key = match place(path, &warehouse) {
+                Place::Own(keys) if keys.len() == 1 && format.eq_ignore_ascii_case("parquet") => {
+                    keys.into_iter().next()
+                }
+                _ => None,
             };
-            if !format.eq_ignore_ascii_case("parquet") || keys.len() != 1 {
+            if content != 0 {
+                deletes.push(DeleteFile {
+                    spec: manifest.spec,
+                    partition: partition_key(&partition),
+                    content,
+                    sequence,
+                    key,
+                    equality: match get(file, &file_ids, 135) {
+                        Some(Avro::Array(ids)) => ids
+                            .iter()
+                            .filter_map(|id| int(Some(id)))
+                            .map(|id| id as i32)
+                            .collect(),
+                        _ => Vec::new(),
+                    },
+                    scoped: text(get(file, &file_ids, 143))
+                        .map(str::to_string)
+                        .or_else(|| {
+                            path_bounds(get(file, &file_ids, 125), get(file, &file_ids, 128))
+                        }),
+                    records: int(get(file, &file_ids, 103)).unwrap_or_default(),
+                });
                 continue;
             }
+            let Some(key) = key else {
+                continue;
+            };
             data.push(DataFile {
                 manifest: at,
                 entry: index,
-                key: keys.into_iter().next().expect("one"),
+                key,
+                path: path.to_string(),
                 partition,
                 records: int(get(file, &file_ids, 103)).unwrap_or(-1),
                 size: int(get(file, &file_ids, 104)).unwrap_or(-1),
+                sequence,
             });
         }
     }
+    // The deletes that apply to each data file ("Scan Planning"): a
+    // position delete not older than it, that names it (one naming a single
+    // file applies to that file alone, whatever spec or partition it is
+    // written in, as Iceberg's Java keys it by path) or is of its partition
+    // (or of an unpartitioned spec, read by path all the same); an equality
+    // delete newer than it, of its partition or of an unpartitioned spec.
+    // Indexed so: by the path one names; by spec and partition; global.
+    let mut by_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_partition: HashMap<(i32, &str), Vec<usize>> = HashMap::new();
+    let mut global: Vec<usize> = Vec::new();
+    for (at, delete) in deletes.iter().enumerate() {
+        match (&delete.scoped, delete.content) {
+            (Some(path), 1) => by_path.entry(path.as_str()).or_default().push(at),
+            _ if unpartitioned.contains(&i64::from(delete.spec)) => global.push(at),
+            _ => by_partition
+                .entry((delete.spec, delete.partition.as_str()))
+                .or_default()
+                .push(at),
+        }
+    }
+    let applies = |file: &DataFile, delete: &DeleteFile| match delete.content {
+        1 => file.sequence <= delete.sequence,
+        _ => file.sequence < delete.sequence,
+    };
+    let readable = |delete: &DeleteFile| delete.key.is_some() && matches!(delete.content, 1 | 2);
+    // A data file a delete applies to that cannot be read here is left as
+    // it is: of a partition's (or the global) deletes, the newest of each
+    // kind that cannot be.
+    let unreadable = |list: &[usize]| {
+        let newest = |content: i64| {
+            list.iter()
+                .map(|&at| &deletes[at])
+                .filter(|delete| !readable(delete) && (delete.content == 1) == (content == 1))
+                .map(|delete| delete.sequence)
+                .max()
+        };
+        (newest(1), newest(2))
+    };
+    let global_unreadable = unreadable(&global);
+    let partition_unreadable: HashMap<(i32, &str), Newest> = by_partition
+        .iter()
+        .map(|(at, list)| (*at, unreadable(list)))
+        .collect();
+    let no_deletes = Vec::new();
+    data.retain(|file| {
+        let spec = manifests[file.manifest].spec;
+        let partition = partition_key(&file.partition);
+        let held = |(positions, equalities): (Option<i64>, Option<i64>)| {
+            positions.is_some_and(|newest| file.sequence <= newest)
+                || equalities.is_some_and(|newest| file.sequence < newest)
+        };
+        let scoped = by_path.get(file.path.as_str()).unwrap_or(&no_deletes);
+        !held(global_unreadable)
+            && !partition_unreadable
+                .get(&(spec, partition.as_str()))
+                .is_some_and(|&newest| held(newest))
+            && scoped
+                .iter()
+                .all(|&at| readable(&deletes[at]) || !applies(file, &deletes[at]))
+    });
+    // Iceberg's delete ratio: the rows file-scoped position deletes delete,
+    // of a file's rows, at least this.
+    let too_deleted = |file: &DataFile| {
+        let deleted: i64 = by_path
+            .get(file.path.as_str())
+            .unwrap_or(&no_deletes)
+            .iter()
+            .map(|&at| &deletes[at])
+            .filter(|delete| applies(file, delete))
+            .map(|delete| delete.records.max(0))
+            .fold(0, i64::saturating_add);
+        file.records > 0 && deleted.min(file.records) as f64 / file.records as f64 >= DELETE_RATIO
+    };
     let target = (target_mb.max(1) as u64) * MIB;
     let min = (target as f64 * MIN_RATIO) as u64;
     let max = (target as f64 * MAX_RATIO) as u64;
@@ -208,11 +345,7 @@ pub(super) async fn compact(
         let spec = manifests[file.manifest].spec;
         let partition = partition_key(&file.partition);
         let size = file.size.max(0) as u64;
-        if global_deletes
-            || deleted_in.contains(&(spec, partition.clone()))
-            || file.records < 0
-            || (min..=max).contains(&size)
-        {
+        if file.records < 0 || ((min..=max).contains(&size) && !too_deleted(file)) {
             continue;
         }
         partitions.entry((spec, partition)).or_default().push(at);
@@ -221,7 +354,10 @@ pub(super) async fn compact(
         let size = sum_sizes(files, &data);
         let n = files.len();
         // (Iceberg's "more than one" is implied by at least five.)
-        n >= MIN_INPUT_FILES || (n > 1 && size > target) || size > max
+        n >= MIN_INPUT_FILES
+            || (n > 1 && size > target)
+            || size > max
+            || files.iter().any(|&at| too_deleted(&data[at]))
     };
     let mut groups: BTreeMap<(i32, String, String), Vec<usize>> = BTreeMap::new();
     for ((spec, partition), files) in partitions {
@@ -254,27 +390,92 @@ pub(super) async fn compact(
         }
         let size = sum_sizes(&files, &data);
         let split = split_size(size, (target, min, write_max));
-        let keys: Vec<String> = files.iter().map(|&at| data[at].key.clone()).collect();
-        let outputs = match rewrite(state, &warehouse, &keys, (split, write_max), &codec, now).await
+        // The group's deletes: its partition's and the global ones, and
+        // those naming one of its files; each a file not older (position)
+        // or newer (equality) than one of its files applies to.
+        let first = &data[files[0]];
+        let spec = manifests[first.manifest].spec;
+        let partition = partition_key(&first.partition);
+        let oldest = files
+            .iter()
+            .map(|&at| data[at].sequence)
+            .min()
+            .unwrap_or_default();
+        let named = files
+            .iter()
+            .flat_map(|&at| by_path.get(data[at].path.as_str()).unwrap_or(&no_deletes));
+        let group_deletes: Vec<&DeleteFile> = by_partition
+            .get(&(spec, partition.as_str()))
+            .unwrap_or(&no_deletes)
+            .iter()
+            .chain(&global)
+            .chain(named)
+            .map(|&at| &deletes[at])
+            .filter(|delete| readable(delete))
+            .filter(|delete| match delete.content {
+                1 => oldest <= delete.sequence,
+                _ => oldest < delete.sequence,
+            })
+            .collect();
+        let inputs: Vec<Input> = files
+            .iter()
+            .map(|&at| Input {
+                key: data[at].key.clone(),
+                path: data[at].path.clone(),
+                sequence: data[at].sequence,
+                records: data[at].records,
+            })
+            .collect();
+        let group = GroupDeletes {
+            positions: group_deletes
+                .iter()
+                .filter(|delete| delete.content == 1)
+                .map(|delete| {
+                    (
+                        delete.key.clone().expect("readable"),
+                        delete.sequence,
+                        delete.scoped.clone(),
+                    )
+                })
+                .collect(),
+            equalities: group_deletes
+                .iter()
+                .filter(|delete| delete.content == 2)
+                .map(|delete| {
+                    (
+                        delete.key.clone().expect("readable"),
+                        delete.equality.clone(),
+                        delete.sequence,
+                    )
+                })
+                .collect(),
+        };
+        let (outputs, read) = match rewrite(
+            state,
+            &warehouse,
+            (&inputs, &group),
+            (split, write_max),
+            &codec,
+            now,
+        )
+        .await
         {
-            Ok(outputs) => outputs,
+            Ok(rewritten) => rewritten,
             Err(err) => {
                 failure.get_or_insert(err);
                 continue;
             }
         };
         // Every row the inputs hold, and no other.
-        let read: i64 = files.iter().map(|&at| data[at].records).sum();
-        let wrote: i64 = outputs
-            .iter()
-            .map(|output| output.metadata.file_metadata().num_rows())
-            .sum();
+        let counted: Vec<i64> = files.iter().map(|&at| data[at].records).collect();
         let first = written.len();
         written.extend(outputs);
-        if read != wrote {
+        if read != counted {
             remove(state, &warehouse, &stored_keys(&written), now).await;
             return Err(format!(
-                "Compaction read {wrote} rows from files whose manifests count {read}: nothing was committed."
+                "Compaction read {} rows from files whose manifests count {}: nothing was committed.",
+                read.iter().sum::<i64>(),
+                counted.iter().sum::<i64>()
             ));
         }
         rewrites.push((files, (first..written.len()).collect()));
@@ -298,10 +499,53 @@ pub(super) async fn compact(
     outcome
 }
 
-/// A partition's value as compared: its values as stored, whatever Avro
-/// logical type (or none) a manifest's writer gave them, so a delete file
-/// written by one writer matches the data files another wrote.
+/// The one file a position delete file's `file_path` bounds name, when its
+/// lower and upper bound are equal.
+fn path_bounds(lower: Option<&Avro>, upper: Option<&Avro>) -> Option<String> {
+    let bound = |map: Option<&Avro>| -> Option<Vec<u8>> {
+        let Some(Avro::Array(entries)) = map else {
+            return None;
+        };
+        entries.iter().find_map(|entry| {
+            let Avro::Record(fields) = entry else {
+                return None;
+            };
+            let mut values = fields.iter().map(|(_, value)| match value {
+                Avro::Union(_, inner) => inner.as_ref(),
+                value => value,
+            });
+            match (values.next(), values.next()) {
+                (Some(Avro::Int(2_147_483_546)), Some(Avro::Bytes(bytes))) => Some(bytes.clone()),
+                _ => None,
+            }
+        })
+    };
+    let (lower, upper) = (bound(lower)?, bound(upper)?);
+    (lower == upper)
+        .then(|| String::from_utf8(lower).ok())
+        .flatten()
+}
+
+/// A partition's value as compared: by value, whatever Avro logical type
+/// (or none) a manifest's writer gave it, and whatever type a promotion
+/// since made it (an int a long, a float a double, a decimal of more
+/// precision: its manifests before and after hold it as either). So a
+/// delete file written by one writer, or after a promotion, matches the
+/// data files another wrote, or before it.
 fn partition_key(value: &Avro) -> String {
+    /// A two's-complement big-endian number in its fewest bytes (a fixed
+    /// value's length is its field's, so among one field's values this
+    /// is one-to-one).
+    fn fewest(bytes: &[u8]) -> Vec<u8> {
+        let mut start = 0;
+        while start + 1 < bytes.len()
+            && ((bytes[start] == 0 && bytes[start + 1] & 0x80 == 0)
+                || (bytes[start] == 0xff && bytes[start + 1] & 0x80 != 0))
+        {
+            start += 1;
+        }
+        bytes[start..].to_vec()
+    }
     fn physical(value: &Avro) -> Avro {
         match value {
             Avro::Union(_, inner) => physical(inner),
@@ -311,7 +555,10 @@ fn partition_key(value: &Avro) -> String {
                     .map(|(name, value)| (name.clone(), physical(value)))
                     .collect(),
             ),
-            Avro::Date(value) | Avro::TimeMillis(value) => Avro::Int(*value),
+            Avro::Int(value) | Avro::Date(value) | Avro::TimeMillis(value) => {
+                Avro::Long(i64::from(*value))
+            }
+            Avro::Float(value) => Avro::Double(f64::from(*value)),
             Avro::TimeMicros(value)
             | Avro::TimestampMillis(value)
             | Avro::TimestampMicros(value)
@@ -319,9 +566,9 @@ fn partition_key(value: &Avro) -> String {
             | Avro::LocalTimestampMillis(value)
             | Avro::LocalTimestampMicros(value)
             | Avro::LocalTimestampNanos(value) => Avro::Long(*value),
-            Avro::Fixed(_, bytes) => Avro::Bytes(bytes.clone()),
+            Avro::Fixed(_, bytes) => Avro::Fixed(0, fewest(bytes)),
             Avro::Decimal(decimal) => match Vec::<u8>::try_from(decimal) {
-                Ok(bytes) => Avro::Bytes(bytes),
+                Ok(bytes) => Avro::Fixed(0, fewest(&bytes)),
                 Err(_) => value.clone(),
             },
             Avro::Uuid(uuid) => Avro::String(uuid.to_string()),
@@ -568,25 +815,60 @@ struct Writing {
     consumed: u64,
 }
 
-/// Rewrites the data files `keys` of the table's storage `warehouse` into
-/// new files, each holding about `split` bytes of the inputs and at most
-/// `write_max` written; each output stored as an object of the storage.
+/// A data file to rewrite: its key, its location, its data sequence number
+/// and the rows its manifest counts.
+#[derive(Clone)]
+struct Input {
+    key: String,
+    path: String,
+    sequence: i64,
+    records: i64,
+}
+
+/// A group's delete files: position deletes (key, data sequence number,
+/// the one file it names if it names one), equality deletes (key, field
+/// ids, data sequence number).
+#[derive(Clone)]
+struct GroupDeletes {
+    positions: Vec<(String, i64, Option<String>)>,
+    equalities: Vec<EqualityDelete>,
+}
+
+/// An equality delete file: its key, field ids and data sequence number.
+type EqualityDelete = (String, Vec<i32>, i64);
+
+/// The newest position and equality deletes (by data sequence number) that
+/// cannot be read.
+type Newest = (Option<i64>, Option<i64>);
+
+/// Rewrites the data files `inputs` of the table's storage `warehouse`,
+/// their deleted rows left out, into new files, each holding about `split`
+/// bytes of the inputs and at most `write_max` written; each output stored
+/// as an object of the storage. The outputs, and the rows read from each
+/// input.
 async fn rewrite(
     state: &S3State,
     warehouse: &str,
-    keys: &[String],
+    (inputs, group): (&[Input], &GroupDeletes),
     (split, write_max): (u64, u64),
     codec: &parquet::basic::Compression,
     now: u64,
-) -> Result<Vec<Output>, String> {
-    let (storage, from, keys, codec) = (
+) -> Result<(Vec<Output>, Vec<i64>), String> {
+    let (storage, from, inputs, group, codec) = (
         Arc::clone(&state.storage),
         warehouse.to_string(),
-        keys.to_vec(),
+        inputs.to_vec(),
+        group.clone(),
         *codec,
     );
-    let files = tokio::task::spawn_blocking(move || {
-        rewrite_files(&storage, &from, &keys, (split, write_max), codec)
+    let (files, read) = tokio::task::spawn_blocking(move || {
+        rewrite_files(
+            &storage,
+            &from,
+            (&inputs, &group),
+            (split, write_max),
+            codec,
+        )
     })
     .await
     .map_err(|_| "A data file could not be rewritten: its rewrite stopped.".to_string())??;
@@ -610,7 +892,7 @@ async fn rewrite(
             metadata,
         });
     }
-    Ok(outputs)
+    Ok((outputs, read))
 }
 
 type Written = (SealedBody, u64, parquet::file::metadata::ParquetMetaData);
@@ -618,10 +900,10 @@ type Written = (SealedBody, u64, parquet::file::metadata::ParquetMetaData);
 fn rewrite_files(
     storage: &Arc<Storage>,
     warehouse: &str,
-    keys: &[String],
+    (inputs, group): (&[Input], &GroupDeletes),
     (split, write_max): (u64, u64),
     codec: parquet::basic::Compression,
-) -> Result<Vec<Written>, String> {
+) -> Result<(Vec<Written>, Vec<i64>), String> {
     let props = parquet::file::properties::WriterProperties::builder()
         .set_compression(codec)
         // Iceberg's default metrics mode, truncate(16): a long value's
@@ -655,12 +937,31 @@ fn rewrite_files(
         let (sealed, size) = writer.inner_mut().take().seal()?;
         Ok((sealed, size, metadata))
     };
+    // Each input's deleted rows, a bit a row, marked a delete file at a
+    // time: what is held does not grow with the deletes.
+    check_rows(inputs)?;
+    let mut deleted = inputs
+        .iter()
+        .map(|input| Deleted::new(input.records))
+        .collect::<Result<Vec<_>, _>>()?;
+    mark_positions(storage, warehouse, inputs, &group.positions, &mut deleted)?;
+    mark_equalities(
+        storage,
+        warehouse,
+        inputs,
+        (&group.equalities, MAX_DELETE_BYTES),
+        &mut deleted,
+    )?;
     let mut done = Vec::new();
     let mut writing: Option<Writing> = None;
-    for key in keys {
+    let mut read = Vec::new();
+    for (input, deleted) in inputs.iter().zip(&deleted) {
+        let key = &input.key;
         let file = truthdb_engine::engine::open_arrow_parquet(storage, warehouse, key)
             .map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
         let descr = file.metadata().file_metadata().schema_descr_ptr();
+        // The position of the next row read.
+        let mut row = 0u64;
         for group in 0..file.metadata().num_row_groups() {
             // The row group's input bytes, spread over its rows.
             let metadata = file.metadata().row_group(group);
@@ -671,6 +972,14 @@ fn rewrite_files(
             for batch in file.batches(group)? {
                 let batch =
                     batch.map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
+                let rows = batch.num_rows() as u64;
+                let kept = deleted.kept(row, batch.num_rows());
+                row += rows;
+                let batch = match kept {
+                    Some(mask) => arrow_select::filter::filter_record_batch(&batch, &mask)
+                        .map_err(|err| format!("Deleted rows cannot be left out: {err}"))?,
+                    None => batch,
+                };
                 let out = match writing.as_mut() {
                     Some(out) => out,
                     None => writing.insert(begin(file.schema(), &descr)?),
@@ -679,9 +988,9 @@ fn rewrite_files(
                 if out.writer.in_progress_size() >= ROW_GROUP_BYTES {
                     out.writer.flush().map_err(failed)?;
                 }
-                out.consumed = out.consumed.saturating_add(
-                    group_bytes.saturating_mul(batch.num_rows() as u64) / group_rows,
-                );
+                out.consumed = out
+                    .consumed
+                    .saturating_add(group_bytes.saturating_mul(rows) / group_rows);
                 // An output ends at its share of the inputs, or at the
                 // largest file written, within a row group too: an output
                 // over the range would be rewritten again on every pass.
@@ -691,11 +1000,409 @@ fn rewrite_files(
                 }
             }
         }
+        read.push(row as i64);
     }
     if let Some(writing) = writing {
         done.push(finish(writing)?);
     }
-    Ok(done)
+    Ok((done, read))
+}
+
+/// The most rows a rewritten group's data files may count together (their
+/// deleted rows are held a bit a row: a GiB at most), and the most memory a
+/// chunk of equality delete keys
+/// takes (a key holds its columns' values).
+const MAX_ROWS: i64 = 1 << 33;
+const MAX_DELETE_BYTES: usize = 512 << 20;
+/// What one held key takes besides its bytes (its box, its sequence
+/// number, the table's control bytes and slack, and allocation rounding).
+const DELETE_OVERHEAD: usize = 64;
+/// Position delete files' columns.
+const FILE_PATH: i32 = 2_147_483_546;
+const POS: i32 = 2_147_483_545;
+
+/// Refuses a group whose inputs' manifests count more rows than its deleted
+/// rows may be held for, a bit a row ([`MAX_ROWS`] in all): what manifests
+/// count is not checked against the files until they are read.
+fn check_rows(inputs: &[Input]) -> Result<(), String> {
+    let rows = inputs
+        .iter()
+        .map(|input| input.records.max(0))
+        .fold(0i64, i64::saturating_add);
+    if rows > MAX_ROWS {
+        return Err(format!(
+            "Data files of {rows} rows in all are not rewritten together here."
+        ));
+    }
+    Ok(())
+}
+
+/// A data file's deleted rows, a bit a row, held from the first one marked
+/// (rows past those its manifest counts are not marked: the file is then
+/// refused for its count).
+struct Deleted {
+    bits: Vec<u64>,
+    rows: u64,
+    marked: u64,
+}
+
+impl Deleted {
+    fn new(records: i64) -> Result<Deleted, String> {
+        if !(0..=MAX_ROWS).contains(&records) {
+            return Err(format!(
+                "A data file of {records} rows is not rewritten here."
+            ));
+        }
+        Ok(Deleted {
+            bits: Vec::new(),
+            rows: records as u64,
+            marked: 0,
+        })
+    }
+
+    fn mark(&mut self, row: u64) {
+        if row >= self.rows {
+            return;
+        }
+        if self.bits.is_empty() {
+            self.bits = vec![0; self.rows.div_ceil(64) as usize];
+        }
+        let (word, bit) = ((row / 64) as usize, 1 << (row % 64));
+        if self.bits[word] & bit == 0 {
+            self.bits[word] |= bit;
+            self.marked += 1;
+        }
+    }
+
+    fn is_marked(&self, row: u64) -> bool {
+        self.marked > 0
+            && row < self.rows
+            && self.bits[(row / 64) as usize] & (1 << (row % 64)) != 0
+    }
+
+    /// Which of `count` rows from row `first` are kept (none: all).
+    fn kept(&self, first: u64, count: usize) -> Option<arrow_array::BooleanArray> {
+        if self.marked == 0 {
+            return None;
+        }
+        Some(arrow_array::BooleanArray::from(
+            (0..count as u64)
+                .map(|row| !self.is_marked(first + row))
+                .collect::<Vec<bool>>(),
+        ))
+    }
+}
+
+/// The column of top-level field id `id` of `schema`, if it is one.
+fn column_of(schema: &arrow_schema::Schema, id: i32) -> Option<usize> {
+    schema.fields().iter().position(|field| {
+        field
+            .metadata()
+            .get("PARQUET:field_id")
+            .and_then(|value| value.parse::<i32>().ok())
+            == Some(id)
+    })
+}
+
+/// Whether field id `id` is anywhere in `fields` (nested too).
+fn holds_id(fields: &arrow_schema::Fields, id: i32) -> bool {
+    use arrow_schema::DataType as D;
+    fields.iter().any(|field| {
+        field
+            .metadata()
+            .get("PARQUET:field_id")
+            .and_then(|value| value.parse::<i32>().ok())
+            == Some(id)
+            || match field.data_type() {
+                D::Struct(inner) => holds_id(inner, id),
+                D::List(inner)
+                | D::LargeList(inner)
+                | D::FixedSizeList(inner, _)
+                | D::Map(inner, _) => {
+                    holds_id(&arrow_schema::Fields::from(vec![inner.clone()]), id)
+                }
+                _ => false,
+            }
+    })
+}
+
+/// Whether any field of `fields` (nested too) has a field id: a file
+/// written without them (one added as it was) has none.
+fn has_ids(fields: &arrow_schema::Fields) -> bool {
+    use arrow_schema::DataType as D;
+    fields.iter().any(|field| {
+        field.metadata().contains_key("PARQUET:field_id")
+            || match field.data_type() {
+                D::Struct(inner) => has_ids(inner),
+                D::List(inner)
+                | D::LargeList(inner)
+                | D::FixedSizeList(inner, _)
+                | D::Map(inner, _) => has_ids(&arrow_schema::Fields::from(vec![inner.clone()])),
+                _ => false,
+            }
+    })
+}
+
+/// The text of row `row` of a string column (as the reader gives one: a
+/// dictionary of strings, or strings).
+fn string_at(array: &arrow_array::ArrayRef, row: usize) -> Option<String> {
+    use arrow_array::{Array, DictionaryArray, LargeStringArray, StringArray, types::Int32Type};
+    if array.is_null(row) {
+        return None;
+    }
+    let any = array.as_any();
+    if let Some(dictionary) = any.downcast_ref::<DictionaryArray<Int32Type>>() {
+        let key = dictionary.keys().value(row) as usize;
+        let values = dictionary.values();
+        return string_at(values, key);
+    }
+    if let Some(strings) = any.downcast_ref::<StringArray>() {
+        return Some(strings.value(row).to_string());
+    }
+    any.downcast_ref::<LargeStringArray>()
+        .map(|strings| strings.value(row).to_string())
+}
+
+/// Marks the rows position delete files `positions` delete in `inputs`
+/// (by path; one not older than an input, naming it if it names one file).
+fn mark_positions(
+    storage: &Arc<Storage>,
+    warehouse: &str,
+    inputs: &[Input],
+    positions: &[(String, i64, Option<String>)],
+    deleted: &mut [Deleted],
+) -> Result<(), String> {
+    let by_path: HashMap<&str, usize> = inputs
+        .iter()
+        .enumerate()
+        .map(|(at, input)| (input.path.as_str(), at))
+        .collect();
+    for (key, sequence, scoped) in positions {
+        let file = truthdb_engine::engine::open_arrow_parquet(storage, warehouse, key)
+            .map_err(|err| format!("The delete file {key} cannot be read: {err}"))?;
+        let schema = file.schema();
+        let (Some(paths), Some(at)) = (column_of(&schema, FILE_PATH), column_of(&schema, POS))
+        else {
+            return Err(format!("The delete file {key} has no file_path and pos."));
+        };
+        for group in 0..file.metadata().num_row_groups() {
+            for batch in file.batches(group)? {
+                let batch =
+                    batch.map_err(|err| format!("The delete file {key} cannot be read: {err}"))?;
+                let pos = batch
+                    .column(at)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .ok_or_else(|| format!("The delete file {key}'s pos is not a long."))?;
+                for row in 0..batch.num_rows() {
+                    let (Some(named), true) = (
+                        string_at(batch.column(paths), row),
+                        arrow_array::Array::is_valid(pos, row),
+                    ) else {
+                        return Err(format!(
+                            "The delete file {key} has a null file_path or pos."
+                        ));
+                    };
+                    let Some(&input) = by_path.get(named.as_str()) else {
+                        continue;
+                    };
+                    let position = pos.value(row);
+                    if inputs[input].sequence <= *sequence
+                        && scoped.as_ref().is_none_or(|one| *one == named)
+                        && position >= 0
+                    {
+                        deleted[input].mark(position as u64);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Marks the rows equality delete files `equalities` delete in `inputs`
+/// (one newer than an input): each set of field ids a chunk of keys at a
+/// time, each key with the newest delete holding it; then each input
+/// older than the chunk read in those columns only.
+fn mark_equalities(
+    storage: &Arc<Storage>,
+    warehouse: &str,
+    inputs: &[Input],
+    (equalities, chunk_bytes): (&[EqualityDelete], usize),
+    deleted: &mut [Deleted],
+) -> Result<(), String> {
+    use arrow_schema::DataType as D;
+    let mut by_ids: BTreeMap<&[i32], Vec<(&str, i64)>> = BTreeMap::new();
+    for (key, ids, sequence) in equalities {
+        if ids.is_empty() {
+            return Err(format!("The equality delete file {key} names no field."));
+        }
+        by_ids.entry(ids).or_default().push((key, *sequence));
+    }
+    for (ids, files) in by_ids {
+        let mut types: Option<Vec<arrow_schema::DataType>> = None;
+        let mut chunk: HashMap<Box<[u8]>, i64> = HashMap::new();
+        let mut bytes = 0usize;
+        for (key, sequence) in files {
+            let file = truthdb_engine::engine::open_arrow_parquet(storage, warehouse, key)
+                .map_err(|err| format!("The delete file {key} cannot be read: {err}"))?;
+            let schema = file.schema();
+            let columns = ids
+                .iter()
+                .map(|&id| {
+                    column_of(&schema, id).ok_or_else(|| {
+                        format!("The equality delete file {key} has no top-level field {id}.")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let of_file: Vec<_> = columns
+                .iter()
+                .map(|&at| schema.field(at).data_type().clone())
+                .collect();
+            // Floating point columns are not equality fields (NaNs of other
+            // bits would not match here).
+            if of_file
+                .iter()
+                .any(|data_type| matches!(data_type, D::Float16 | D::Float32 | D::Float64))
+            {
+                return Err(format!(
+                    "The equality delete file {key} compares floating point columns."
+                ));
+            }
+            match &types {
+                Some(types) if *types != of_file => {
+                    return Err(format!(
+                        "The equality delete files of fields {ids:?} have columns of other types."
+                    ));
+                }
+                Some(_) => {}
+                None => types = Some(of_file),
+            }
+            let types = types.as_deref().expect("set above");
+            let converter = converter(types)?;
+            for group in 0..file.metadata().num_row_groups() {
+                for batch in file.batches(group)? {
+                    let batch = batch
+                        .map_err(|err| format!("The delete file {key} cannot be read: {err}"))?;
+                    let picked: Vec<_> =
+                        columns.iter().map(|&at| batch.column(at).clone()).collect();
+                    let rows = converter
+                        .convert_columns(&picked)
+                        .map_err(|err| format!("The delete file {key} cannot be read: {err}"))?;
+                    for row in rows.iter() {
+                        let newest = chunk.entry(Box::from(row.as_ref())).or_insert_with(|| {
+                            bytes += row.as_ref().len() + DELETE_OVERHEAD;
+                            sequence
+                        });
+                        *newest = (*newest).max(sequence);
+                        if bytes > chunk_bytes {
+                            mark_chunk(storage, warehouse, inputs, (ids, types), &chunk, deleted)?;
+                            chunk.clear();
+                            bytes = 0;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(types) = &types
+            && !chunk.is_empty()
+        {
+            mark_chunk(storage, warehouse, inputs, (ids, types), &chunk, deleted)?;
+        }
+    }
+    Ok(())
+}
+
+/// Marks the rows of `inputs` whose columns `ids` (of `types`) match a key
+/// of `chunk` newer than the input (a column an input does not hold: null).
+fn mark_chunk(
+    storage: &Arc<Storage>,
+    warehouse: &str,
+    inputs: &[Input],
+    (ids, types): (&[i32], &[arrow_schema::DataType]),
+    chunk: &HashMap<Box<[u8]>, i64>,
+    deleted: &mut [Deleted],
+) -> Result<(), String> {
+    let newest = chunk.values().copied().max().unwrap_or(i64::MIN);
+    let converter = converter(types)?;
+    for (input, deleted) in inputs.iter().zip(deleted.iter_mut()) {
+        if input.sequence >= newest {
+            continue;
+        }
+        let key = &input.key;
+        let file = truthdb_engine::engine::open_arrow_parquet(storage, warehouse, key)
+            .map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
+        let schema = file.schema();
+        if !has_ids(schema.fields()) {
+            // Its columns are not known by field id (a name mapping would
+            // say which they are): its equality deletes cannot be applied.
+            return Err(
+                "Equality deletes do not apply here to a data file written without field ids."
+                    .to_string(),
+            );
+        }
+        let mut roots = Vec::new();
+        for id in ids {
+            match column_of(&schema, *id) {
+                Some(at) => roots.push(at),
+                None if holds_id(schema.fields(), *id) => {
+                    return Err(format!(
+                        "Equality deletes of field {id}, nested in the data file, are not applied here."
+                    ));
+                }
+                // A column added after the file was written: null in it.
+                None => {}
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        let mut row = 0u64;
+        for group in 0..file.metadata().num_row_groups() {
+            for batch in file.batches_of(group, Some(&roots))? {
+                let batch =
+                    batch.map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
+                let rows = batch.num_rows();
+                let projected = batch.schema();
+                let mut columns = Vec::new();
+                for (id, data_type) in ids.iter().zip(types) {
+                    let column = match column_of(&projected, *id) {
+                        Some(at) => batch.column(at).clone(),
+                        None => arrow_array::new_null_array(data_type, rows),
+                    };
+                    if column.data_type() != data_type {
+                        return Err(format!(
+                            "Equality deletes of field {id} are of another type than the data file's column."
+                        ));
+                    }
+                    columns.push(column);
+                }
+                let encoded = converter
+                    .convert_columns(&columns)
+                    .map_err(|err| format!("Equality deletes cannot be applied: {err}"))?;
+                for (at, encoded) in encoded.iter().enumerate() {
+                    if chunk
+                        .get(encoded.as_ref())
+                        .is_some_and(|newest| *newest > input.sequence)
+                    {
+                        deleted.mark(row + at as u64);
+                    }
+                }
+                row += rows as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An encoder of rows of columns of `types`, to compare.
+fn converter(types: &[arrow_schema::DataType]) -> Result<arrow_row::RowConverter, String> {
+    arrow_row::RowConverter::new(
+        types
+            .iter()
+            .map(|data_type| arrow_row::SortField::new(data_type.clone()))
+            .collect(),
+    )
+    .map_err(|err| format!("Equality deletes of these columns cannot be applied: {err}"))
 }
 
 /// Stores `body` as object `key` of the table's storage: its version.
@@ -1191,8 +1898,12 @@ async fn commit(
         if let Some(size) = total("total-files-size") {
             summary["total-files-size"] = json!((size + added_size - deleted_size).to_string());
         }
+        // Rows deleted are left out of the outputs.
+        if let Some(records) = total("total-records") {
+            summary["total-records"] =
+                json!((records + added_records - deleted_records).to_string());
+        }
         for field in [
-            "total-records",
             "total-delete-files",
             "total-position-deletes",
             "total-equality-deletes",
@@ -1365,6 +2076,205 @@ mod tests {
         assert_eq!(metrics.offsets.len(), 3);
     }
 
+    /// A storage of the object engine at a new path, and that path.
+    fn storage() -> (Arc<Storage>, std::path::PathBuf) {
+        use truthdb_core::storage::StorageOptions;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-compaction-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        const RING: u64 = 8 * 1024 * 1024;
+        let storage = Storage::create_with_wal_bounds(
+            path.clone(),
+            StorageOptions {
+                size_bytes: 64 << 20,
+                wal_ratio: 0.05,
+                metadata_ratio: 0.08,
+                snapshot_ratio: 0.02,
+                allocator_ratio: 0.02,
+                reserved_ratio: 0.17,
+                default_collation: None,
+            },
+            RING,
+            RING,
+            truthdb_engine::database_engines,
+        )
+        .expect("create");
+        truthdb_object::ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.create_bucket("www", truthdb_object::DEFAULT_ACCOUNT, 1))
+            .unwrap()
+            .expect("bucket");
+        (Arc::new(storage), path)
+    }
+
+    /// Stores `batch` as Parquet object `key` of bucket `www`.
+    fn put_parquet(storage: &Arc<Storage>, key: &str, batch: &arrow_array::RecordBatch) {
+        let mut bytes = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        let mut body = BodyWriter::begin(storage, 1).unwrap();
+        body.write(storage, &bytes, 1).unwrap();
+        let sealed = body.finish(storage, 1).unwrap();
+        truthdb_object::ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_object(
+                    "www",
+                    key,
+                    &sealed,
+                    &truthdb_object::ObjectAttrs::default(),
+                    truthdb_object::StorageClass::Standard,
+                    2,
+                    0,
+                )
+                .map(|put| {
+                    put.expect("put");
+                })
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn equality_deletes_are_applied_a_chunk_of_keys_at_a_time() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        let (storage, path) = storage();
+        let id = |n: i32| HashMap::from([("PARQUET:field_id".to_string(), n.to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(id(1)),
+        ]));
+        let ids = |values: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )
+            .unwrap()
+        };
+        put_parquet(&storage, "data/old.parquet", &ids((0..100).collect()));
+        put_parquet(&storage, "data/new.parquet", &ids((0..100).collect()));
+        // Two delete files, of sequence 3 and 5: 50 and 3; every third id
+        // (3 too: its key is the newer delete's).
+        put_parquet(&storage, "data/eq-3.parquet", &ids(vec![50, 3]));
+        put_parquet(
+            &storage,
+            "data/eq-5.parquet",
+            &ids((0..100).step_by(3).collect()),
+        );
+        let inputs = [
+            Input {
+                key: "data/old.parquet".to_string(),
+                path: "s3://www/data/old.parquet".to_string(),
+                sequence: 2,
+                records: 100,
+            },
+            Input {
+                key: "data/new.parquet".to_string(),
+                path: "s3://www/data/new.parquet".to_string(),
+                sequence: 4,
+                records: 100,
+            },
+        ];
+        let equalities = [
+            ("data/eq-3.parquet".to_string(), vec![1], 3),
+            ("data/eq-5.parquet".to_string(), vec![1], 5),
+        ];
+        let marked = |chunk_bytes| {
+            let mut deleted = vec![Deleted::new(100).unwrap(), Deleted::new(100).unwrap()];
+            mark_equalities(
+                &storage,
+                "www",
+                &inputs,
+                (&equalities, chunk_bytes),
+                &mut deleted,
+            )
+            .unwrap();
+            deleted
+                .iter()
+                .map(|deleted| {
+                    (0..100)
+                        .filter(|&row| deleted.is_marked(row))
+                        .collect::<Vec<u64>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let thirds: Vec<u64> = (0..100).step_by(3).collect();
+        let mut old = thirds.clone();
+        old.push(50);
+        old.sort_unstable();
+        // The older file loses both files' keys; the newer only the newer
+        // delete's (50 is of an older delete than it).
+        let expected = vec![old, thirds];
+        // In one chunk, and in chunks of a few keys each.
+        assert_eq!(marked(MAX_DELETE_BYTES), expected);
+        assert_eq!(marked(4 * (8 + DELETE_OVERHEAD)), expected);
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn position_deletes_mark_rows_of_their_files_by_path() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        let (storage, path) = storage();
+        let id = |n: i32| HashMap::from([("PARQUET:field_id".to_string(), n.to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(id(FILE_PATH)),
+            Field::new("pos", DataType::Int64, false).with_metadata(id(POS)),
+        ]));
+        let (a, b) = ("s3://www/data/a.parquet", "s3://www/data/b.parquet");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![a, b, a])),
+                Arc::new(Int64Array::from(vec![1, 2, 9])),
+            ],
+        )
+        .unwrap();
+        put_parquet(&storage, "data/pos.parquet", &batch);
+        let input = |path: &str, sequence| Input {
+            key: String::new(),
+            path: path.to_string(),
+            sequence,
+            records: 5,
+        };
+        let marked = |inputs: &[Input], positions: &[(String, i64, Option<String>)]| {
+            let mut deleted: Vec<_> = inputs.iter().map(|_| Deleted::new(5).unwrap()).collect();
+            mark_positions(&storage, "www", inputs, positions, &mut deleted).unwrap();
+            deleted
+                .iter()
+                .map(|deleted| {
+                    (0..5)
+                        .filter(|&row| deleted.is_marked(row))
+                        .collect::<Vec<u64>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let key = "data/pos.parquet".to_string();
+        // Each file its own rows (9 is past a's rows).
+        assert_eq!(
+            marked(&[input(a, 1), input(b, 1)], &[(key.clone(), 3, None)]),
+            [vec![1], vec![2]]
+        );
+        // A file newer than the delete keeps its rows.
+        assert_eq!(
+            marked(&[input(a, 4), input(b, 3)], &[(key.clone(), 3, None)]),
+            [vec![], vec![2]]
+        );
+        // One naming a single file applies to that file only.
+        assert_eq!(
+            marked(
+                &[input(a, 1), input(b, 1)],
+                &[(key, 3, Some(a.to_string()))]
+            ),
+            [vec![1], vec![]]
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn an_output_ends_at_the_largest_file_written_inside_a_row_group() {
         use arrow_array::{Int64Array, RecordBatch};
@@ -1429,11 +2339,24 @@ mod tests {
         let outputs = rewrite_files(
             &storage,
             "www",
-            &["data/one.parquet".to_string()],
+            (
+                &[Input {
+                    key: "data/one.parquet".to_string(),
+                    path: "s3://www/data/one.parquet".to_string(),
+                    sequence: 1,
+                    records: 30_000,
+                }],
+                &GroupDeletes {
+                    positions: Vec::new(),
+                    equalities: Vec::new(),
+                },
+            ),
             (u64::MAX, 1),
             parquet::basic::Compression::UNCOMPRESSED,
         )
         .unwrap();
+        let (outputs, read) = outputs;
+        assert_eq!(read, [30_000]);
         assert!(outputs.len() > 1, "{} outputs", outputs.len());
         let rows: i64 = outputs
             .iter()
@@ -1455,14 +2378,72 @@ mod tests {
             partition_key(&record(Avro::TimestampMicros(7))),
             partition_key(&record(Avro::Union(1, Box::new(Avro::Long(7)))))
         );
+        // A promoted partition source: an int then a long, a float then a
+        // double, a decimal of more precision (a longer fixed).
         assert_eq!(
-            partition_key(&record(Avro::Fixed(2, vec![1, 2]))),
-            partition_key(&record(Avro::Bytes(vec![1, 2])))
+            partition_key(&record(Avro::Int(7))),
+            partition_key(&record(Avro::Union(1, Box::new(Avro::Long(7)))))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::Float(1.5))),
+            partition_key(&record(Avro::Double(1.5)))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::Fixed(2, vec![0x00, 0x05]))),
+            partition_key(&record(Avro::Fixed(4, vec![0x00, 0x00, 0x00, 0x05])))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::Fixed(2, vec![0xff, 0xfb]))),
+            partition_key(&record(Avro::Fixed(3, vec![0xff, 0xff, 0xfb])))
+        );
+        assert_ne!(
+            partition_key(&record(Avro::Fixed(2, vec![0x00, 0x05]))),
+            partition_key(&record(Avro::Fixed(2, vec![0xff, 0x05])))
+        );
+        // Binary is compared as it is.
+        assert_ne!(
+            partition_key(&record(Avro::Bytes(vec![0x00, 0x05]))),
+            partition_key(&record(Avro::Bytes(vec![0x05])))
         );
         assert_ne!(
             partition_key(&record(Avro::Int(1))),
             partition_key(&record(Avro::Int(2)))
         );
+    }
+
+    #[test]
+    fn a_group_counting_too_many_rows_is_refused_before_any_is_held() {
+        let input = |records| Input {
+            key: String::new(),
+            path: String::new(),
+            sequence: 1,
+            records,
+        };
+        assert!(check_rows(&[input(MAX_ROWS / 2), input(MAX_ROWS / 2)]).is_ok());
+        assert!(check_rows(&[input(MAX_ROWS / 2), input(MAX_ROWS / 2 + 1)]).is_err());
+        assert!(check_rows(&[input(i64::MAX), input(i64::MAX)]).is_err());
+    }
+
+    #[test]
+    fn a_files_deleted_rows_are_a_bit_a_row() {
+        assert!(Deleted::new(-1).is_err());
+        assert!(Deleted::new(MAX_ROWS + 1).is_err());
+        let mut deleted = Deleted::new(130).unwrap();
+        assert!(deleted.kept(0, 130).is_none());
+        // Nothing held until a row is marked.
+        assert!(deleted.bits.is_empty());
+        for row in [0, 63, 64, 129, 130, 1000, 64] {
+            deleted.mark(row);
+        }
+        assert_eq!(deleted.marked, 4);
+        let kept = deleted.kept(60, 10).unwrap();
+        let kept: Vec<bool> = (0..10).map(|at| kept.value(at)).collect();
+        assert_eq!(
+            kept,
+            [true, true, true, false, false, true, true, true, true, true]
+        );
+        // Past its rows nothing is marked.
+        assert!(deleted.is_marked(129) && !deleted.is_marked(130));
     }
 
     #[test]

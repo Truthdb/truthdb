@@ -19511,7 +19511,7 @@ def ran(name, since, status="Successful"):
         time.sleep(0.1)
     raise SystemExit(f"{name}: no {status} run since {since}: {j}")
 def files(table):
-    return table.inspect.files().to_pylist()
+    return [f for f in table.inspect.files().to_pylist() if f["content"] == 0]
 def table(name, *, spec=None, order=None, properties=None):
     made = c.create_table(("lake", name), schema=schema, partition_spec=spec or PartitionSpec(),
         sort_order=order or SortOrder(), properties=properties or {})
@@ -19690,30 +19690,61 @@ failed = ran("liar", since, "Failed")
 assert "nothing was committed" in failed["failureMessage"], failed
 assert c.load_table(("lake", "liar")).current_snapshot().snapshot_id == lying_id
 
-# A partition a delete file is in: its files are left as they are (deletes
-# are not applied yet); the other partition's are compacted.
-from pyiceberg.manifest import DataFileContent, ManifestContent, ManifestWriterV2
+# Deletes: real position and equality delete files, in a delete manifest
+# of a snapshot of their own.
+import io
+from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestContent, ManifestWriterV2
 class DeleteWriter(ManifestWriterV2):
     def content(self):
         return ManifestContent.DELETES
     @property
     def _meta(self):
         return {**super()._meta, "content": "deletes"}
-def add_delete(tbl, name, snapshot_id, region=None):
+def field(name, kind, field_id):
+    return pa.field(name, kind, nullable=False, metadata={"PARQUET:field_id": str(field_id)})
+def delete_file(tbl, content, table_rows, partition, *, scoped=None, equality_ids=None, outside=False):
+    store = tbl.location().removeprefix("s3://")
+    key = f"data/deletes-{time.time_ns()}.parquet"
+    out = io.BytesIO()
+    pq.write_table(table_rows, out)
+    body = out.getvalue()
+    s3.put_object(Bucket=store, Key=key, Body=body)
+    location = f"s3://elsewhere/{key}" if outside else f"{tbl.location()}/{key}"
+    args = {"content": content, "file_path": location, "file_format": FileFormat.PARQUET,
+        "partition": partition, "record_count": len(table_rows), "file_size_in_bytes": len(body)}
+    if scoped:
+        args["lower_bounds"] = {2147483546: scoped.encode()}
+        args["upper_bounds"] = {2147483546: scoped.encode()}
+    if equality_ids:
+        args["equality_ids"] = equality_ids
+    return DataFile.from_args(**args)
+def positions(tbl, partition, targets, **options):
+    paths = [path for path, at in targets for _ in at]
+    at = [position for _, positions in targets for position in positions]
+    table_rows = pa.Table.from_arrays([pa.array(paths, pa.string()), pa.array(at, pa.int64())],
+        schema=pa.schema([field("file_path", pa.string(), 2147483546), field("pos", pa.int64(), 2147483545)]))
+    return delete_file(tbl, DataFileContent.POSITION_DELETES, table_rows, partition, **options)
+def equalities(tbl, partition, ids):
+    table_rows = pa.Table.from_arrays([pa.array(ids, pa.int64())], schema=pa.schema([field("id", pa.int64(), 1)]))
+    return delete_file(tbl, DataFileContent.EQUALITY_DELETES, table_rows, partition, equality_ids=[1])
+def data_files(tbl, region=None):
+    return [entry.data_file for manifest in tbl.current_snapshot().manifests(tbl.io)
+        for entry in manifest.fetch_manifest_entry(tbl.io, discard_deleted=True)
+        if entry.data_file.content == DataFileContent.DATA
+        and (region is None or entry.data_file.partition[0] == region)]
+def add_deletes(tbl, name, snapshot_id, delete_files, spec=None):
     snapshot = tbl.current_snapshot()
     data_manifests = snapshot.manifests(tbl.io)
-    [first, *_] = [entry for manifest in data_manifests
-        for entry in manifest.fetch_manifest_entry(tbl.io, discard_deleted=True)
-        if region is None or entry.data_file.partition[0] == region]
-    first.data_file[0] = DataFileContent.POSITION_DELETES
     store = tbl.location().removeprefix("s3://")
     local = os.path.join(tempfile.mkdtemp(), "deletes.avro")
-    with DeleteWriter(tbl.spec(), tbl.schema(), PyArrowFileIO().new_output(local), snapshot_id, "deflate") as writer:
-        writer.add_entry(ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, snapshot_id=snapshot_id,
-            sequence_number=None, file_sequence_number=None, data_file=first.data_file))
+    with DeleteWriter(spec or tbl.spec(), tbl.schema(), PyArrowFileIO().new_output(local), snapshot_id,
+            "deflate") as writer:
+        for delete in delete_files:
+            writer.add_entry(ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, snapshot_id=snapshot_id,
+                sequence_number=None, file_sequence_number=None, data_file=delete))
     delete_manifest = writer.to_manifest_file()
-    delete_manifest[0] = f"{tbl.location()}/metadata/deletes.avro"
-    s3.put_object(Bucket=store, Key="metadata/deletes.avro", Body=open(local, "rb").read())
+    delete_manifest[0] = f"{tbl.location()}/metadata/deletes-{snapshot_id}.avro"
+    s3.put_object(Bucket=store, Key=f"metadata/deletes-{snapshot_id}.avro", Body=open(local, "rb").read())
     sequence = tbl.metadata.last_sequence_number + 1
     local_list = os.path.join(tempfile.mkdtemp(), "list.avro")
     with write_manifest_list(2, PyArrowFileIO().new_output(local_list), snapshot_id, snapshot.snapshot_id,
@@ -19723,51 +19754,247 @@ def add_delete(tbl, name, snapshot_id, region=None):
     c._session.post(c.url(f"namespaces/lake/tables/{name}", prefixed=True), json={"requirements": [],
         "updates": [{"action": "add-snapshot", "snapshot": {"snapshot-id": snapshot_id,
         "parent-snapshot-id": snapshot.snapshot_id, "sequence-number": sequence,
-        "timestamp-ms": int(time.time() * 1000), "summary": {"operation": "delete"},
+        "timestamp-ms": int(time.time() * 1000), "summary": {"operation": "delete",
+        "total-records": str(sum(f.record_count for f in data_files(tbl)))},
         "manifest-list": f"{tbl.location()}/metadata/snap-{snapshot_id}.avro"}},
         {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot_id}]}
         ).raise_for_status()
+    return c.load_table(("lake", name))
+def compacted_rows(tbl):
+    out = []
+    for f in files(tbl):
+        body = s3.get_object(Bucket=f["file_path"].split("/")[2], Key=f["file_path"].split("/", 3)[3])["Body"].read()
+        out.extend(pq.read_table(pa.BufferReader(body)).column("id").to_pylist())
+    return sorted(out)
+
+# Position deletes of a partition: applied when its files are compacted
+# (rows 0 and 2 of a file of partition a); the other partition's too.
 deleted = table("deleted", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
     transform=IdentityTransform(), name="region")))
 for region in ["a", "b"]:
     for i in range(5):
         deleted.append(rows(i * 3, region))
-add_delete(deleted, "deleted", 77, "a")
+[first_a, *_] = sorted(data_files(deleted, "a"), key=lambda f: f.file_path)
+deleted = add_deletes(deleted, "deleted", 77, [positions(deleted, first_a.partition, [(first_a.file_path, [0, 2])])])
+expected = sorted(row["id"] for row in deleted.scan().to_arrow().to_pylist())
+assert len(expected) == 28, expected
 since = time.time()
 configure("deleted", targetFileSizeMB=64)
 ran("deleted", since)
 deleted = c.load_table(("lake", "deleted"))
 assert deleted.current_snapshot().summary.operation == Operation.REPLACE
-kept = sorted((entry.data_file.partition[0], entry.data_file.content)
-    for manifest in deleted.current_snapshot().manifests(deleted.io)
-    for entry in manifest.fetch_manifest_entry(deleted.io, discard_deleted=True))
-assert kept == [("a", DataFileContent.DATA)] * 5 + [("a", DataFileContent.POSITION_DELETES),
-    ("b", DataFileContent.DATA)], kept
-# A delete file of an unpartitioned spec may apply to any file: none is
-# compacted.
+# The rows left out leave the total too.
+assert deleted.current_snapshot().summary["total-records"] == "28", deleted.current_snapshot().summary
+assert sorted((f["partition"]["region"], f["record_count"]) for f in files(deleted)) == [("a", 13), ("b", 15)]
+assert sorted(row["id"] for row in deleted.scan().to_arrow().to_pylist()) == expected
+
+# Equality deletes of an unpartitioned spec apply to every file older than
+# them, not to one appended after.
 anywhere = table("anywhere")
 for i in range(5):
     anywhere.append(rows(i * 3))
-add_delete(anywhere, "anywhere", 78)
+anywhere = add_deletes(anywhere, "anywhere", 78, [equalities(anywhere, data_files(anywhere)[0].partition, [4, 7])])
+anywhere.append(rows(4, n=1))
 since = time.time()
 configure("anywhere", targetFileSizeMB=64)
 ran("anywhere", since)
-assert c.load_table(("lake", "anywhere")).current_snapshot().snapshot_id == 78
-# One of a spec that was unpartitioned may apply to the files of a later,
-# partitioned spec too: none is compacted.
+anywhere = c.load_table(("lake", "anywhere"))
+assert anywhere.current_snapshot().summary.operation == Operation.REPLACE
+assert compacted_rows(anywhere) == sorted([i for i in range(15) if i not in (4, 7)] + [4]), compacted_rows(anywhere)
+
+# Equality deletes of a partition apply to its files only.
+scoped = table("scoped", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for region in ["a", "b"]:
+    for i in range(5):
+        scoped.append(rows(i * 3, region))
+scoped = add_deletes(scoped, "scoped", 82, [equalities(scoped, data_files(scoped, "b")[0].partition, [1])])
+since = time.time()
+configure("scoped", targetFileSizeMB=64)
+ran("scoped", since)
+scoped = c.load_table(("lake", "scoped"))
+by_region = {}
+for f in files(scoped):
+    body = s3.get_object(Bucket=f["file_path"].split("/")[2], Key=f["file_path"].split("/", 3)[3])["Body"].read()
+    by_region[f["partition"]["region"]] = sorted(pq.read_table(pa.BufferReader(body)).column("id").to_pylist())
+assert by_region == {"a": list(range(15)), "b": [i for i in range(15) if i != 1]}, by_region
+
+# A position delete of a spec that was unpartitioned is read by path: it
+# deletes from its own file only; the later spec's files are compacted.
 evolved = table("evolved")
 evolved.append(rows(0))
-add_delete(evolved, "evolved", 79)
-evolved = c.load_table(("lake", "evolved"))
+[old] = data_files(evolved)
+evolved = add_deletes(evolved, "evolved", 79, [positions(evolved, old.partition, [(old.file_path, [1])])])
 with evolved.update_spec() as update:
     update.add_identity("region")
 for i in range(5):
     evolved.append(rows(10 + i * 3))
-current = c.load_table(("lake", "evolved")).current_snapshot().snapshot_id
 since = time.time()
 configure("evolved", targetFileSizeMB=64)
 ran("evolved", since)
-assert c.load_table(("lake", "evolved")).current_snapshot().snapshot_id == current
+evolved = c.load_table(("lake", "evolved"))
+assert sorted(f["record_count"] for f in files(evolved)) == [3, 15], files(evolved)
+assert sorted(row["id"] for row in evolved.scan().to_arrow().to_pylist()) == [0, 2] + list(range(10, 25))
+
+# A partition source promoted from int to long: the manifests before hold
+# the partition as an int, the delete's after as a long; it is still the
+# files' partition, so the delete is applied.
+from pyiceberg.types import IntegerType
+promoted = c.create_table(("lake", "promoted"), schema=Schema(NestedField(1, "id", LongType()),
+    NestedField(2, "p", IntegerType())), partition_spec=PartitionSpec(
+    PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="p")))
+configure("promoted", status="disabled")
+for i in range(5):
+    promoted.append(pa.table({"id": pa.array(range(i * 3, i * 3 + 3), pa.int64()), "p": pa.array([7] * 3, pa.int32())}))
+with promoted.update_schema() as update:
+    update.update_column("p", LongType())
+promoted = c.load_table(("lake", "promoted"))
+[first, *_] = sorted(data_files(promoted), key=lambda f: f.file_path)
+promoted = add_deletes(promoted, "promoted", 90, [positions(promoted, first.partition, [(first.file_path, [0, 2])])])
+expected = sorted(row["id"] for row in promoted.scan().to_arrow().to_pylist())
+assert len(expected) == 13, expected
+since = time.time()
+configure("promoted", targetFileSizeMB=64)
+ran("promoted", since)
+promoted = c.load_table(("lake", "promoted"))
+assert promoted.current_snapshot().summary.operation == Operation.REPLACE
+assert sorted(row["id"] for row in promoted.scan().to_arrow().to_pylist()) == expected
+
+# A spec whose fields are all void is unpartitioned (as Iceberg's Java has
+# it): its equality deletes apply to every older file. And a position
+# delete applies by path, whatever spec or partition it is written in.
+from pyiceberg.typedef import Record
+def voided(name):
+    tbl = table(name, spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+        transform=IdentityTransform(), name="region")))
+    for i in range(5):
+        tbl.append(rows(i * 3))
+    c._session.post(c.url(f"namespaces/lake/tables/{name}", prefixed=True), json={"requirements": [],
+        "updates": [{"action": "add-spec", "spec": {"spec-id": 1, "fields": [{"source-id": 6, "field-id": 1000,
+        "name": "region", "transform": "void"}]}}, {"action": "set-default-spec", "spec-id": -1}]}).raise_for_status()
+    return c.load_table(("lake", name))
+voideq = voided("voideq")
+voideq = add_deletes(voideq, "voideq", 91, [equalities(voideq, Record(None), [4, 7])], spec=voideq.spec())
+since = time.time()
+configure("voideq", targetFileSizeMB=64)
+ran("voideq", since)
+voideq = c.load_table(("lake", "voideq"))
+assert voideq.current_snapshot().summary.operation == Operation.REPLACE
+assert compacted_rows(voideq) == [i for i in range(15) if i not in (4, 7)], compacted_rows(voideq)
+voidpos = voided("voidpos")
+[first, *_] = sorted(data_files(voidpos), key=lambda f: f.file_path)
+voidpos = add_deletes(voidpos, "voidpos", 92, [positions(voidpos, Record(None), [(first.file_path, [0, 2])],
+    scoped=first.file_path)], spec=voidpos.spec())
+expected = sorted(row["id"] for row in voidpos.scan().to_arrow().to_pylist())
+since = time.time()
+configure("voidpos", targetFileSizeMB=64)
+ran("voidpos", since)
+voidpos = c.load_table(("lake", "voidpos"))
+assert voidpos.current_snapshot().summary.operation == Operation.REPLACE
+assert len(compacted_rows(voidpos)) == 13 and sorted(row["id"] for row in voidpos.scan().to_arrow().to_pylist()) == expected
+# A position delete naming no single file is its partition's (as Iceberg's
+# Java keys it): one that cannot be read leaves that partition's files as
+# they are, not another's.
+otherpos = table("otherpos", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for region in ["a", "b"]:
+    for i in range(5):
+        otherpos.append(rows(i * 3, region))
+in_b = data_files(otherpos, "b")[0]
+otherpos = add_deletes(otherpos, "otherpos", 93, [positions(otherpos, in_b.partition,
+    [(in_b.file_path, [0])], outside=True)])
+since = time.time()
+configure("otherpos", targetFileSizeMB=64)
+ran("otherpos", since)
+otherpos = c.load_table(("lake", "otherpos"))
+assert sorted((f["partition"]["region"], f["record_count"]) for f in files(otherpos)) == [("a", 15)] + [("b", 3)] * 5
+# One naming a single file applies to it by path, though written in
+# another partition.
+scopedpos = table("scopedpos", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for i in range(5):
+    scopedpos.append(rows(i * 3, "a"))
+scopedpos.append(rows(100, "b"))
+[first, *_] = sorted(data_files(scopedpos, "a"), key=lambda f: f.file_path)
+scopedpos = add_deletes(scopedpos, "scopedpos", 94, [positions(scopedpos, data_files(scopedpos, "b")[0].partition,
+    [(first.file_path, [0, 2])], scoped=first.file_path)])
+since = time.time()
+configure("scopedpos", targetFileSizeMB=64)
+ran("scopedpos", since)
+scopedpos = c.load_table(("lake", "scopedpos"))
+assert sorted((f["partition"]["region"], f["record_count"]) for f in files(scopedpos)) == [("a", 13), ("b", 3)]
+
+# Iceberg's delete ratio: a single file whose file-scoped position deletes
+# delete 30% of its rows is rewritten without them; at 20% it is not.
+# One whose deletes name another file is not this file's.
+for name, deleting, other in [("ratio", [0, 1, 2], False), ("ratio_low", [0, 1], False),
+        ("ratio_other", [0, 1, 2], True)]:
+    alone = table(name)
+    alone.append(rows(0, n=10))
+    [only] = data_files(alone)
+    named = f"{alone.location()}/data/other.parquet" if other else only.file_path
+    alone = add_deletes(alone, name, 80, [positions(alone, only.partition, [(named, deleting)],
+        scoped=named)])
+    since = time.time()
+    configure(name, targetFileSizeMB=64)
+    ran(name, since)
+    alone = c.load_table(("lake", name))
+    if len(deleting) == 3 and not other:
+        assert alone.current_snapshot().summary.operation == Operation.REPLACE
+        assert compacted_rows(alone) == list(range(3, 10)), compacted_rows(alone)
+    else:
+        assert alone.current_snapshot().snapshot_id == 80
+
+# Data files written without field ids (added as they were): their
+# columns are not known by id, so equality deletes are not applied to
+# them; the files are left as they are.
+imported = table("imported")
+imported_store = imported.location().removeprefix("s3://")
+def without_ids(kind):
+    if pa.types.is_large_list(kind):
+        return pa.large_list(without_ids(kind.value_type))
+    if pa.types.is_list(kind):
+        return pa.list_(without_ids(kind.value_type))
+    return kind
+plain_schema = pa.schema([pa.field(f.name, without_ids(f.type), nullable=f.nullable) for f in schema.as_arrow()])
+added = []
+for i in range(5):
+    out = io.BytesIO()
+    pq.write_table(rows(i * 3).cast(plain_schema), out)
+    s3.put_object(Bucket=imported_store, Key=f"data/imported-{i}.parquet", Body=out.getvalue())
+    added.append(f"{imported.location()}/data/imported-{i}.parquet")
+imported.add_files(added)
+imported = c.load_table(("lake", "imported"))
+imported = add_deletes(imported, "imported", 83, [equalities(imported, data_files(imported)[0].partition, [1])])
+since = time.time()
+configure("imported", targetFileSizeMB=64)
+failed = ran("imported", since, "Failed")
+assert "without field ids" in failed["failureMessage"], failed
+assert c.load_table(("lake", "imported")).current_snapshot().snapshot_id == 83
+# An equality delete of a floating point column is not applied (NaNs of
+# other bits would not match): left as they are.
+floaty = table("floaty")
+for i in range(5):
+    floaty.append(rows(i * 3))
+float_rows = pa.Table.from_arrays([pa.array([1.5], pa.float64())], schema=pa.schema([field("name", pa.float64(), 2)]))
+floaty = add_deletes(floaty, "floaty", 84, [delete_file(floaty, DataFileContent.EQUALITY_DELETES, float_rows,
+    data_files(floaty)[0].partition, equality_ids=[2])])
+since = time.time()
+configure("floaty", targetFileSizeMB=64)
+failed = ran("floaty", since, "Failed")
+assert "floating point" in failed["failureMessage"], failed
+
+# A delete file outside the table's storage cannot be applied: the files
+# it may apply to are left as they are.
+foreign = table("foreign")
+for i in range(5):
+    foreign.append(rows(i * 3))
+foreign = add_deletes(foreign, "foreign", 81, [positions(foreign, data_files(foreign)[0].partition,
+    [(data_files(foreign)[0].file_path, [0])], outside=True)])
+since = time.time()
+configure("foreign", targetFileSizeMB=64)
+ran("foreign", since)
+assert c.load_table(("lake", "foreign")).current_snapshot().snapshot_id == 81
 
 # A manifest compaction wrote holds the deleted entries of the files it
 # rewrote: written again by a later compaction, they stay deleted.
