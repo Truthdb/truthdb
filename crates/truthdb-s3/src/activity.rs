@@ -510,13 +510,14 @@ fn record(
     error: Option<(&str, &str)>,
     fit: Fit,
 ) -> Value {
-    // Through an access point: its bucket and the access point, except in a
-    // refused call's event for an account owning neither (it gave the
-    // access point's name, and was not let through to learn the bucket's).
+    // Through an access point: its bucket and the access point, except in
+    // the event of an account owning neither (it gave the access point's
+    // name; whether it was let through or not, its answers need not have
+    // named the bucket, as a DeleteObjects' refusals or a GetObject's do
+    // not).
     let through = call.through.as_ref();
-    let hidden = through.is_some_and(|through| {
-        error.is_some() && recipient != through.account && owner != Some(recipient)
-    });
+    let hidden =
+        through.is_some_and(|through| recipient != through.account && owner != Some(recipient));
     let (bucket_named, through, owner) = match through {
         Some(through) if hidden => (through.given.as_ref(), None, None),
         through => (call.bucket.as_ref(), through, owner),

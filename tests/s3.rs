@@ -20599,16 +20599,19 @@ for call in [lambda: their_s3.get_object(Bucket=alias, Key="docs/a"), lambda: th
         raise SystemExit("not refused")
     except botocore.exceptions.ClientError as error:
         assert error.response["Error"]["Code"] == "AccessDenied", error.response
-def their_records():
+# A multiple delete answers its refusals inside a success.
+deleted = their_s3.delete_objects(Bucket=alias, Delete={"Objects": [{"Key": "docs/a"}]})
+assert [e["Code"] for e in deleted["Errors"]] == ["AccessDenied"], deleted
+def their_records(name="GetObject"):
     out = []
     for o in their_s3.list_objects_v2(Bucket="their-logs").get("Contents", []):
         out += json.loads(gzip.decompress(their_s3.get_object(Bucket="their-logs", Key=o["Key"])["Body"].read()))["Records"]
-    return [r for r in out if r["eventName"] == "GetObject"]
-wait_for(lambda: their_records())
-theirs = their_records()[0]
-assert theirs["requestParameters"]["bucketName"] == alias, theirs
-assert "data" not in json.dumps(theirs["resources"]) and "accesspoint" not in json.dumps(theirs), theirs
-assert account not in json.dumps(theirs["resources"]), theirs
+    return [r for r in out if r["eventName"] == name]
+wait_for(lambda: their_records() and their_records("DeleteObjects"))
+for theirs in [their_records()[0], their_records("DeleteObjects")[0]]:
+    assert theirs["requestParameters"]["bucketName"] == alias, theirs
+    assert "data" not in json.dumps(theirs["resources"]) and "accesspoint" not in json.dumps(theirs), theirs
+    assert account not in json.dumps(theirs["resources"]), theirs
 def their_acl():
     events = their_ct.lookup_events(LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "GetBucketAcl"}])["Events"]
     return [json.loads(event["CloudTrailEvent"]) for event in events]
