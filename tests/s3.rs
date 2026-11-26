@@ -19056,11 +19056,20 @@ def aws_refused(call, code):
 import botocore.exceptions
 at = {"tableBucketARN": arn, "namespace": "sales"}
 default = t.get_table_maintenance_configuration(**at, name="orders_2024")["configuration"]
-assert default == {"icebergSnapshotManagement": {"status": "enabled", "settings": {"icebergSnapshotManagement":
-    {"minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 120}}}}, default
-# Not built: refused, not ignored.
-aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
-    value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 256}}}), "NotImplemented")
+assert default == {"icebergCompaction": {"status": "enabled", "settings": {"icebergCompaction":
+    {"targetFileSizeMB": 512, "strategy": "auto"}}}, "icebergSnapshotManagement": {"status": "enabled", "settings":
+    {"icebergSnapshotManagement": {"minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 120}}}}, default
+# Compaction's target from 64 to 512 MB; the sort strategies not built: refused, not ignored.
+for size in [63, 513]:
+    aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
+        value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": size}}}), "BadRequestException")
+for strategy in ["sort", "z-order"]:
+    aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
+        value={"status": "enabled", "settings": {"icebergCompaction": {"strategy": strategy}}}), "NotImplemented")
+t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
+    value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 64}}})
+assert t.get_table_maintenance_configuration(**at, name="orders_2024")["configuration"]["icebergCompaction"] == {
+    "status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 64, "strategy": "auto"}}}
 bucket_default = t.get_table_bucket_maintenance_configuration(tableBucketARN=arn)["configuration"]
 assert bucket_default == {"icebergUnreferencedFileRemoval": {"status": "enabled", "settings":
     {"icebergUnreferencedFileRemoval": {"unreferencedDays": 3, "nonCurrentDays": 10}}}}, bucket_default
@@ -19420,5 +19429,365 @@ for space in ["sales", "archive", "made"]:
 t.delete_table_bucket(tableBucketARN=arn)
 refused(lambda: t.get_table_bucket(tableBucketARN=arn), "NotFoundException")
 assert [b["name"] for b in t.list_table_buckets()["tableBuckets"]] == ["kept"]
+print("ok")
+"#;
+
+#[test]
+fn pyiceberg_tables_are_compacted_by_their_maintenance() {
+    // A Python with PyIceberg and boto3 installed (pip install pyiceberg boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_PYICEBERG_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_PYICEBERG_PYTHON names no Python with PyIceberg");
+        return;
+    };
+    let server = start_server();
+    let (_, key, secret) = account_with_key(&server, "compacting");
+    let script = server.dir.join("compaction.py");
+    std::fs::write(&script, COMPACTION_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg("-I")
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const COMPACTION_SCRIPT: &str = r#"
+import datetime, decimal, json, sys, time
+import boto3, botocore.config
+import pyarrow as pa, pyarrow.parquet as pq
+from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.partitioning import PartitionField, PartitionSpec
+from pyiceberg.schema import Schema
+from pyiceberg.table.snapshots import Operation
+from pyiceberg.table.sorting import SortField, SortOrder
+from pyiceberg.transforms import IdentityTransform
+from pyiceberg.types import (DecimalType, ListType, LongType, NestedField, StringType,
+    TimestampType)
+port, key, secret = sys.argv[1:4]
+t = boto3.client("s3tables", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret)
+arn = t.create_table_bucket(name="compacted")["arn"]
+c = RestCatalog("lake", **{
+    "uri": f"http://127.0.0.1:{port}/iceberg", "warehouse": arn,
+    "rest.sigv4-enabled": "true", "rest.signing-name": "s3tables", "rest.signing-region": "us-east-1",
+    "client.access-key-id": key, "client.secret-access-key": secret, "client.region": "us-east-1",
+    "s3.endpoint": f"http://127.0.0.1:{port}", "s3.access-key-id": key,
+    "s3.secret-access-key": secret, "s3.region": "us-east-1"})
+c.create_namespace("lake")
+at = {"tableBucketARN": arn, "namespace": "lake"}
+schema = Schema(
+    NestedField(1, "id", LongType(), required=True),
+    NestedField(2, "name", StringType()),
+    NestedField(3, "at", TimestampType()),
+    NestedField(4, "price", DecimalType(10, 2)),
+    NestedField(5, "tags", ListType(7, LongType(), element_required=False)),
+    NestedField(6, "region", StringType()))
+def rows(first, region="a", n=3):
+    return pa.Table.from_pylist([{
+        "id": i, "name": None if i % 4 == 0 else f"n{i:03}",
+        "at": datetime.datetime(2026, 1, 1) + datetime.timedelta(hours=i),
+        "price": decimal.Decimal(i * 3 - 20) / 4, "tags": [i, None] if i % 2 else [],
+        "region": region} for i in range(first, first + n)], schema=schema.as_arrow())
+def configure(name, **settings):
+    status = settings.pop("status", "enabled")
+    t.put_table_maintenance_configuration(**at, name=name, type="icebergCompaction",
+        value={"status": status, "settings": {"icebergCompaction": settings}})
+def job(name):
+    return t.get_table_maintenance_job_status(**at, name=name)["status"]["icebergCompaction"]
+def ran(name, since, status="Successful"):
+    for _ in range(600):
+        j = job(name)
+        if j["status"] == status and j.get("lastRunTimestamp") and j["lastRunTimestamp"].timestamp() >= since:
+            return j
+        time.sleep(0.1)
+    raise SystemExit(f"{name}: no {status} run since {since}: {j}")
+def files(table):
+    return table.inspect.files().to_pylist()
+def table(name, *, spec=None, order=None, properties=None):
+    made = c.create_table(("lake", name), schema=schema, partition_spec=spec or PartitionSpec(),
+        sort_order=order or SortOrder(), properties=properties or {})
+    configure(name, status="disabled")
+    return made
+
+# Six small files of one table: one file, the same rows, as a replace snapshot.
+plain = table("plain")
+for i in range(6):
+    plain.append(rows(i * 3))
+before = plain.current_snapshot()
+assert len(files(plain)) == 6
+since = time.time()
+configure("plain", targetFileSizeMB=64, strategy="binpack")
+ran("plain", since)
+plain = c.load_table(("lake", "plain"))
+after = plain.current_snapshot()
+assert after.snapshot_id != before.snapshot_id, "not compacted"
+assert after.parent_snapshot_id == before.snapshot_id
+assert after.summary.operation == Operation.REPLACE, after.summary
+assert after.summary["added-data-files"] == "1" and after.summary["deleted-data-files"] == "6", after.summary
+assert after.summary["total-data-files"] == "1" and after.summary["total-records"] == "18", after.summary
+compacted = files(plain)
+assert len(compacted) == 1 and compacted[0]["record_count"] == 18, compacted
+written = compacted[0]
+assert sorted(plain.scan().to_arrow().to_pylist(), key=lambda row: row["id"]) == rows(0, n=18).to_pylist()
+# Its metrics: counts, and bounds a scan prunes by.
+metrics = written["readable_metrics"]
+assert metrics["id"]["lower_bound"] == 0 and metrics["id"]["upper_bound"] == 17, metrics["id"]
+assert metrics["name"]["null_value_count"] == 5 and metrics["name"]["value_count"] == 18, metrics["name"]
+assert metrics["name"]["lower_bound"] == "n001" and metrics["name"]["upper_bound"] == "n017", metrics["name"]
+assert metrics["price"]["lower_bound"] == decimal.Decimal("-5.00"), metrics["price"]
+assert metrics["price"]["upper_bound"] == decimal.Decimal("7.75"), metrics["price"]
+assert metrics["at"]["upper_bound"] == datetime.datetime(2026, 1, 1, 17), metrics["at"]
+assert written["split_offsets"] and dict(written["column_sizes"])[1] > 0, written
+assert len(plain.scan(row_filter="id >= 10").to_arrow()) == 8
+assert not list(plain.scan(row_filter="id > 100").plan_files())
+# Iceberg's default codec, zstd; the previous snapshot still reads as it was.
+key_of = written["file_path"].split("/", 3)[3]
+store = written["file_path"].split("/")[2]
+body = s3.get_object(Bucket=store, Key=key_of)["Body"].read()
+assert pq.ParquetFile(pa.BufferReader(body)).metadata.row_group(0).column(0).compression == "ZSTD"
+assert len(plain.scan(snapshot_id=before.snapshot_id).to_arrow()) == 18
+# One file in range of nothing more to do: no new snapshot.
+since = time.time()
+ran("plain", since)
+assert c.load_table(("lake", "plain")).current_snapshot().snapshot_id == after.snapshot_id
+
+# A partition at a time: five files of one partition rewritten, two of another not.
+parts = table("parts", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for i in range(5):
+    parts.append(rows(i * 3, "a"))
+for i in range(2):
+    parts.append(rows(100 + i * 3, "b"))
+since = time.time()
+configure("parts", targetFileSizeMB=64)
+ran("parts", since)
+parts = c.load_table(("lake", "parts"))
+by_region = sorted((f["partition"]["region"], f["record_count"]) for f in files(parts))
+assert by_region == [("a", 15), ("b", 3), ("b", 3)], by_region
+assert len(parts.scan(row_filter="region = 'a'").to_arrow()) == 15
+
+# A table with a sort order: auto would sort, which is not built.
+ordered = table("ordered", order=SortOrder(SortField(source_id=1, transform=IdentityTransform())),
+    properties={"write.parquet.compression-codec": "snappy"})
+for i in range(5):
+    ordered.append(rows(i * 3))
+since = time.time()
+configure("ordered", targetFileSizeMB=64)
+failed = ran("ordered", since, "Failed")
+assert "Sort compaction is not supported" in failed["failureMessage"], failed
+# Bin-packed when asked, with the table's codec.
+since = time.time()
+configure("ordered", targetFileSizeMB=64, strategy="binpack")
+ran("ordered", since)
+ordered = c.load_table(("lake", "ordered"))
+[one] = files(ordered)
+body = s3.get_object(Bucket=store.replace(store, one["file_path"].split("/")[2]),
+    Key=one["file_path"].split("/", 3)[3])["Body"].read()
+assert pq.ParquetFile(pa.BufferReader(body)).metadata.row_group(0).column(0).compression == "SNAPPY"
+# A codec compaction does not write: the job fails, the table as it was.
+with ordered.transaction() as tx:
+    tx.set_properties({"write.parquet.compression-codec": "lz4"})
+for i in range(5):
+    ordered.append(rows(50 + i * 3))
+current = c.load_table(("lake", "ordered")).current_snapshot().snapshot_id
+since = time.time()
+failed = ran("ordered", since, "Failed")
+assert "lz4" in failed["failureMessage"], failed
+assert c.load_table(("lake", "ordered")).current_snapshot().snapshot_id == current
+
+# Manifests that count rows the files do not hold: nothing committed.
+liar = table("liar")
+for i in range(5):
+    liar.append(rows(i * 3))
+import os, tempfile
+from pyiceberg.io.pyarrow import PyArrowFileIO
+from pyiceberg.manifest import ManifestEntry, ManifestEntryStatus, write_manifest, write_manifest_list
+snapshot = liar.current_snapshot()
+entries = [entry for manifest in snapshot.manifests(liar.io)
+    for entry in manifest.fetch_manifest_entry(liar.io, discard_deleted=True)]
+lying_id = 4242
+liar_store = liar.location().removeprefix("s3://")
+local = os.path.join(tempfile.mkdtemp(), "lying-m0.avro")
+with write_manifest(2, liar.spec(), liar.schema(), PyArrowFileIO().new_output(local), lying_id, "deflate") as writer:
+    for index, entry in enumerate(entries):
+        if index == 0:
+            entry.data_file[4] = entry.data_file.record_count + 1
+        writer.add_entry(ManifestEntry.from_args(status=ManifestEntryStatus.EXISTING, snapshot_id=entry.snapshot_id,
+            sequence_number=entry.sequence_number, file_sequence_number=entry.file_sequence_number,
+            data_file=entry.data_file))
+manifest = writer.to_manifest_file()
+manifest[0] = f"{liar.location()}/metadata/lying-m0.avro"
+s3.put_object(Bucket=liar_store, Key="metadata/lying-m0.avro", Body=open(local, "rb").read())
+sequence = liar.metadata.last_sequence_number + 1
+local_list = os.path.join(tempfile.mkdtemp(), "list.avro")
+with write_manifest_list(2, PyArrowFileIO().new_output(local_list), lying_id, snapshot.snapshot_id, sequence,
+        "deflate") as lw:
+    lw.add_manifests([manifest])
+s3.put_object(Bucket=liar_store, Key=f"metadata/snap-{lying_id}-lying.avro", Body=open(local_list, "rb").read())
+c._session.post(c.url("namespaces/lake/tables/liar", prefixed=True), json={"requirements": [], "updates": [
+    {"action": "add-snapshot", "snapshot": {"snapshot-id": lying_id, "parent-snapshot-id": snapshot.snapshot_id,
+    "sequence-number": sequence, "timestamp-ms": int(time.time() * 1000), "summary": {"operation": "append"},
+    "manifest-list": f"{liar.location()}/metadata/snap-{lying_id}-lying.avro"}},
+    {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": lying_id}]}).raise_for_status()
+since = time.time()
+configure("liar", targetFileSizeMB=64)
+failed = ran("liar", since, "Failed")
+assert "nothing was committed" in failed["failureMessage"], failed
+assert c.load_table(("lake", "liar")).current_snapshot().snapshot_id == lying_id
+
+# A partition a delete file is in: its files are left as they are (deletes
+# are not applied yet); the other partition's are compacted.
+from pyiceberg.manifest import DataFileContent, ManifestContent, ManifestWriterV2
+class DeleteWriter(ManifestWriterV2):
+    def content(self):
+        return ManifestContent.DELETES
+    @property
+    def _meta(self):
+        return {**super()._meta, "content": "deletes"}
+def add_delete(tbl, name, snapshot_id, region=None):
+    snapshot = tbl.current_snapshot()
+    data_manifests = snapshot.manifests(tbl.io)
+    [first, *_] = [entry for manifest in data_manifests
+        for entry in manifest.fetch_manifest_entry(tbl.io, discard_deleted=True)
+        if region is None or entry.data_file.partition[0] == region]
+    first.data_file[0] = DataFileContent.POSITION_DELETES
+    store = tbl.location().removeprefix("s3://")
+    local = os.path.join(tempfile.mkdtemp(), "deletes.avro")
+    with DeleteWriter(tbl.spec(), tbl.schema(), PyArrowFileIO().new_output(local), snapshot_id, "deflate") as writer:
+        writer.add_entry(ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, snapshot_id=snapshot_id,
+            sequence_number=None, file_sequence_number=None, data_file=first.data_file))
+    delete_manifest = writer.to_manifest_file()
+    delete_manifest[0] = f"{tbl.location()}/metadata/deletes.avro"
+    s3.put_object(Bucket=store, Key="metadata/deletes.avro", Body=open(local, "rb").read())
+    sequence = tbl.metadata.last_sequence_number + 1
+    local_list = os.path.join(tempfile.mkdtemp(), "list.avro")
+    with write_manifest_list(2, PyArrowFileIO().new_output(local_list), snapshot_id, snapshot.snapshot_id,
+            sequence, "deflate") as lw:
+        lw.add_manifests([*data_manifests, delete_manifest])
+    s3.put_object(Bucket=store, Key=f"metadata/snap-{snapshot_id}.avro", Body=open(local_list, "rb").read())
+    c._session.post(c.url(f"namespaces/lake/tables/{name}", prefixed=True), json={"requirements": [],
+        "updates": [{"action": "add-snapshot", "snapshot": {"snapshot-id": snapshot_id,
+        "parent-snapshot-id": snapshot.snapshot_id, "sequence-number": sequence,
+        "timestamp-ms": int(time.time() * 1000), "summary": {"operation": "delete"},
+        "manifest-list": f"{tbl.location()}/metadata/snap-{snapshot_id}.avro"}},
+        {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot_id}]}
+        ).raise_for_status()
+deleted = table("deleted", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for region in ["a", "b"]:
+    for i in range(5):
+        deleted.append(rows(i * 3, region))
+add_delete(deleted, "deleted", 77, "a")
+since = time.time()
+configure("deleted", targetFileSizeMB=64)
+ran("deleted", since)
+deleted = c.load_table(("lake", "deleted"))
+assert deleted.current_snapshot().summary.operation == Operation.REPLACE
+kept = sorted((entry.data_file.partition[0], entry.data_file.content)
+    for manifest in deleted.current_snapshot().manifests(deleted.io)
+    for entry in manifest.fetch_manifest_entry(deleted.io, discard_deleted=True))
+assert kept == [("a", DataFileContent.DATA)] * 5 + [("a", DataFileContent.POSITION_DELETES),
+    ("b", DataFileContent.DATA)], kept
+# A delete file of an unpartitioned spec may apply to any file: none is
+# compacted.
+anywhere = table("anywhere")
+for i in range(5):
+    anywhere.append(rows(i * 3))
+add_delete(anywhere, "anywhere", 78)
+since = time.time()
+configure("anywhere", targetFileSizeMB=64)
+ran("anywhere", since)
+assert c.load_table(("lake", "anywhere")).current_snapshot().snapshot_id == 78
+# One of a spec that was unpartitioned may apply to the files of a later,
+# partitioned spec too: none is compacted.
+evolved = table("evolved")
+evolved.append(rows(0))
+add_delete(evolved, "evolved", 79)
+evolved = c.load_table(("lake", "evolved"))
+with evolved.update_spec() as update:
+    update.add_identity("region")
+for i in range(5):
+    evolved.append(rows(10 + i * 3))
+current = c.load_table(("lake", "evolved")).current_snapshot().snapshot_id
+since = time.time()
+configure("evolved", targetFileSizeMB=64)
+ran("evolved", since)
+assert c.load_table(("lake", "evolved")).current_snapshot().snapshot_id == current
+
+# A manifest compaction wrote holds the deleted entries of the files it
+# rewrote: written again by a later compaction, they stay deleted.
+pruned = table("pruned", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+pruned.append(pa.concat_tables([rows(0, "a"), rows(100, "b")]))
+added_by = pruned.current_snapshot().snapshot_id
+for i in range(1, 5):
+    pruned.append(rows(i * 3, "a"))
+since = time.time()
+configure("pruned", targetFileSizeMB=64)
+ran("pruned", since)
+configure("pruned", status="disabled")
+pruned = c.load_table(("lake", "pruned"))
+mixed = [[entry.status for entry in manifest.fetch_manifest_entry(pruned.io, discard_deleted=False)]
+    for manifest in pruned.current_snapshot().manifests(pruned.io)]
+assert any(ManifestEntryStatus.DELETED in statuses and ManifestEntryStatus.EXISTING in statuses
+    for statuses in mixed), mixed
+# The file kept keeps the snapshot that added it.
+[kept_b] = [entry for entry in pruned.inspect.entries().to_pylist()
+    if entry["status"] == 0 and entry["data_file"]["partition"]["region"] == "b"]
+assert kept_b["snapshot_id"] == added_by, kept_b
+for i in range(1, 5):
+    pruned.append(rows(100 + i * 3, "b"))
+first = c.load_table(("lake", "pruned")).current_snapshot().snapshot_id
+since = time.time()
+configure("pruned", targetFileSizeMB=64)
+ran("pruned", since)
+pruned = c.load_table(("lake", "pruned"))
+assert pruned.current_snapshot().snapshot_id != first
+assert sorted(row["id"] for row in pruned.scan().to_arrow().to_pylist()) == list(range(15)) + list(range(100, 115))
+assert sorted((f["partition"]["region"], f["record_count"]) for f in files(pruned)) == [("a", 15), ("b", 15)]
+
+# A file already about the target's size is left as it is; the small ones
+# around it are compacted.
+import base64, os as _os
+ranged = table("ranged", properties={"write.parquet.compression-codec": "zstd"})
+for i in range(5):
+    ranged.append(rows(i * 3))
+big = rows(1000, n=48).to_pylist()
+for row in big:
+    row["name"] = base64.b64encode(_os.urandom(1 << 20)).decode()
+ranged.append(pa.Table.from_pylist(big, schema=schema.as_arrow()))
+big_file = max(files(ranged), key=lambda f: f["file_size_in_bytes"])
+assert 48 << 20 <= big_file["file_size_in_bytes"] <= 115 << 20, big_file["file_size_in_bytes"]
+since = time.time()
+configure("ranged", targetFileSizeMB=64)
+ran("ranged", since)
+ranged = c.load_table(("lake", "ranged"))
+after = sorted((f["file_path"] == big_file["file_path"], f["record_count"]) for f in files(ranged))
+assert after == [(False, 15), (True, 48)], after
+
+# A table whose metadata is of format version 1: not compacted.
+old = table("old")
+for i in range(5):
+    old.append(rows(i * 3))
+where = t.get_table_metadata_location(**at, name="old")
+old_store = old.location().removeprefix("s3://")
+metadata = json.loads(s3.get_object(Bucket=old_store, Key=where["metadataLocation"].split("/", 3)[3])["Body"].read())
+metadata["format-version"] = 1
+s3.put_object(Bucket=old_store, Key="metadata/99999-v1.metadata.json", Body=json.dumps(metadata).encode())
+t.update_table_metadata_location(**at, name="old", versionToken=where["versionToken"],
+    metadataLocation=f"{old.location()}/metadata/99999-v1.metadata.json")
+since = time.time()
+configure("old", targetFileSizeMB=64)
+failed = ran("old", since, "Failed")
+assert "format version 2" in failed["failureMessage"], failed
 print("ok")
 "#;

@@ -18,7 +18,7 @@ use truthdb_object::{NamespaceInfo, TableBucketInfo, TableError, TableInfo};
 use crate::error::S3Error;
 use crate::server::{Body, Connection, S3State, full};
 
-mod iceberg;
+pub(super) mod iceberg;
 pub(crate) mod maintenance;
 
 /// The largest request body (S3 Tables' are small JSON documents).
@@ -152,7 +152,7 @@ pub async fn handle(state: &S3State, request: Request<Incoming>) -> Response<Bod
 }
 
 /// A random id, formatted as a UUID.
-fn uuid() -> String {
+pub(crate) fn uuid() -> String {
     let mut bytes = [0u8; 16];
     ring::rand::SystemRandom::new()
         .fill(&mut bytes)
@@ -867,15 +867,22 @@ async fn serve(
                 match (method, rest) {
                     (&Method::GET, ["maintenance"]) => {
                         let (looked, id) = (bucket.clone(), id.clone());
-                        let stored = read(state, move |file| {
-                            file.maintenance(
-                                (&account, &looked),
-                                Some(&id),
-                                (
-                                    truthdb_object::MaintenanceRecord::Configuration,
-                                    maintenance::SNAPSHOT_MANAGEMENT,
-                                ),
-                            )
+                        let (compaction, snapshots) = read(state, move |file| {
+                            let of = |kind| {
+                                (truthdb_object::MaintenanceRecord::Configuration, kind)
+                            };
+                            Ok((
+                                file.maintenance(
+                                    (&account, &looked),
+                                    Some(&id),
+                                    of(maintenance::COMPACTION),
+                                )?,
+                                file.maintenance(
+                                    (&account, &looked),
+                                    Some(&id),
+                                    of(maintenance::SNAPSHOT_MANAGEMENT),
+                                )?,
+                            ))
                         })
                         .await?;
                         Ok((
@@ -883,8 +890,10 @@ async fn serve(
                             Some(json!({
                                 "tableARN": table_arn,
                                 "configuration": {
+                                    maintenance::COMPACTION:
+                                        maintenance::configuration(maintenance::COMPACTION, compaction.as_deref()),
                                     maintenance::SNAPSHOT_MANAGEMENT:
-                                        maintenance::configuration(maintenance::SNAPSHOT_MANAGEMENT, stored.as_deref()),
+                                        maintenance::configuration(maintenance::SNAPSHOT_MANAGEMENT, snapshots.as_deref()),
                                 },
                             })),
                         ))
@@ -907,11 +916,16 @@ async fn serve(
                     }
                     (&Method::GET, ["maintenance-job-status"]) => {
                         let (looked, id) = (bucket.clone(), id.clone());
-                        let (snapshots, files) = read(state, move |file| {
+                        let (compaction, snapshots, files) = read(state, move |file| {
                             let of = |kind| {
                                 (truthdb_object::MaintenanceRecord::JobStatus, kind)
                             };
                             Ok((
+                                file.maintenance(
+                                    (&account, &looked),
+                                    Some(&id),
+                                    of(maintenance::COMPACTION),
+                                )?,
                                 file.maintenance(
                                     (&account, &looked),
                                     Some(&id),
@@ -930,6 +944,8 @@ async fn serve(
                             Some(json!({
                                 "tableARN": table_arn,
                                 "status": {
+                                    maintenance::COMPACTION:
+                                        maintenance::job_status(compaction.as_deref()),
                                     maintenance::SNAPSHOT_MANAGEMENT:
                                         maintenance::job_status(snapshots.as_deref()),
                                     maintenance::UNREFERENCED_FILE_REMOVAL:
