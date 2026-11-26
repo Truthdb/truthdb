@@ -175,7 +175,7 @@ pub(super) async fn compact(
             let partition = get(file, &file_ids, 102).cloned().unwrap_or(Avro::Null);
             if content != 0 {
                 global_deletes |= unpartitioned.contains(&i64::from(manifest.spec));
-                deleted_in.insert((manifest.spec, format!("{partition:?}")));
+                deleted_in.insert((manifest.spec, partition_key(&partition)));
                 continue;
             }
             let format = text(get(file, &file_ids, 101)).unwrap_or_default();
@@ -206,7 +206,7 @@ pub(super) async fn compact(
     let mut partitions: BTreeMap<(i32, String), Vec<usize>> = BTreeMap::new();
     for (at, file) in data.iter().enumerate() {
         let spec = manifests[file.manifest].spec;
-        let partition = format!("{:?}", file.partition);
+        let partition = partition_key(&file.partition);
         let size = file.size.max(0) as u64;
         if global_deletes
             || deleted_in.contains(&(spec, partition.clone()))
@@ -296,6 +296,40 @@ pub(super) async fn compact(
         remove(state, &warehouse, &stored_keys(&written), now).await;
     }
     outcome
+}
+
+/// A partition's value as compared: its values as stored, whatever Avro
+/// logical type (or none) a manifest's writer gave them, so a delete file
+/// written by one writer matches the data files another wrote.
+fn partition_key(value: &Avro) -> String {
+    fn physical(value: &Avro) -> Avro {
+        match value {
+            Avro::Union(_, inner) => physical(inner),
+            Avro::Record(fields) => Avro::Record(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), physical(value)))
+                    .collect(),
+            ),
+            Avro::Date(value) | Avro::TimeMillis(value) => Avro::Int(*value),
+            Avro::TimeMicros(value)
+            | Avro::TimestampMillis(value)
+            | Avro::TimestampMicros(value)
+            | Avro::TimestampNanos(value)
+            | Avro::LocalTimestampMillis(value)
+            | Avro::LocalTimestampMicros(value)
+            | Avro::LocalTimestampNanos(value) => Avro::Long(*value),
+            Avro::Fixed(_, bytes) => Avro::Bytes(bytes.clone()),
+            Avro::Decimal(decimal) => match Vec::<u8>::try_from(decimal) {
+                Ok(bytes) => Avro::Bytes(bytes),
+                Err(_) => value.clone(),
+            },
+            Avro::Uuid(uuid) => Avro::String(uuid.to_string()),
+            Avro::Enum(_, symbol) => Avro::String(symbol.clone()),
+            other => other.clone(),
+        }
+    }
+    format!("{:?}", physical(value))
 }
 
 /// The sizes of data files `files` together (a size a manifest gives as
@@ -1408,6 +1442,27 @@ mod tests {
         assert_eq!(rows, 30_000);
         drop(storage);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_partition_is_compared_by_its_values_whatever_their_logical_types() {
+        let record = |value: Avro| Avro::Record(vec![("day".to_string(), value)]);
+        assert_eq!(
+            partition_key(&record(Avro::Union(1, Box::new(Avro::Date(20000))))),
+            partition_key(&record(Avro::Int(20000)))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::TimestampMicros(7))),
+            partition_key(&record(Avro::Union(1, Box::new(Avro::Long(7)))))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::Fixed(2, vec![1, 2]))),
+            partition_key(&record(Avro::Bytes(vec![1, 2])))
+        );
+        assert_ne!(
+            partition_key(&record(Avro::Int(1))),
+            partition_key(&record(Avro::Int(2)))
+        );
     }
 
     #[test]
