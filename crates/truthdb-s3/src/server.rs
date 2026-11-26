@@ -340,6 +340,21 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
             Some(err.message),
         ),
     };
+    // Made through an access point: for its bucket, which the name the
+    // request gave (the access point's) was read as above.
+    let through = seen.through();
+    let (mut call, mut data, mut metered, mut cross_origin) = (call, data, metered, cross_origin);
+    if let Some((bucket, arn)) = &through {
+        for event in [&mut call, &mut data].into_iter().flatten() {
+            event.through(bucket, arn);
+        }
+        if let Some(metered) = &mut metered {
+            metered.bucket = bucket.clone();
+        }
+        if let Some((named, _, _)) = &mut cross_origin {
+            *named = bucket.clone();
+        }
+    }
     if let Some(call) = &call {
         state.activity.record(
             state,
@@ -389,6 +404,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 &metered.bucket,
                 metered.key.as_deref(),
                 seen.owner().as_deref(),
+                through.as_ref().map(|(_, arn)| arn.as_str()),
             )
             .await;
         let history = (!series.is_empty()).then(|| {
@@ -436,6 +452,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                     turnaround_ms: first_byte.as_millis() as u64,
                     signed,
                     auth_type,
+                    access_point: through.as_ref().map(|(_, arn)| arn.clone()),
                     request,
                 },
             ));
@@ -560,6 +577,8 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
     // A CORS preflight: answered from the bucket's configuration, before
     // (and without) any authentication, as a browser sends it.
     if request.method() == hyper::Method::OPTIONS {
+        // Through an access point: its bucket's configuration.
+        crate::access_points::resolve(state, &mut request, None).await?;
         return crate::cors::preflight(state, &request).await;
     }
     // A form upload (POST Object) carries its signature in the form.

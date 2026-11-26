@@ -160,13 +160,22 @@ pub(crate) fn finished(downloaded: u64, total: Duration) -> MetricPoint {
 }
 
 /// Whether a request for `key` (none: the bucket's own), of an object with
-/// `tags`, is one a configuration counts.
-fn counts(config: &MetricsConfig, key: Option<&str>, tags: &[(String, String)]) -> bool {
+/// `tags`, made through the access point of ARN `through` (if any), is one
+/// a configuration counts. A filter on an access point counts only the
+/// requests through it on single objects ("only requests that operate on
+/// single objects can match the filter").
+fn counts(
+    config: &MetricsConfig,
+    key: Option<&str>,
+    tags: &[(String, String)],
+    through: Option<&str>,
+) -> bool {
     let Some(filter) = &config.filter else {
         return true;
     };
-    // Requests through access points: there are none.
-    if filter.access_point.is_some() {
+    if let Some(point) = &filter.access_point
+        && (key.is_none() || through != Some(point.as_str()))
+    {
         return false;
     }
     if let Some(prefix) = &filter.prefix
@@ -301,6 +310,7 @@ impl MetricRecorder {
         bucket: &str,
         key: Option<&str>,
         owner: Option<&str>,
+        through: Option<&str>,
     ) -> Matched {
         let loaded = self.configs(state, bucket).await;
         let configs = &loaded.configs;
@@ -335,7 +345,7 @@ impl MetricRecorder {
             made_ms: loaded.made_ms,
             series: configs
                 .iter()
-                .filter(|config| counts(config, key, &tags))
+                .filter(|config| counts(config, key, &tags, through))
                 .map(|config| MetricSeries {
                     bucket: bucket.to_string(),
                     by: SeriesBy::Filter(config.id.clone()),
@@ -542,14 +552,14 @@ mod tests {
             filter,
         };
         let tag = |key: &str, value: &str| (key.to_string(), value.to_string());
-        assert!(counts(&config(None), None, &[]));
+        assert!(counts(&config(None), None, &[], None));
         let docs = config(Some(MetricsFilter {
             prefix: Some("docs/".to_string()),
             ..MetricsFilter::default()
         }));
-        assert!(counts(&docs, Some("docs/a"), &[]));
-        assert!(!counts(&docs, Some("img/a"), &[]));
-        assert!(!counts(&docs, None, &[]));
+        assert!(counts(&docs, Some("docs/a"), &[], None));
+        assert!(!counts(&docs, Some("img/a"), &[], None));
+        assert!(!counts(&docs, None, &[], None));
         let blue = config(Some(MetricsFilter {
             prefix: Some("docs/".to_string()),
             tags: vec![tag("class", "blue")],
@@ -558,14 +568,33 @@ mod tests {
         assert!(counts(
             &blue,
             Some("docs/a"),
-            &[tag("class", "blue"), tag("x", "y")]
+            &[tag("class", "blue"), tag("x", "y")],
+            None
         ));
-        assert!(!counts(&blue, Some("docs/a"), &[tag("class", "red")]));
+        assert!(!counts(&blue, Some("docs/a"), &[tag("class", "red")], None));
+        let arn = "arn:aws:s3:us-east-1:1:accesspoint/a";
         let point = config(Some(MetricsFilter {
-            access_point: Some("arn:aws:s3:us-east-1:1:accesspoint/a".to_string()),
+            access_point: Some(arn.to_string()),
             ..MetricsFilter::default()
         }));
-        assert!(!counts(&point, Some("a"), &[]));
+        assert!(counts(&point, Some("a"), &[], Some(arn)));
+        // Not directly, nor through another, nor on the bucket.
+        assert!(!counts(&point, Some("a"), &[], None));
+        assert!(!counts(
+            &point,
+            Some("a"),
+            &[],
+            Some("arn:aws:s3:us-east-1:1:accesspoint/b")
+        ));
+        assert!(!counts(&point, None, &[], Some(arn)));
+        // With a prefix: both.
+        let docs_through = config(Some(MetricsFilter {
+            prefix: Some("docs/".to_string()),
+            access_point: Some(arn.to_string()),
+            ..MetricsFilter::default()
+        }));
+        assert!(counts(&docs_through, Some("docs/a"), &[], Some(arn)));
+        assert!(!counts(&docs_through, Some("img/a"), &[], Some(arn)));
     }
 
     #[test]

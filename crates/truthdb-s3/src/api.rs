@@ -382,6 +382,12 @@ pub async fn dispatch(
         .extensions()
         .get::<crate::access_points::Via>()
         .cloned();
+    // What the request's metrics, log line and events count it for.
+    if let Some(via) = &via
+        && let Some(seen) = crate::metering::seen_of(&request)
+    {
+        seen.mark_through(&via.point.bucket, &via.arn(&state.region));
+    }
     if via.is_some() && !crate::access_points::allowed(&request, &target, &method) {
         return Err(S3Error::invalid_request(
             "This operation is not supported through an access point",

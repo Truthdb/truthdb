@@ -148,6 +148,8 @@ pub(crate) struct Entry {
     /// (none: anonymous, or a form upload).
     pub signed: bool,
     pub auth_type: Option<&'static str>,
+    /// The ARN of the access point it was made through.
+    pub access_point: Option<String>,
     pub request: Request,
 }
 
@@ -198,7 +200,7 @@ impl Entry {
             dash(self.auth_type),
             sent_text(request.host.as_deref()),
             "-".to_string(),
-            "-".to_string(),
+            dash(self.access_point.as_deref()),
             "-".to_string(),
             "-".to_string(),
         ];
@@ -580,6 +582,7 @@ mod tests {
             turnaround_ms: 0,
             signed: false,
             auth_type: None,
+            access_point: None,
             request: Request {
                 operation: "REST.GET.BUCKET".into(),
                 request_uri: "x".repeat(uri_bytes),

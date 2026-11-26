@@ -102,6 +102,8 @@ pub(crate) struct Call {
     /// (a refused call's may be another's), and its access point (its
     /// name; none: ListAccessPoints) and query parameters.
     control: Option<ControlCall>,
+    /// The ARN of the access point the request was made through.
+    through: Option<String>,
     host: Option<String>,
     user_agent: Option<String>,
     source_ip: Option<String>,
@@ -109,6 +111,14 @@ pub(crate) struct Call {
 }
 
 impl Call {
+    /// This event for a request made through the access point of ARN `arn`,
+    /// on its bucket `bucket` (the name the request gave was the access
+    /// point's).
+    pub(crate) fn through(&mut self, bucket: &str, arn: &str) {
+        self.bucket = Some(bucket.to_string());
+        self.through = Some(arn.to_string());
+    }
+
     /// The management event `request` makes, if it is one.
     pub(crate) fn of(request: &hyper::Request<Incoming>) -> Option<Call> {
         if request
@@ -263,6 +273,7 @@ impl Call {
             source: None,
             express,
             control: None,
+            through: None,
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
@@ -615,6 +626,14 @@ fn record(
             }
             if let Some(source) = &call.source {
                 resources.insert(1, source_resource(state, source, source_owner, account));
+            }
+            // And the access point it was made through.
+            if let Some(arn) = &call.through {
+                resources.push(json!({
+                    "accountId": arn.split(':').nth(4).unwrap_or(""),
+                    "type": "AWS::S3::AccessPoint",
+                    "ARN": arn,
+                }));
             }
             record["resources"] = json!(resources);
         }
