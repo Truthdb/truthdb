@@ -193,10 +193,11 @@ pub fn validate_bucket_name(name: &str) -> Result<(), BucketError> {
     }
     // Not AWS's rule: here access point hosts share the buckets' domains
     // (`<name>-<account>.s3-accesspoint.<region>.<domain>`), so a bucket's
-    // virtual host must not be one.
-    if name.contains(".s3-accesspoint.") {
+    // virtual host must not be one (under any of the domains, which may
+    // include `<region>.<domain>`).
+    if name.contains(".s3-accesspoint.") || name.ends_with(".s3-accesspoint") {
         return Err(BucketError::InvalidName(
-            "must not contain \".s3-accesspoint.\"",
+            "must not have an \"s3-accesspoint\" label",
         ));
     }
     Ok(())
@@ -559,6 +560,7 @@ mod tests {
             "xn--bucket",
             "bucket-s3alias",
             "reader-111111111111.s3-accesspoint.us-east-1",
+            "reader-111111111111.s3-accesspoint",
         ] {
             assert!(validate_bucket_name(bad).is_err(), "{bad}");
         }
