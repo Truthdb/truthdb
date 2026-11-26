@@ -447,10 +447,26 @@ fn path_bounds(lower: Option<&Avro>, upper: Option<&Avro>) -> Option<String> {
         .flatten()
 }
 
-/// A partition's value as compared: its values as stored, whatever Avro
-/// logical type (or none) a manifest's writer gave them, so a delete file
-/// written by one writer matches the data files another wrote.
+/// A partition's value as compared: by value, whatever Avro logical type
+/// (or none) a manifest's writer gave it, and whatever type a promotion
+/// since made it (an int a long, a float a double, a decimal of more
+/// precision: its manifests before and after hold it as either). So a
+/// delete file written by one writer, or after a promotion, matches the
+/// data files another wrote, or before it.
 fn partition_key(value: &Avro) -> String {
+    /// A two's-complement big-endian number in its fewest bytes (a fixed
+    /// value's length is its field's, so among one field's values this
+    /// is one-to-one).
+    fn fewest(bytes: &[u8]) -> Vec<u8> {
+        let mut start = 0;
+        while start + 1 < bytes.len()
+            && ((bytes[start] == 0 && bytes[start + 1] & 0x80 == 0)
+                || (bytes[start] == 0xff && bytes[start + 1] & 0x80 != 0))
+        {
+            start += 1;
+        }
+        bytes[start..].to_vec()
+    }
     fn physical(value: &Avro) -> Avro {
         match value {
             Avro::Union(_, inner) => physical(inner),
@@ -460,7 +476,10 @@ fn partition_key(value: &Avro) -> String {
                     .map(|(name, value)| (name.clone(), physical(value)))
                     .collect(),
             ),
-            Avro::Date(value) | Avro::TimeMillis(value) => Avro::Int(*value),
+            Avro::Int(value) | Avro::Date(value) | Avro::TimeMillis(value) => {
+                Avro::Long(i64::from(*value))
+            }
+            Avro::Float(value) => Avro::Double(f64::from(*value)),
             Avro::TimeMicros(value)
             | Avro::TimestampMillis(value)
             | Avro::TimestampMicros(value)
@@ -468,9 +487,9 @@ fn partition_key(value: &Avro) -> String {
             | Avro::LocalTimestampMillis(value)
             | Avro::LocalTimestampMicros(value)
             | Avro::LocalTimestampNanos(value) => Avro::Long(*value),
-            Avro::Fixed(_, bytes) => Avro::Bytes(bytes.clone()),
+            Avro::Fixed(_, bytes) => Avro::Fixed(0, fewest(bytes)),
             Avro::Decimal(decimal) => match Vec::<u8>::try_from(decimal) {
-                Ok(bytes) => Avro::Bytes(bytes),
+                Ok(bytes) => Avro::Fixed(0, fewest(&bytes)),
                 Err(_) => value.clone(),
             },
             Avro::Uuid(uuid) => Avro::String(uuid.to_string()),
@@ -1990,9 +2009,32 @@ mod tests {
             partition_key(&record(Avro::TimestampMicros(7))),
             partition_key(&record(Avro::Union(1, Box::new(Avro::Long(7)))))
         );
+        // A promoted partition source: an int then a long, a float then a
+        // double, a decimal of more precision (a longer fixed).
         assert_eq!(
-            partition_key(&record(Avro::Fixed(2, vec![1, 2]))),
-            partition_key(&record(Avro::Bytes(vec![1, 2])))
+            partition_key(&record(Avro::Int(7))),
+            partition_key(&record(Avro::Union(1, Box::new(Avro::Long(7)))))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::Float(1.5))),
+            partition_key(&record(Avro::Double(1.5)))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::Fixed(2, vec![0x00, 0x05]))),
+            partition_key(&record(Avro::Fixed(4, vec![0x00, 0x00, 0x00, 0x05])))
+        );
+        assert_eq!(
+            partition_key(&record(Avro::Fixed(2, vec![0xff, 0xfb]))),
+            partition_key(&record(Avro::Fixed(3, vec![0xff, 0xff, 0xfb])))
+        );
+        assert_ne!(
+            partition_key(&record(Avro::Fixed(2, vec![0x00, 0x05]))),
+            partition_key(&record(Avro::Fixed(2, vec![0xff, 0x05])))
+        );
+        // Binary is compared as it is.
+        assert_ne!(
+            partition_key(&record(Avro::Bytes(vec![0x00, 0x05]))),
+            partition_key(&record(Avro::Bytes(vec![0x05])))
         );
         assert_ne!(
             partition_key(&record(Avro::Int(1))),

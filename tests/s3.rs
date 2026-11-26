@@ -19836,6 +19836,30 @@ evolved = c.load_table(("lake", "evolved"))
 assert sorted(f["record_count"] for f in files(evolved)) == [3, 15], files(evolved)
 assert sorted(row["id"] for row in evolved.scan().to_arrow().to_pylist()) == [0, 2] + list(range(10, 25))
 
+# A partition source promoted from int to long: the manifests before hold
+# the partition as an int, the delete's after as a long; it is still the
+# files' partition, so the delete is applied.
+from pyiceberg.types import IntegerType
+promoted = c.create_table(("lake", "promoted"), schema=Schema(NestedField(1, "id", LongType()),
+    NestedField(2, "p", IntegerType())), partition_spec=PartitionSpec(
+    PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="p")))
+configure("promoted", status="disabled")
+for i in range(5):
+    promoted.append(pa.table({"id": pa.array(range(i * 3, i * 3 + 3), pa.int64()), "p": pa.array([7] * 3, pa.int32())}))
+with promoted.update_schema() as update:
+    update.update_column("p", LongType())
+promoted = c.load_table(("lake", "promoted"))
+[first, *_] = sorted(data_files(promoted), key=lambda f: f.file_path)
+promoted = add_deletes(promoted, "promoted", 90, [positions(promoted, first.partition, [(first.file_path, [0, 2])])])
+expected = sorted(row["id"] for row in promoted.scan().to_arrow().to_pylist())
+assert len(expected) == 13, expected
+since = time.time()
+configure("promoted", targetFileSizeMB=64)
+ran("promoted", since)
+promoted = c.load_table(("lake", "promoted"))
+assert promoted.current_snapshot().summary.operation == Operation.REPLACE
+assert sorted(row["id"] for row in promoted.scan().to_arrow().to_pylist()) == expected
+
 # Iceberg's delete ratio: a single file whose file-scoped position deletes
 # delete 30% of its rows is rewritten without them; at 20% it is not.
 # One whose deletes name another file is not this file's.
