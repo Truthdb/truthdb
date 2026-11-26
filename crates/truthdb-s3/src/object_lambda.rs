@@ -142,14 +142,18 @@ impl Configuration {
             _ => format!("{root}/Configuration/"),
         };
         let mut supporting = None;
-        let mut metrics = false;
+        let mut metrics = None;
         let mut features: Vec<String> = Vec::new();
         let mut transformations: Vec<Transformation> = Vec::new();
         let mut seen_configuration = root == "Configuration";
         const TRANSFORMATION: &str = "TransformationConfigurations/TransformationConfiguration";
-        for (path, text) in &elements[1..] {
-            let text = text.trim();
+        for (path, raw) in &elements[1..] {
+            // The payload is the caller's own data, kept as given.
+            let text = raw.trim();
             if path.as_str() == format!("{root}/Configuration") {
+                if seen_configuration {
+                    return Err(malformed());
+                }
                 seen_configuration = true;
                 continue;
             }
@@ -157,13 +161,15 @@ impl Configuration {
                 return Err(malformed());
             };
             match field {
-                "SupportingAccessPoint" => supporting = Some(text.to_string()),
-                "CloudWatchMetricsEnabled" => {
-                    metrics = match text.to_ascii_lowercase().as_str() {
+                "SupportingAccessPoint" if supporting.is_none() => {
+                    supporting = Some(text.to_string());
+                }
+                "CloudWatchMetricsEnabled" if metrics.is_none() => {
+                    metrics = Some(match text.to_ascii_lowercase().as_str() {
                         "true" => true,
                         "false" => false,
                         _ => return Err(malformed()),
-                    }
+                    });
                 }
                 "AllowedFeatures" | "TransformationConfigurations" => {}
                 "AllowedFeatures/AllowedFeature" => {
@@ -191,11 +197,15 @@ impl Configuration {
                         "Actions" | "ContentTransformation" | "ContentTransformation/AwsLambda" => {
                         }
                         "Actions/Action" => transformation.actions.push(text.to_string()),
-                        "ContentTransformation/AwsLambda/FunctionArn" => {
+                        "ContentTransformation/AwsLambda/FunctionArn"
+                            if transformation.function_arn.is_empty() =>
+                        {
                             transformation.function_arn = text.to_string();
                         }
-                        "ContentTransformation/AwsLambda/FunctionPayload" => {
-                            transformation.payload = Some(text.to_string());
+                        "ContentTransformation/AwsLambda/FunctionPayload"
+                            if transformation.payload.is_none() =>
+                        {
+                            transformation.payload = Some(raw.clone());
                         }
                         _ => return Err(malformed()),
                     }
@@ -237,7 +247,7 @@ impl Configuration {
         }
         Ok(Configuration {
             supporting,
-            metrics,
+            metrics: metrics.unwrap_or(false),
             features,
             transformations,
         })
@@ -745,6 +755,21 @@ mod tests {
             }
         );
         let rendered = parsed.render();
+        // A payload kept as given, its spaces and its special characters.
+        let spaced = request(&format!(
+            "{SUPPORTING}<TransformationConfigurations><TransformationConfiguration><Actions><Action>GetObject</Action></Actions><ContentTransformation><AwsLambda><FunctionArn>shape</FunctionArn><FunctionPayload> &lt;a&gt; &amp; \"b\"\n</FunctionPayload></AwsLambda></ContentTransformation></TransformationConfiguration></TransformationConfigurations>"
+        ));
+        let spaced =
+            Configuration::parse(spaced.as_bytes(), "CreateAccessPointForObjectLambdaRequest")
+                .unwrap();
+        assert_eq!(
+            spaced.transformations[0].payload.as_deref(),
+            Some(" <a> & \"b\"\n")
+        );
+        assert_eq!(
+            Configuration::parse(spaced.render().as_bytes(), "Configuration").unwrap(),
+            spaced
+        );
         assert_eq!(
             Configuration::parse(rendered.as_bytes(), "Configuration").unwrap(),
             parsed
@@ -811,6 +836,39 @@ mod tests {
                 "{why}"
             );
         }
+        // Given twice.
+        let arn = "<FunctionArn>shape</FunctionArn>";
+        for twice in [
+            format!("{SUPPORTING}{SUPPORTING}{shape}"),
+            format!(
+                "{SUPPORTING}<CloudWatchMetricsEnabled>true</CloudWatchMetricsEnabled><CloudWatchMetricsEnabled>false</CloudWatchMetricsEnabled>{shape}"
+            ),
+            format!(
+                "{SUPPORTING}<TransformationConfigurations><TransformationConfiguration><Actions><Action>GetObject</Action></Actions><ContentTransformation><AwsLambda>{arn}{arn}</AwsLambda></ContentTransformation></TransformationConfiguration></TransformationConfigurations>"
+            ),
+            format!(
+                "{SUPPORTING}<TransformationConfigurations><TransformationConfiguration><Actions><Action>GetObject</Action></Actions><ContentTransformation><AwsLambda>{arn}<FunctionPayload>a</FunctionPayload><FunctionPayload>b</FunctionPayload></AwsLambda></ContentTransformation></TransformationConfiguration></TransformationConfigurations>"
+            ),
+        ] {
+            assert!(
+                Configuration::parse(
+                    request(&twice).as_bytes(),
+                    "CreateAccessPointForObjectLambdaRequest"
+                )
+                .is_err(),
+                "{twice}"
+            );
+        }
+        let two_configurations = format!(
+            "<CreateAccessPointForObjectLambdaRequest><Configuration>{SUPPORTING}{shape}</Configuration><Configuration><CloudWatchMetricsEnabled>true</CloudWatchMetricsEnabled></Configuration></CreateAccessPointForObjectLambdaRequest>"
+        );
+        assert!(
+            Configuration::parse(
+                two_configurations.as_bytes(),
+                "CreateAccessPointForObjectLambdaRequest"
+            )
+            .is_err()
+        );
         // Two transformations of one action.
         let twice = format!(
             "{SUPPORTING}<TransformationConfigurations><TransformationConfiguration><Actions><Action>GetObject</Action></Actions><ContentTransformation><AwsLambda><FunctionArn>a</FunctionArn></AwsLambda></ContentTransformation></TransformationConfiguration><TransformationConfiguration><Actions><Action>GetObject</Action></Actions><ContentTransformation><AwsLambda><FunctionArn>b</FunctionArn></AwsLambda></ContentTransformation></TransformationConfiguration></TransformationConfigurations>"
