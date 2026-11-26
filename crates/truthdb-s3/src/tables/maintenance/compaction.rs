@@ -145,9 +145,10 @@ pub(super) async fn compact(
     // order, and bin-packs one that does not; "sort" and "z-order" need one.
     let order = match strategy {
         "binpack" => None,
-        "auto" if !sorted(&base) => None,
-        _ => match order::table_order(&base)? {
-            Some((_, fields)) if strategy == "z-order" => {
+        _ => match (strategy, order::table_order(&base)?) {
+            ("auto", None) => None,
+            (_, None) => return Err(NO_SORT_ORDER.to_string()),
+            ("z-order", Some((_, fields))) => {
                 let mut columns: Vec<i32> = Vec::new();
                 for field in fields {
                     if !columns.contains(&field.source) {
@@ -156,8 +157,7 @@ pub(super) async fn compact(
                 }
                 Some(order::Order::ZOrder(columns))
             }
-            Some((id, fields)) => Some(order::Order::Sort(id, fields)),
-            None => return Err(NO_SORT_ORDER.to_string()),
+            (_, Some((id, fields))) => Some(order::Order::Sort(id, fields)),
         },
     };
     let Some(current) = base["current-snapshot-id"].as_i64().filter(|id| *id != -1) else {
@@ -648,18 +648,6 @@ fn stored_keys(written: &[Output]) -> Vec<(String, u64)> {
         .iter()
         .map(|output| (output.key.clone(), output.version))
         .collect()
-}
-
-/// Whether the table's default sort order sorts by anything.
-fn sorted(metadata: &Value) -> bool {
-    let id = metadata["default-sort-order-id"].as_i64();
-    metadata["sort-orders"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|order| order["order-id"].as_i64() == id)
-        .and_then(|order| order["fields"].as_array())
-        .is_some_and(|fields| !fields.is_empty())
 }
 
 fn text(value: Option<&Avro>) -> Option<&str> {

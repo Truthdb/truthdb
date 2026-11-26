@@ -103,6 +103,10 @@ pub(super) fn table_order(metadata: &Value) -> Result<Option<(i64, Vec<SortField
             .ok_or_else(|| {
                 "A sort field of more than one source is not followed here.".to_string()
             })?;
+        // A void field orders nothing: one of only those is unsorted.
+        if transform == Transform::Void {
+            continue;
+        }
         fields.push(SortField {
             source: source as i32,
             transform,
@@ -255,6 +259,10 @@ fn apply(transform: Transform, column: &ArrayRef) -> Result<ArrayRef, String> {
         Transform::Identity | Transform::Void => Ok(Arc::clone(column)),
         Transform::Bucket(n) => bucket(column, n),
         Transform::Truncate(width) => truncate(column, width),
+        // A column a file does not hold (nulls): no value to transform.
+        _ if column.null_count() == column.len() => {
+            Ok(arrow_array::new_null_array(&DataType::Int32, column.len()))
+        }
         Transform::Year | Transform::Month | Transform::Day => {
             let days = match moments(column)? {
                 Moments::Days(days) => days,
@@ -403,7 +411,8 @@ fn truncate(column: &ArrayRef, width: u32) -> Result<ArrayRef, String> {
     let column = plain(column)?;
     let any = column.as_any();
     let w = i64::from(width);
-    let down = |v: i64| v - (((v % w) + w) % w);
+    // Wrapping, as Java's arithmetic does at the type's limits.
+    let down = |v: i64| v.wrapping_sub(((v % w) + w) % w);
     if let Some(values) = any.downcast_ref::<Int32Array>() {
         return Ok(Arc::new(Int32Array::from(
             values
@@ -421,7 +430,7 @@ fn truncate(column: &ArrayRef, width: u32) -> Result<ArrayRef, String> {
         let w = i128::from(width);
         let truncated: Decimal128Array = values
             .iter()
-            .map(|v| v.map(|v| v - (((v % w) + w) % w)))
+            .map(|v| v.map(|v| v.wrapping_sub(((v % w) + w) % w)))
             .collect();
         let truncated = truncated
             .with_precision_and_scale(values.precision(), values.scale())
@@ -592,6 +601,8 @@ pub(super) struct Sorter<'a> {
     held: Vec<RecordBatch>,
     held_bytes: usize,
     runs: Vec<(String, u64)>,
+    /// The rows pushed, which are given back: every one, and no other.
+    pushed: u64,
 }
 
 impl<'a> Sorter<'a> {
@@ -614,6 +625,7 @@ impl<'a> Sorter<'a> {
             held: Vec::new(),
             held_bytes: 0,
             runs: Vec::new(),
+            pushed: 0,
         }
     }
 
@@ -622,6 +634,7 @@ impl<'a> Sorter<'a> {
             return Ok(());
         }
         self.held_bytes += batch.get_array_memory_size();
+        self.pushed += batch.num_rows() as u64;
         self.held.push(batch);
         if self.held_bytes >= self.run_bytes {
             self.spill()?;
@@ -691,7 +704,31 @@ impl<'a> Sorter<'a> {
     /// Gives every row pushed, in order, a batch at a time, to `emit`.
     pub(super) fn finish(
         mut self,
-        mut emit: impl FnMut(RecordBatch) -> Result<(), String>,
+        emit: impl FnMut(RecordBatch) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut given = 0u64;
+        let mut emit = {
+            let given = &mut given;
+            let mut emit = emit;
+            move |batch: RecordBatch| {
+                *given += batch.num_rows() as u64;
+                emit(batch)
+            }
+        };
+        self.give(&mut emit)?;
+        drop(emit);
+        if given != self.pushed {
+            return Err(format!(
+                "A sort gave back {given} rows of the {} put in: nothing was written.",
+                self.pushed
+            ));
+        }
+        Ok(())
+    }
+
+    fn give(
+        &mut self,
+        mut emit: &mut impl FnMut(RecordBatch) -> Result<(), String>,
     ) -> Result<(), String> {
         if self.runs.is_empty() {
             if let Some(sorted) = self.sorted()? {
@@ -979,6 +1016,16 @@ mod tests {
             )
             .is_err()
         );
+        // A column a file does not hold (nulls, of no type of its own): no
+        // value to transform.
+        let missing = arrow_array::new_null_array(&DataType::Int64, 2);
+        assert_eq!(of(Transform::Year, Arc::clone(&missing)), [None, None]);
+        assert_eq!(of(Transform::Hour, missing), [None, None]);
+        // At the type's limits, wrapping as Java's arithmetic does.
+        assert_eq!(
+            ints(truncated(Arc::new(Int64Array::from(vec![i64::MIN])), 10)),
+            [Some(i64::MIN.wrapping_sub(2))]
+        );
     }
 
     #[test]
@@ -1077,6 +1124,10 @@ mod tests {
         let unsorted = serde_json::json!({"default-sort-order-id": 0,
             "sort-orders": [{"order-id": 0, "fields": []}]});
         assert!(table_order(&unsorted).unwrap().is_none());
+        // Only void fields: unsorted.
+        let void = serde_json::json!({"default-sort-order-id": 1, "sort-orders": [{"order-id": 1,
+            "fields": [{"transform": "void", "source-id": 1, "direction": "asc", "null-order": "nulls-first"}]}]});
+        assert!(table_order(&void).unwrap().is_none());
         let unknown = serde_json::json!({"default-sort-order-id": 1, "sort-orders": [{"order-id": 1,
             "fields": [{"transform": "zorder", "source-id": 1, "direction": "asc", "null-order": "nulls-first"}]}]});
         assert!(table_order(&unknown).is_err());
