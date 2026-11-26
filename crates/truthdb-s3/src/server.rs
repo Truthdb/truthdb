@@ -577,8 +577,10 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
     // A CORS preflight: answered from the bucket's configuration, before
     // (and without) any authentication, as a browser sends it.
     if request.method() == hyper::Method::OPTIONS {
-        // Through an access point: its bucket's configuration.
-        crate::access_points::resolve(state, &mut request, None).await?;
+        // Through an access point: its bucket's configuration. A name that
+        // is no access point's answers as one that is no bucket's (a
+        // preflight is not authenticated: it tells no more of what exists).
+        let _ = crate::access_points::resolve(state, &mut request, None).await;
         return crate::cors::preflight(state, &request).await;
     }
     // A form upload (POST Object) carries its signature in the form.
