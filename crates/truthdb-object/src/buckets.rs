@@ -191,14 +191,17 @@ pub fn validate_bucket_name(name: &str) -> Result<(), BucketError> {
             return Err(BucketError::InvalidName("uses a reserved suffix"));
         }
     }
-    // Not AWS's rule: here access point hosts share the buckets' domains
-    // (`<name>-<account>.s3-accesspoint.<region>.<domain>`), so a bucket's
-    // virtual host must not be one (under any of the domains, which may
-    // include `<region>.<domain>`).
-    if name.contains(".s3-accesspoint.") || name.ends_with(".s3-accesspoint") {
-        return Err(BucketError::InvalidName(
-            "must not have an \"s3-accesspoint\" label",
-        ));
+    // Not AWS's rule: here access point and Object Lambda access point
+    // hosts share the buckets' domains
+    // (`<name>-<account>.s3-accesspoint.<region>.<domain>`, and the same with
+    // `s3-object-lambda`), so a bucket's virtual host must not be one (under
+    // any of the domains, which may include `<region>.<domain>`).
+    for label in ["s3-accesspoint", "s3-object-lambda"] {
+        if name.contains(&format!(".{label}.")) || name.ends_with(&format!(".{label}")) {
+            return Err(BucketError::InvalidName(
+                "must not have an \"s3-accesspoint\" or \"s3-object-lambda\" label",
+            ));
+        }
     }
     Ok(())
 }
@@ -561,6 +564,8 @@ mod tests {
             "bucket-s3alias",
             "reader-111111111111.s3-accesspoint.us-east-1",
             "reader-111111111111.s3-accesspoint",
+            "shaper-111111111111.s3-object-lambda.us-east-1",
+            "shaper-111111111111.s3-object-lambda",
         ] {
             assert!(validate_bucket_name(bad).is_err(), "{bad}");
         }

@@ -35,6 +35,7 @@ pub mod metrics_config;
 pub mod multipart;
 pub mod notification;
 pub mod object_lambda;
+mod object_lambda_run;
 pub mod object_lock;
 pub mod objects;
 pub(crate) mod part_checksums;

@@ -558,6 +558,15 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
         Some("monitoring") => return Ok(crate::cloudwatch::handle(state, request).await),
         // CloudTrail, over the API activity log.
         Some("cloudtrail") => return Ok(crate::cloudtrail::handle(state, request).await),
+        // Object Lambda: a request through an Object Lambda access point's
+        // host, or a function's WriteGetObjectResponse.
+        Some("s3-object-lambda") => {
+            let auth = authenticate(state, &request).await?;
+            if let Some(who) = request.extensions().get::<crate::activity::Who>() {
+                who.set(auth.principal.clone(), auth.signed);
+            }
+            return crate::object_lambda_run::route(state, request, auth).await;
+        }
         _ => {}
     }
     // The signature covers parameter names decoded, while operations are
@@ -847,7 +856,13 @@ pub async fn authenticate(
     // A directory bucket's requests are signed for S3 Express; either
     // service is taken for any bucket.
     let express = request_service(request).as_deref() == Some("s3express");
-    let service = if express { "s3express" } else { "s3" };
+    // Object Lambda's requests (and WriteGetObjectResponse) are signed for
+    // `s3-object-lambda`: taken here, served only as theirs (see `route`).
+    let service = match request_service(request).as_deref() {
+        Some("s3express") => "s3express",
+        Some("s3-object-lambda") => "s3-object-lambda",
+        _ => "s3",
+    };
     let (auth, amz_date) = signed_request(state, request, service)?;
     let amz_date = amz_date.as_str();
     let payload_hash = header(request, "x-amz-content-sha256")
