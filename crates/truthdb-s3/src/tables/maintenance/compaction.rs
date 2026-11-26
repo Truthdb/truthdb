@@ -18,8 +18,12 @@
 //! delete ratio). A data file a delete applies to that cannot be read here
 //! (one not in Parquet, or outside the table's storage) is left as it is.
 //!
-//! Not built yet: the sort and z-order strategies, and Avro or ORC data
-//! files (left as they are). A file of an older partition
+//! The sort strategy (and auto, on a table that has a sort order) writes a
+//! group's rows in the table's sort order, and z-order in the z-order of
+//! its sort order's columns (see [`order`]): sorted in runs written out as
+//! objects of the table's storage, then merged, so a group's outputs are
+//! in one order across them. Not built: Avro or ORC data files (left as
+//! they are). A file of an older partition
 //! spec is rewritten within its own spec and partition, where Iceberg
 //! rewrites such files into the current spec.
 //!
@@ -43,6 +47,8 @@ use crate::iceberg_manifests::{
 };
 use crate::server::S3State;
 
+mod order;
+
 const MIB: u64 = 1 << 20;
 /// Iceberg's bin-pack defaults: the size range kept, the fewest files a
 /// partition is rewritten for, and what a split takes over its share.
@@ -59,8 +65,8 @@ const SINK_BUFFER: usize = 8 << 20;
 /// hour is taken for abandoned).
 const TOUCH_MS: u64 = 5 * 60 * 1000;
 
-const SORT_NOT_BUILT: &str =
-    "Sort compaction is not supported yet: the auto strategy sorts a table that has a sort order.";
+const NO_SORT_ORDER: &str =
+    "The sort and z-order compaction strategies need the table to have a sort order.";
 
 /// A manifest of the current snapshot: its manifest list entry, the file,
 /// and the list entry's fields read.
@@ -115,6 +121,9 @@ struct Output {
     version: u64,
     size: u64,
     metadata: parquet::file::metadata::ParquetMetaData,
+    /// The sort order its rows are in (0: unsorted, as a z-order's are to
+    /// Iceberg), if they were put in one.
+    sort_order: Option<i64>,
 }
 
 /// Compacts `table` with target size `target_mb` and strategy `strategy`,
@@ -132,9 +141,25 @@ pub(super) async fn compact(
     if base["format-version"].as_i64() != Some(2) {
         return Err("Compaction supports Iceberg format version 2 tables only.".to_string());
     }
-    if strategy == "auto" && sorted(&base) {
-        return Err(SORT_NOT_BUILT.to_string());
-    }
+    // The order rows are written in: "auto" sorts a table that has a sort
+    // order, and bin-packs one that does not; "sort" and "z-order" need one.
+    let order = match strategy {
+        "binpack" => None,
+        "auto" if !sorted(&base) => None,
+        _ => match order::table_order(&base)? {
+            Some((_, fields)) if strategy == "z-order" => {
+                let mut columns: Vec<i32> = Vec::new();
+                for field in fields {
+                    if !columns.contains(&field.source) {
+                        columns.push(field.source);
+                    }
+                }
+                Some(order::Order::ZOrder(columns))
+            }
+            Some((id, fields)) => Some(order::Order::Sort(id, fields)),
+            None => return Err(NO_SORT_ORDER.to_string()),
+        },
+    };
     let Some(current) = base["current-snapshot-id"].as_i64().filter(|id| *id != -1) else {
         return Ok(());
     };
@@ -450,10 +475,39 @@ pub(super) async fn compact(
                 })
                 .collect(),
         };
+        // A z-order leaves out the group's identity partition sources (one
+        // value in a partition).
+        let group_order = match &order {
+            Some(order::Order::ZOrder(columns)) => {
+                let identity: Vec<i64> = base["partition-specs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|of| of["spec-id"].as_i64() == Some(i64::from(spec)))
+                    .flat_map(|of| of["fields"].as_array().into_iter().flatten())
+                    .filter(|field| field["transform"].as_str() == Some("identity"))
+                    .filter_map(|field| field["source-id"].as_i64())
+                    .collect();
+                let kept: Vec<i32> = columns
+                    .iter()
+                    .copied()
+                    .filter(|column| !identity.contains(&i64::from(*column)))
+                    .collect();
+                if kept.is_empty() {
+                    failure.get_or_insert(
+                        "The sort order's columns are all identity partition sources: nothing is z-ordered."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                Some(order::Order::ZOrder(kept))
+            }
+            other => other.clone(),
+        };
         let (outputs, read) = match rewrite(
             state,
             &warehouse,
-            (&inputs, &group),
+            (&inputs, &group, group_order.as_ref()),
             (split, write_max),
             &codec,
             now,
@@ -849,23 +903,24 @@ type Newest = (Option<i64>, Option<i64>);
 async fn rewrite(
     state: &S3State,
     warehouse: &str,
-    (inputs, group): (&[Input], &GroupDeletes),
+    (inputs, group, order): (&[Input], &GroupDeletes, Option<&order::Order>),
     (split, write_max): (u64, u64),
     codec: &parquet::basic::Compression,
     now: u64,
 ) -> Result<(Vec<Output>, Vec<i64>), String> {
-    let (storage, from, inputs, group, codec) = (
+    let (storage, from, inputs, group, codec, ordered) = (
         Arc::clone(&state.storage),
         warehouse.to_string(),
         inputs.to_vec(),
         group.clone(),
         *codec,
+        order.cloned(),
     );
     let (files, read) = tokio::task::spawn_blocking(move || {
         rewrite_files(
             &storage,
             &from,
-            (&inputs, &group),
+            (&inputs, &group, ordered.as_ref()),
             (split, write_max),
             codec,
         )
@@ -890,6 +945,11 @@ async fn rewrite(
             version,
             size,
             metadata,
+            sort_order: match order {
+                Some(order::Order::Sort(id, _)) => Some(*id),
+                Some(order::Order::ZOrder(_)) => Some(0),
+                None => None,
+            },
         });
     }
     Ok((outputs, read))
@@ -900,7 +960,7 @@ type Written = (SealedBody, u64, parquet::file::metadata::ParquetMetaData);
 fn rewrite_files(
     storage: &Arc<Storage>,
     warehouse: &str,
-    (inputs, group): (&[Input], &GroupDeletes),
+    (inputs, group, order): (&[Input], &GroupDeletes, Option<&order::Order>),
     (split, write_max): (u64, u64),
     codec: parquet::basic::Compression,
 ) -> Result<(Vec<Written>, Vec<i64>), String> {
@@ -955,11 +1015,59 @@ fn rewrite_files(
     let mut done = Vec::new();
     let mut writing: Option<Writing> = None;
     let mut read = Vec::new();
+    // The inputs' schema (one for the group), as the first one read has it.
+    let mut layout: Option<(
+        arrow_schema::SchemaRef,
+        parquet::schema::types::SchemaDescriptor,
+    )> = None;
+    // Writes `batch` (`consumed` of the inputs' bytes) into the output being
+    // written, which ends at its share of the inputs, or at the largest
+    // file written (within a row group too: an output over the range would
+    // be rewritten again on every pass).
+    let mut emit = |batch: arrow_array::RecordBatch,
+                    consumed: u64,
+                    layout: &(
+        arrow_schema::SchemaRef,
+        parquet::schema::types::SchemaDescriptor,
+    )|
+     -> Result<(), String> {
+        let out = match writing.as_mut() {
+            Some(out) => out,
+            None => writing.insert(begin(Arc::clone(&layout.0), &layout.1)?),
+        };
+        out.writer.write(&batch).map_err(failed)?;
+        if out.writer.in_progress_size() >= ROW_GROUP_BYTES {
+            out.writer.flush().map_err(failed)?;
+        }
+        out.consumed = out.consumed.saturating_add(consumed);
+        let written = (out.writer.bytes_written() + out.writer.in_progress_size()) as u64;
+        if out.consumed >= split || written >= write_max {
+            done.push(finish(writing.take().expect("written"))?);
+        }
+        Ok(())
+    };
+    let mut sorter: Option<order::Sorter<'_>> = None;
+    // The inputs' bytes and rows kept, which a sorted output's share is
+    // counted from.
+    let (mut input_bytes, mut kept_rows) = (0u64, 0u64);
     for (input, deleted) in inputs.iter().zip(&deleted) {
         let key = &input.key;
         let file = truthdb_engine::engine::open_arrow_parquet(storage, warehouse, key)
             .map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
-        let descr = file.metadata().file_metadata().schema_descr_ptr();
+        let layout = &*layout.get_or_insert_with(|| {
+            (
+                file.schema(),
+                (*file.metadata().file_metadata().schema_descr_ptr()).clone(),
+            )
+        });
+        if let (Some(order), None) = (order, &sorter) {
+            sorter = Some(order::Sorter::new(
+                order::Keys::new(order.clone()),
+                (storage, warehouse),
+                (Arc::clone(&layout.0), layout.1.clone()),
+                order::RUN_BYTES,
+            ));
+        }
         // The position of the next row read.
         let mut row = 0u64;
         for group in 0..file.metadata().num_row_groups() {
@@ -969,6 +1077,7 @@ fn rewrite_files(
                 metadata.compressed_size().max(0) as u64,
                 metadata.num_rows().max(1) as u64,
             );
+            input_bytes = input_bytes.saturating_add(group_bytes);
             for batch in file.batches(group)? {
                 let batch =
                     batch.map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
@@ -980,27 +1089,21 @@ fn rewrite_files(
                         .map_err(|err| format!("Deleted rows cannot be left out: {err}"))?,
                     None => batch,
                 };
-                let out = match writing.as_mut() {
-                    Some(out) => out,
-                    None => writing.insert(begin(file.schema(), &descr)?),
-                };
-                out.writer.write(&batch).map_err(failed)?;
-                if out.writer.in_progress_size() >= ROW_GROUP_BYTES {
-                    out.writer.flush().map_err(failed)?;
-                }
-                out.consumed = out
-                    .consumed
-                    .saturating_add(group_bytes.saturating_mul(rows) / group_rows);
-                // An output ends at its share of the inputs, or at the
-                // largest file written, within a row group too: an output
-                // over the range would be rewritten again on every pass.
-                let written = (out.writer.bytes_written() + out.writer.in_progress_size()) as u64;
-                if out.consumed >= split || written >= write_max {
-                    done.push(finish(writing.take().expect("written"))?);
+                kept_rows += batch.num_rows() as u64;
+                match sorter.as_mut() {
+                    Some(sorter) => sorter.push(batch)?,
+                    None => emit(batch, group_bytes.saturating_mul(rows) / group_rows, layout)?,
                 }
             }
         }
         read.push(row as i64);
+    }
+    if let (Some(sorter), Some(layout)) = (sorter, &layout) {
+        let (bytes, rows) = (input_bytes, kept_rows.max(1));
+        sorter.finish(|batch| {
+            let share = bytes.saturating_mul(batch.num_rows() as u64) / rows;
+            emit(batch, share, layout)
+        })?;
     }
     if let Some(writing) = writing {
         done.push(finish(writing)?);
@@ -1826,6 +1929,13 @@ async fn commit(
                         (125, map(125, metrics.lower)?),
                         (128, map(128, metrics.upper)?),
                         (132, Set::To(Avro::Array(metrics.offsets))),
+                        (
+                            140,
+                            match output.sort_order {
+                                Some(id) => Set::To(Avro::Int(id as i32)),
+                                None => Set::Null,
+                            },
+                        ),
                     ],
                 )?;
                 records.push(build(
@@ -2276,6 +2386,97 @@ mod tests {
     }
 
     #[test]
+    fn rows_are_put_in_order_through_runs_written_out_and_merged() {
+        use arrow_array::{Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        let (storage, path) = storage();
+        let id = |n: i32| HashMap::from([("PARQUET:field_id".to_string(), n.to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true).with_metadata(id(1)),
+        ]));
+        let descr = parquet::arrow::ArrowSchemaConverter::new()
+            .convert(&schema)
+            .unwrap();
+        // 5 batches of shuffled ids (and nulls), each a run of its own.
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|batch| {
+                let ids: Vec<Option<i64>> = (0..40)
+                    .map(|row| match (batch * 40 + row) % 13 {
+                        0 => None,
+                        _ => Some(((batch * 40 + row) * 7919 % 200) as i64),
+                    })
+                    .collect();
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])
+                    .unwrap()
+            })
+            .collect();
+        let sorted = |run_bytes| {
+            let order = order::Order::Sort(
+                1,
+                vec![order::SortField {
+                    source: 1,
+                    transform: order::Transform::Identity,
+                    descending: true,
+                    nulls_first: true,
+                }],
+            );
+            let mut sorter = order::Sorter::new(
+                order::Keys::new(order),
+                (&storage, "www"),
+                (Arc::clone(&schema), descr.clone()),
+                run_bytes,
+            );
+            for batch in &batches {
+                sorter.push(batch.clone()).unwrap();
+            }
+            let mut out = Vec::new();
+            sorter
+                .finish(|batch| {
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    out.extend((0..ids.len()).map(|row| ids.is_valid(row).then(|| ids.value(row))));
+                    Ok(())
+                })
+                .unwrap();
+            out
+        };
+        let mut expected: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..ids.len())
+                    .map(|row| ids.is_valid(row).then(|| ids.value(row)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Descending, nulls first.
+        expected.sort_by(|a, b| match (a, b) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Less,
+            (_, None) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => b.cmp(a),
+        });
+        // All held, and a run per batch merged.
+        assert_eq!(sorted(order::RUN_BYTES), expected);
+        assert_eq!(sorted(1), expected);
+        // The runs are gone once merged.
+        let left = truthdb_object::ObjFile::new(&mut storage.lock())
+            .list_objects("www", "tmp/", None, None, 10)
+            .unwrap()
+            .unwrap();
+        assert!(left.objects.is_empty());
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn an_output_ends_at_the_largest_file_written_inside_a_row_group() {
         use arrow_array::{Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
@@ -2350,6 +2551,7 @@ mod tests {
                     positions: Vec::new(),
                     equalities: Vec::new(),
                 },
+                None,
             ),
             (u64::MAX, 1),
             parquet::basic::Compression::UNCOMPRESSED,

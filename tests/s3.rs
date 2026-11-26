@@ -19063,9 +19063,11 @@ assert default == {"icebergCompaction": {"status": "enabled", "settings": {"iceb
 for size in [63, 513]:
     aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
         value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": size}}}), "BadRequestException")
-for strategy in ["sort", "z-order"]:
-    aws_refused(lambda: t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
-        value={"status": "enabled", "settings": {"icebergCompaction": {"strategy": strategy}}}), "NotImplemented")
+for strategy in ["sort", "z-order", "binpack", "auto"]:
+    t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
+        value={"status": "enabled", "settings": {"icebergCompaction": {"strategy": strategy}}})
+    assert t.get_table_maintenance_configuration(**at, name="orders_2024")["configuration"]["icebergCompaction"][
+        "settings"]["icebergCompaction"]["strategy"] == strategy
 t.put_table_maintenance_configuration(**at, name="orders_2024", type="icebergCompaction",
     value={"status": "enabled", "settings": {"icebergCompaction": {"targetFileSizeMB": 64}}})
 assert t.get_table_maintenance_configuration(**at, name="orders_2024")["configuration"]["icebergCompaction"] == {
@@ -19621,24 +19623,99 @@ by_region = sorted((f["partition"]["region"], f["record_count"]) for f in files(
 assert by_region == [("a", 15), ("b", 3), ("b", 3)], by_region
 assert len(parts.scan(row_filter="region = 'a'").to_arrow()) == 15
 
-# A table with a sort order: auto would sort, which is not built.
-ordered = table("ordered", order=SortOrder(SortField(source_id=1, transform=IdentityTransform())),
-    properties={"write.parquet.compression-codec": "snappy"})
-for i in range(5):
+# A table with a sort order: auto sorts it (by id, descending), its file
+# marked with the order, written with the table's codec.
+from pyiceberg.table.sorting import NullOrder, SortDirection
+ordered = table("ordered", order=SortOrder(SortField(source_id=1, transform=IdentityTransform(),
+    direction=SortDirection.DESC)), properties={"write.parquet.compression-codec": "snappy"})
+for i in [2, 0, 4, 1, 3]:
     ordered.append(rows(i * 3))
 since = time.time()
 configure("ordered", targetFileSizeMB=64)
-failed = ran("ordered", since, "Failed")
-assert "Sort compaction is not supported" in failed["failureMessage"], failed
-# Bin-packed when asked, with the table's codec.
-since = time.time()
-configure("ordered", targetFileSizeMB=64, strategy="binpack")
 ran("ordered", since)
 ordered = c.load_table(("lake", "ordered"))
 [one] = files(ordered)
-body = s3.get_object(Bucket=store.replace(store, one["file_path"].split("/")[2]),
-    Key=one["file_path"].split("/", 3)[3])["Body"].read()
+assert one["sort_order_id"] == ordered.sort_order().order_id == 1, one
+body = s3.get_object(Bucket=one["file_path"].split("/")[2], Key=one["file_path"].split("/", 3)[3])["Body"].read()
+written = pq.read_table(pa.BufferReader(body))
+assert written.column("id").to_pylist() == list(range(14, -1, -1)), written.column("id").to_pylist()
 assert pq.ParquetFile(pa.BufferReader(body)).metadata.row_group(0).column(0).compression == "SNAPPY"
+# Nulls first, as the order says.
+by_name = table("by_name", order=SortOrder(SortField(source_id=2, transform=IdentityTransform(),
+    direction=SortDirection.DESC, null_order=NullOrder.NULLS_FIRST)))
+for i in [3, 1, 4, 0, 2]:
+    by_name.append(rows(i * 3))
+since = time.time()
+configure("by_name", targetFileSizeMB=64)
+ran("by_name", since)
+[one] = files(c.load_table(("lake", "by_name")))
+body = s3.get_object(Bucket=one["file_path"].split("/")[2], Key=one["file_path"].split("/", 3)[3])["Body"].read()
+names = pq.read_table(pa.BufferReader(body)).column("name").to_pylist()
+nulls = names.count(None)
+assert nulls == 4 and names[:nulls] == [None] * nulls, names
+assert names[nulls:] == sorted(names[nulls:], reverse=True), names
+# The z-order of the sort order's columns: rows in their interleaved keys'
+# order, the file marked unsorted (0), as Iceberg's Java leaves it.
+def z_key(row):
+    def ordered_bytes(value, kind):
+        if value is None:
+            return bytes(8)
+        if kind == "long":
+            return ((value ^ (1 << 63)) & ((1 << 64) - 1)).to_bytes(8, "big")
+        return value.encode()[:8].ljust(8, b"\0")
+    columns = [ordered_bytes(row["id"], "long"), ordered_bytes(row["name"], "string")]
+    bits = []
+    for bit in range(64):
+        for column in columns:
+            bits.append((column[bit // 8] >> (7 - bit % 8)) & 1)
+    return bytes(int("".join(map(str, bits[at:at + 8])), 2) for at in range(0, len(bits), 8))
+zordered = table("zordered", order=SortOrder(SortField(source_id=1, transform=IdentityTransform()),
+    SortField(source_id=2, transform=IdentityTransform())))
+for i in [4, 2, 0, 3, 1]:
+    zordered.append(rows(i * 3))
+since = time.time()
+configure("zordered", targetFileSizeMB=64, strategy="z-order")
+ran("zordered", since)
+zordered = c.load_table(("lake", "zordered"))
+[one] = files(zordered)
+assert one["sort_order_id"] == 0, one
+body = s3.get_object(Bucket=one["file_path"].split("/")[2], Key=one["file_path"].split("/", 3)[3])["Body"].read()
+keys = [z_key(row) for row in pq.read_table(pa.BufferReader(body)).to_pylist()]
+assert keys == sorted(keys), keys
+assert sorted(row["id"] for row in zordered.scan().to_arrow().to_pylist()) == list(range(15))
+# A partition's identity source is left out of its z-order (one value in
+# a partition): partitioned by region, z-ordered by (region, id), its rows
+# are in id's order.
+zparted = table("zparted", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")), order=SortOrder(SortField(source_id=6,
+    transform=IdentityTransform()), SortField(source_id=1, transform=IdentityTransform())))
+for i in [4, 2, 0, 3, 1]:
+    zparted.append(rows(i * 3, "a"))
+since = time.time()
+configure("zparted", targetFileSizeMB=64, strategy="z-order")
+ran("zparted", since)
+[one] = files(c.load_table(("lake", "zparted")))
+body = s3.get_object(Bucket=one["file_path"].split("/")[2], Key=one["file_path"].split("/", 3)[3])["Body"].read()
+assert pq.read_table(pa.BufferReader(body)).column("id").to_pylist() == list(range(15))
+# One whose order is its identity partition source alone: nothing to
+# z-order, the job fails.
+zonly = table("zonly", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")), order=SortOrder(SortField(source_id=6,
+    transform=IdentityTransform())))
+for i in range(5):
+    zonly.append(rows(i * 3, "a"))
+since = time.time()
+configure("zonly", targetFileSizeMB=64, strategy="z-order")
+failed = ran("zonly", since, "Failed")
+assert "identity partition sources" in failed["failureMessage"], failed
+# "sort" on a table with no sort order: the job fails.
+unsorted = table("unsorted")
+for i in range(5):
+    unsorted.append(rows(i * 3))
+since = time.time()
+configure("unsorted", targetFileSizeMB=64, strategy="sort")
+failed = ran("unsorted", since, "Failed")
+assert "need the table to have a sort order" in failed["failureMessage"], failed
 # A codec compaction does not write: the job fails, the table as it was.
 with ordered.transaction() as tx:
     tx.set_properties({"write.parquet.compression-codec": "lz4"})

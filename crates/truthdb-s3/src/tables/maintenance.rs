@@ -124,14 +124,9 @@ fn checked_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError
                 }
                 if field == "strategy" {
                     match value.as_str() {
-                        Some("auto" | "binpack") => {
+                        Some("auto" | "binpack" | "sort" | "z-order") => {
                             kept.insert(field.clone(), value.clone());
                             continue;
-                        }
-                        Some("sort" | "z-order") => {
-                            return Err(TError::not_implemented(
-                                "The sort and z-order compaction strategies",
-                            ));
                         }
                         _ => {
                             return Err(TError::bad("strategy is auto, binpack, sort or z-order."));
