@@ -176,7 +176,11 @@ fn no_such_object(bucket: &str, key: &str) -> SqlError {
 }
 
 impl BodyReader {
-    fn open(core: &Arc<Storage>, bucket: &str, key: &str) -> Result<BodyReader, SqlError> {
+    pub(super) fn open(
+        core: &Arc<Storage>,
+        bucket: &str,
+        key: &str,
+    ) -> Result<BodyReader, SqlError> {
         let mut guard = core.lock();
         let mut file = ObjFile::try_new(&mut guard).ok_or_else(super::s3_sql::no_object_engine)?;
         let info = match file

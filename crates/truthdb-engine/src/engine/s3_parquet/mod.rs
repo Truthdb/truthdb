@@ -78,6 +78,13 @@ struct SourceState {
     /// The memory each chunk's decoded dictionary takes, by chunk start: the
     /// reader holds every dictionary of a row group at once.
     dictionaries: std::collections::HashMap<u64, u64>,
+    /// With a budget (the most a row group may declare decompressed): each
+    /// chunk's pages may not decompress past the size its metadata declares,
+    /// so what a row group decodes to is what its metadata says, at most.
+    chunk_budget: Option<u64>,
+    /// The pages counted against their chunk's declared size (by start: a
+    /// page read again is not counted again).
+    counted: std::collections::HashSet<u64>,
 }
 
 /// A column chunk's byte range, row group, compression, the fewest bits one
@@ -89,6 +96,10 @@ struct Chunk {
     codec: parquet::basic::Compression,
     value_bits: u64,
     value_memory: u64,
+    /// Its pages' decompressed bytes as its metadata declares them, and as
+    /// counted so far.
+    declared: u64,
+    used: u64,
 }
 
 fn parquet_failure(message: impl Into<String>) -> parquet::errors::ParquetError {
@@ -196,11 +207,21 @@ impl parquet::file::reader::ChunkReader for ParquetFile {
                     )));
                 }
                 let end = start + length as u64;
-                let chunk = state
+                let index = state
                     .chunks
                     .iter()
-                    .find(|chunk| chunk.start <= start && end <= chunk.end)
+                    .position(|chunk| chunk.start <= start && end <= chunk.end)
                     .ok_or_else(|| parquet_failure("a page outside every column chunk"))?;
+                if state.chunk_budget.is_some() && state.counted.insert(start) {
+                    let chunk = &mut state.chunks[index];
+                    chunk.used = chunk.used.saturating_add(uncompressed);
+                    if chunk.used > chunk.declared {
+                        return Err(parquet_failure(
+                            "a column chunk whose pages decompress past its declared size",
+                        ));
+                    }
+                }
+                let chunk = &state.chunks[index];
                 let codec = chunk.codec;
                 // A dictionary holds its values in its bytes: the reader
                 // allocates the count it declares.
@@ -682,102 +703,10 @@ pub(super) fn rows(
     key: &str,
 ) -> Result<(Schema, Rows), SqlError> {
     use parquet::file::reader::FileReader;
-    let size = reader.size;
-    let source = Arc::new(ParquetSource {
-        state: std::sync::Mutex::new(SourceState {
-            reader,
-            header_at: None,
-            pages: false,
-            page_cap: 0,
-            chunks: Vec::new(),
-            dictionaries: std::collections::HashMap::new(),
-        }),
-        size,
-    });
-    // The footer: the metadata, its length and the magic. Its schema is read
-    // here and handed to the reader, which then skips the footer's copy.
-    let parquet_schema = {
-        let mut state = source.state();
-        let mut tail = [0u8; 8];
-        if size < 12 {
-            return Err(read_error("Invalid Parquet: the file is too short."));
-        }
-        ParquetSource::read_exact_at(&mut state, size - 8, &mut tail)
-            .map_err(|err| read_error(err.to_string()))?;
-        let len = u64::from(u32::from_le_bytes(tail[..4].try_into().expect("4 bytes")));
-        if &tail[4..] != b"PAR1" || len > size - 12 || len > MAX_PARQUET_METADATA as u64 {
-            return Err(read_error("Invalid Parquet: the footer cannot be read."));
-        }
-        let mut metadata = vec![0u8; len as usize];
-        ParquetSource::read_exact_at(&mut state, size - 8 - len, &mut metadata)
-            .map_err(|err| read_error(err.to_string()))?;
-        thrift::footer_schema(&metadata, MAX_PARQUET_DEPTH)
-            .map_err(|err| read_error(format!("Invalid Parquet: {err}.")))?
-    };
-    let parquet = parquet_guarded(|| {
-        let options = parquet::file::serialized_reader::ReadOptionsBuilder::new()
-            .with_parquet_schema(Arc::new(parquet_schema))
-            .build();
-        parquet::file::serialized_reader::SerializedFileReader::new_with_options(
-            ParquetFile(Arc::clone(&source)),
-            options,
-        )
-        .map_err(parquet_error)
-    })?;
+    let (_, parquet) = open(reader, check_parquet_leaf, None)?;
+    parquet_guarded(|| check_row_lengths(&parquet))?;
     let descr = parquet.metadata().file_metadata().schema_descr_ptr();
     let leaves = descr.columns();
-    if leaves.len() > MAX_PARQUET_LEAVES {
-        return Err(read_error(format!(
-            "The Parquet file has {} leaf columns, more than {MAX_PARQUET_LEAVES}.",
-            leaves.len()
-        )));
-    }
-    let mut paths = std::collections::HashSet::new();
-    for leaf in leaves {
-        check_parquet_leaf(leaf)?;
-        // The record reader finds a leaf's values by its path, so two leaves
-        // of one path would both read the same values.
-        if !paths.insert(leaf.path()) {
-            return Err(read_error(format!(
-                "The Parquet file has two columns named '{}'.",
-                leaf.path()
-            )));
-        }
-    }
-    {
-        let mut state = source.state();
-        state.page_cap = (PARQUET_PAGE_BUDGET / leaves.len().max(1)).max(MIN_PARQUET_PAGE);
-        let mut chunks: Vec<Chunk> = parquet
-            .metadata()
-            .row_groups()
-            .iter()
-            .enumerate()
-            .flat_map(|(group, columns)| {
-                columns.columns().iter().map(move |column| (group, column))
-            })
-            .map(|(group, column)| {
-                let (start, len) = column.byte_range();
-                let (value_bits, value_memory) = value_sizes(column.column_descr());
-                Chunk {
-                    start,
-                    end: start.saturating_add(len),
-                    group,
-                    codec: column.compression(),
-                    value_bits,
-                    value_memory,
-                }
-            })
-            .collect();
-        // Chunks may not overlap: a page is checked against its own chunk's
-        // codec, and an overlap would let it be checked against another's.
-        chunks.sort_by_key(|chunk| (chunk.start, chunk.end));
-        if chunks.windows(2).any(|pair| pair[1].start < pair[0].end) {
-            return Err(read_error("Invalid Parquet: two column chunks overlap."));
-        }
-        state.chunks = chunks;
-        state.pages = true;
-    }
-    parquet_guarded(|| check_row_lengths(&parquet))?;
     let fields: Vec<(String, ColumnType)> = descr
         .root_schema()
         .get_fields()
@@ -855,6 +784,282 @@ pub(super) fn rows(
     Ok((schema, Box::new(rows)))
 }
 
+/// A Parquet object's body opened for the `parquet` crate's readers, its
+/// footer and chunks checked (see [`ParquetSource`]); `check_leaf` refuses
+/// the leaf columns its reader cannot read. With `chunk_budget`, the
+/// pages of each column chunk may not decompress past what the chunk's
+/// metadata declares (see [`SourceState::chunk_budget`]).
+fn open(
+    reader: BodyReader,
+    check_leaf: fn(&parquet::schema::types::ColumnDescriptor) -> Result<(), SqlError>,
+    chunk_budget: Option<u64>,
+) -> Result<
+    (
+        ParquetFile,
+        parquet::file::serialized_reader::SerializedFileReader<ParquetFile>,
+    ),
+    SqlError,
+> {
+    use parquet::file::reader::FileReader;
+    let size = reader.size;
+    let source = Arc::new(ParquetSource {
+        state: std::sync::Mutex::new(SourceState {
+            reader,
+            header_at: None,
+            pages: false,
+            page_cap: 0,
+            chunks: Vec::new(),
+            dictionaries: std::collections::HashMap::new(),
+            chunk_budget: None,
+            counted: std::collections::HashSet::new(),
+        }),
+        size,
+    });
+    // The footer: the metadata, its length and the magic. Its schema is read
+    // here and handed to the reader, which then skips the footer's copy.
+    let parquet_schema = {
+        let mut state = source.state();
+        let mut tail = [0u8; 8];
+        if size < 12 {
+            return Err(read_error("Invalid Parquet: the file is too short."));
+        }
+        ParquetSource::read_exact_at(&mut state, size - 8, &mut tail)
+            .map_err(|err| read_error(err.to_string()))?;
+        let len = u64::from(u32::from_le_bytes(tail[..4].try_into().expect("4 bytes")));
+        if &tail[4..] != b"PAR1" || len > size - 12 || len > MAX_PARQUET_METADATA as u64 {
+            return Err(read_error("Invalid Parquet: the footer cannot be read."));
+        }
+        let mut metadata = vec![0u8; len as usize];
+        ParquetSource::read_exact_at(&mut state, size - 8 - len, &mut metadata)
+            .map_err(|err| read_error(err.to_string()))?;
+        thrift::footer_schema(&metadata, MAX_PARQUET_DEPTH)
+            .map_err(|err| read_error(format!("Invalid Parquet: {err}.")))?
+    };
+    let parquet = parquet_guarded(|| {
+        let options = parquet::file::serialized_reader::ReadOptionsBuilder::new()
+            .with_parquet_schema(Arc::new(parquet_schema))
+            .build();
+        parquet::file::serialized_reader::SerializedFileReader::new_with_options(
+            ParquetFile(Arc::clone(&source)),
+            options,
+        )
+        .map_err(parquet_error)
+    })?;
+    let descr = parquet.metadata().file_metadata().schema_descr_ptr();
+    let leaves = descr.columns();
+    if leaves.len() > MAX_PARQUET_LEAVES {
+        return Err(read_error(format!(
+            "The Parquet file has {} leaf columns, more than {MAX_PARQUET_LEAVES}.",
+            leaves.len()
+        )));
+    }
+    let mut paths = std::collections::HashSet::new();
+    for leaf in leaves {
+        check_leaf(leaf)?;
+        // The record reader finds a leaf's values by its path, so two leaves
+        // of one path would both read the same values.
+        if !paths.insert(leaf.path()) {
+            return Err(read_error(format!(
+                "The Parquet file has two columns named '{}'.",
+                leaf.path()
+            )));
+        }
+    }
+    {
+        let mut state = source.state();
+        state.page_cap = (PARQUET_PAGE_BUDGET / leaves.len().max(1)).max(MIN_PARQUET_PAGE);
+        let mut chunks: Vec<Chunk> = parquet
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .flat_map(|(group, columns)| {
+                columns.columns().iter().map(move |column| (group, column))
+            })
+            .map(|(group, column)| {
+                let (start, len) = column.byte_range();
+                let (value_bits, value_memory) = value_sizes(column.column_descr());
+                Chunk {
+                    start,
+                    end: start.saturating_add(len),
+                    group,
+                    codec: column.compression(),
+                    value_bits,
+                    value_memory,
+                    declared: u64::try_from(column.uncompressed_size()).unwrap_or(0),
+                    used: 0,
+                }
+            })
+            .collect();
+        // Chunks may not overlap: a page is checked against its own chunk's
+        // codec, and an overlap would let it be checked against another's.
+        chunks.sort_by_key(|chunk| (chunk.start, chunk.end));
+        if chunks.windows(2).any(|pair| pair[1].start < pair[0].end) {
+            return Err(read_error("Invalid Parquet: two column chunks overlap."));
+        }
+        if let Some(budget) = chunk_budget {
+            for group in parquet.metadata().row_groups() {
+                let declared: u64 = group
+                    .columns()
+                    .iter()
+                    .map(|column| u64::try_from(column.uncompressed_size()).unwrap_or(u64::MAX))
+                    .fold(0, u64::saturating_add);
+                if declared > budget {
+                    return Err(read_error(format!(
+                        "A Parquet row group of {declared} bytes decompressed is larger than {budget} bytes."
+                    )));
+                }
+            }
+        }
+        state.chunks = chunks;
+        state.pages = true;
+        state.chunk_budget = chunk_budget;
+    }
+    Ok((ParquetFile(source), parquet))
+}
+
+/// The most a row group of a file read in Arrow batches may declare its
+/// pages decompress to (small under test, so the limit is reached with
+/// small files): a batch holds at most its row group's values.
+const BATCH_ROW_GROUP_BUDGET: u64 = if cfg!(test) { 1 << 20 } else { 1 << 30 };
+/// The values a batch holds at most (each a few bytes of fixed width,
+/// besides the bytes of its byte arrays), and the most rows it holds.
+const BATCH_VALUES: u64 = 1 << 20;
+const MAX_BATCH_ROWS: u64 = 8192;
+
+/// A Parquet object read in Arrow record batches, a row group at a time,
+/// with the checks [`rows`] makes (but any leaf type the Arrow reader
+/// reads), and two more, since a batch holds many rows at once: a row
+/// group may decompress to [`BATCH_ROW_GROUP_BUDGET`] at most, and byte
+/// array columns are read as dictionary arrays, so a small dictionary is
+/// never expanded into a value per row.
+pub struct ArrowParquet {
+    file: ParquetFile,
+    metadata: parquet::arrow::arrow_reader::ArrowReaderMetadata,
+    batch_rows: usize,
+}
+
+/// Opens object `key` of `bucket` (its latest version) for [`ArrowParquet`],
+/// or why it cannot be read.
+pub fn open_arrow_parquet(
+    core: &Arc<truthdb_core::storage::Storage>,
+    bucket: &str,
+    key: &str,
+) -> Result<ArrowParquet, String> {
+    use parquet::file::reader::FileReader;
+    let message = |err: SqlError| err.message;
+    let reader = BodyReader::open(core, bucket, key).map_err(message)?;
+    let (file, parquet) =
+        open(reader, check_depth, Some(BATCH_ROW_GROUP_BUDGET)).map_err(message)?;
+    let longest = parquet_guarded(|| check_row_lengths(&parquet)).map_err(message)?;
+    let descr = parquet.metadata().file_metadata().schema_descr_ptr();
+    let repeated = (0..descr.num_columns())
+        .filter(|&leaf| descr.column(leaf).max_rep_level() > 0)
+        .count() as u64;
+    let per_row = (descr.num_columns() as u64 - repeated)
+        .saturating_add(repeated.saturating_mul(longest))
+        .max(1);
+    let batch_rows = (BATCH_VALUES / per_row).clamp(1, MAX_BATCH_ROWS) as usize;
+    let metadata = parquet_guarded(|| {
+        let arrow = parquet::arrow::parquet_to_arrow_schema(&descr, None).map_err(parquet_error)?;
+        let fields: Vec<arrow_schema::FieldRef> = arrow
+            .fields()
+            .iter()
+            .map(|field| Arc::new(dictionary_bytes(field)))
+            .collect();
+        let options =
+            parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_schema(Arc::new(
+                arrow_schema::Schema::new_with_metadata(fields, arrow.metadata().clone()),
+            ));
+        parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
+            Arc::new(parquet.metadata().clone()),
+            options,
+        )
+        .map_err(parquet_error)
+    })
+    .map_err(message)?;
+    Ok(ArrowParquet {
+        file,
+        metadata,
+        batch_rows,
+    })
+}
+
+/// Refuses a leaf nested deeper than [`MAX_PARQUET_DEPTH`].
+fn check_depth(leaf: &parquet::schema::types::ColumnDescriptor) -> Result<(), SqlError> {
+    if leaf.path().parts().len() > MAX_PARQUET_DEPTH {
+        return Err(read_error(format!(
+            "The Parquet column '{}' nests deeper than {MAX_PARQUET_DEPTH} levels.",
+            leaf.path()
+        )));
+    }
+    Ok(())
+}
+
+/// `field` with its byte arrays (at any depth) read as dictionary arrays.
+fn dictionary_bytes(field: &arrow_schema::Field) -> arrow_schema::Field {
+    use arrow_schema::DataType as D;
+    let nested = |inner: &arrow_schema::FieldRef| Arc::new(dictionary_bytes(inner));
+    let data_type = match field.data_type() {
+        bytes @ (D::Utf8 | D::LargeUtf8 | D::Binary | D::LargeBinary) => {
+            D::Dictionary(Box::new(D::Int32), Box::new(bytes.clone()))
+        }
+        D::Struct(fields) => D::Struct(fields.iter().map(nested).collect()),
+        D::List(inner) => D::List(nested(inner)),
+        D::LargeList(inner) => D::LargeList(nested(inner)),
+        D::FixedSizeList(inner, len) => D::FixedSizeList(nested(inner), *len),
+        D::Map(inner, sorted) => D::Map(nested(inner), *sorted),
+        other => other.clone(),
+    };
+    field.clone().with_data_type(data_type)
+}
+
+impl ArrowParquet {
+    /// The file's metadata (its footer).
+    pub fn metadata(&self) -> &parquet::file::metadata::ParquetMetaData {
+        self.metadata.metadata()
+    }
+
+    /// The Arrow schema its batches have.
+    pub fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::clone(self.metadata.schema())
+    }
+
+    /// The rows of row group `group`, in batches. A batch that cannot be
+    /// read ends them with why.
+    pub fn batches(
+        &self,
+        group: usize,
+    ) -> Result<impl Iterator<Item = Result<arrow_array::RecordBatch, String>>, String> {
+        let message = |err: SqlError| err.message;
+        let mut reader = parquet_guarded(|| {
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::new_with_metadata(
+                self.file.clone(),
+                self.metadata.clone(),
+            )
+            .with_row_groups(vec![group])
+            .with_batch_size(self.batch_rows)
+            .build()
+            .map_err(parquet_error)
+        })
+        .map_err(message)?;
+        let mut failed = false;
+        Ok(std::iter::from_fn(move || {
+            if failed {
+                return None;
+            }
+            let batch = parquet_guarded(|| {
+                reader
+                    .next()
+                    .transpose()
+                    .map_err(|err| read_error(format!("Invalid Parquet: {err}")))
+            });
+            failed = batch.is_err();
+            batch.map_err(message).transpose()
+        }))
+    }
+}
+
 /// The fewest bits one value of a leaf column takes in a plain dictionary,
 /// and the bytes the reader takes for it decoded.
 fn value_sizes(leaf: &parquet::schema::types::ColumnDescriptor) -> (u64, u64) {
@@ -874,10 +1079,11 @@ fn value_sizes(leaf: &parquet::schema::types::ColumnDescriptor) -> (u64, u64) {
 /// Refuses a file one of whose rows holds more than [`MAX_ROW_VALUES`]
 /// values across its repeated columns, read from the repetition levels of
 /// every page (each page through the checks above), before the record API
-/// builds any row.
+/// builds any row. The most values a row holds in one repeated column (0:
+/// none is repeated).
 fn check_row_lengths(
     parquet: &parquet::file::serialized_reader::SerializedFileReader<ParquetFile>,
-) -> Result<(), SqlError> {
+) -> Result<u64, SqlError> {
     use parquet::column::page::Page;
     use parquet::file::reader::FileReader;
     let descr = parquet.metadata().file_metadata().schema_descr_ptr();
@@ -885,9 +1091,10 @@ fn check_row_lengths(
         .filter(|&leaf| descr.column(leaf).max_rep_level() > 0)
         .collect();
     if repeated.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let cap = MAX_ROW_VALUES / repeated.len() as u64;
+    let mut longest = 0;
     for group in 0..parquet.num_row_groups() {
         let group = parquet.get_row_group(group).map_err(parquet_error)?;
         for &leaf in &repeated {
@@ -897,6 +1104,7 @@ fn check_row_lengths(
                 values: 0,
                 cap,
                 seen: 0,
+                longest: 0,
             };
             let mut pages = group.get_column_page_reader(leaf).map_err(parquet_error)?;
             while let Some(page) = pages.get_next_page().map_err(parquet_error)? {
@@ -931,9 +1139,10 @@ fn check_row_lengths(
                     Page::DictionaryPage { .. } => {}
                 }
             }
+            longest = longest.max(row.longest);
         }
     }
-    Ok(())
+    Ok(longest)
 }
 
 /// The values of the row being measured: a repetition level of 0 starts a
@@ -943,6 +1152,8 @@ struct Row {
     cap: u64,
     /// Level runs looked at, to check for cancellation now and then.
     seen: u64,
+    /// The most values a row measured held.
+    longest: u64,
 }
 
 impl Row {
@@ -956,6 +1167,7 @@ impl Row {
             check_cancelled()?;
         }
         self.values = if level == 0 { 1 } else { self.values + count };
+        self.longest = self.longest.max(self.values);
         if self.values > self.cap {
             return Err(read_error(format!(
                 "A Parquet row holds more than {} values.",

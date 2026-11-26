@@ -6,11 +6,11 @@
 //! - snapshot management, expiring the snapshots its settings keep no
 //!   longer, as a commit of the table (the files only they referenced then
 //!   marked noncurrent at once);
+//! - compaction (see [`compaction`]), rewriting a table's small data files
+//!   into files of about its target size, as a commit of the table;
 //! - unreferenced file removal (the table bucket's): the objects of a
 //!   table's storage no snapshot references, older than unreferencedDays,
 //!   marked noncurrent, and deleted nonCurrentDays after.
-//!
-//! Compaction is not built: its configuration is refused.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -21,6 +21,8 @@ use tokio::sync::watch;
 use truthdb_object::{ListAfter, MaintenanceRecord, TableInfo, VersionSel};
 
 use super::{TError, read, write};
+
+mod compaction;
 use crate::server::S3State;
 
 pub(super) const SNAPSHOT_MANAGEMENT: &str = "icebergSnapshotManagement";
@@ -43,15 +45,30 @@ const DROP_GRACE_MS: u64 = 15 * 60 * 1000;
 const STALE: &str = "Failed to commit because of out of date metadata. Maintenance will be retried at the next available opportunity.";
 const GC_DISABLED: &str = "Iceberg snapshot management and unreferenced file removal is not supported when the 'gc.enabled' table property is false.";
 
-/// A type's settings and their defaults: "MinimumSnapshots (1 by default)
-/// and MaximumSnapshotAge (120 hours by default)", "unreferencedDays (3
-/// days by default) and nonCurrentDays (10 days by default)".
+/// A type's numeric settings and their defaults: "MinimumSnapshots (1 by
+/// default) and MaximumSnapshotAge (120 hours by default)",
+/// "unreferencedDays (3 days by default) and nonCurrentDays (10 days by
+/// default)", "a default target file size of 512MB".
 fn defaults(kind: &str) -> &'static [(&'static str, i64)] {
     match kind {
         SNAPSHOT_MANAGEMENT => &[("minSnapshotsToKeep", 1), ("maxSnapshotAgeHours", 120)],
         UNREFERENCED_FILE_REMOVAL => &[("unreferencedDays", 3), ("nonCurrentDays", 10)],
+        COMPACTION => &[("targetFileSizeMB", 512)],
         _ => &[],
     }
+}
+
+/// A type's settings as they are by default (compaction's strategy "auto
+/// (Default)" besides the numbers).
+fn default_settings(kind: &str) -> Map<String, Value> {
+    let mut settings: Map<String, Value> = defaults(kind)
+        .iter()
+        .map(|(field, value)| (field.to_string(), json!(value)))
+        .collect();
+    if kind == COMPACTION {
+        settings.insert("strategy".to_string(), json!("auto"));
+    }
+    settings
 }
 
 /// A configuration of `kind`: as put, or the default ("enabled by
@@ -59,13 +76,9 @@ fn defaults(kind: &str) -> &'static [(&'static str, i64)] {
 pub(super) fn configuration(kind: &str, stored: Option<&[u8]>) -> Value {
     stored
         .and_then(|value| serde_json::from_slice(value).ok())
-        .unwrap_or_else(|| {
-            let settings: Map<String, Value> = defaults(kind)
-                .iter()
-                .map(|(field, value)| (field.to_string(), json!(value)))
-                .collect();
-            json!({ "status": "enabled", "settings": { kind: settings } })
-        })
+        .unwrap_or_else(
+            || json!({ "status": "enabled", "settings": { kind: default_settings(kind) } }),
+        )
 }
 
 /// The `value` of a Put…MaintenanceConfiguration of `kind`, checked, its
@@ -91,10 +104,7 @@ fn checked_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError
         None => "enabled",
         Some(_) => return Err(TError::bad("status is enabled or disabled.")),
     };
-    let mut kept: Map<String, Value> = defaults(kind)
-        .iter()
-        .map(|(field, value)| (field.to_string(), json!(value)))
-        .collect();
+    let mut kept = default_settings(kind);
     if let Some(settings) = value.get("settings").filter(|settings| !settings.is_null()) {
         let settings = settings
             .as_object()
@@ -112,11 +122,32 @@ fn checked_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError
                 if !kept.contains_key(field) {
                     return Err(TError::bad(format!("{field} is not a {kind} setting.")));
                 }
+                if field == "strategy" {
+                    match value.as_str() {
+                        Some("auto" | "binpack") => {
+                            kept.insert(field.clone(), value.clone());
+                            continue;
+                        }
+                        Some("sort" | "z-order") => {
+                            return Err(TError::not_implemented(
+                                "The sort and z-order compaction strategies",
+                            ));
+                        }
+                        _ => {
+                            return Err(TError::bad("strategy is auto, binpack, sort or z-order."));
+                        }
+                    }
+                }
                 // PositiveInteger: 1 to 2147483647.
                 let positive = value
                     .as_i64()
                     .filter(|value| (1..=i64::from(i32::MAX)).contains(value))
                     .ok_or_else(|| TError::bad(format!("{field} is from 1 to 2147483647.")))?;
+                // "The minimum target compaction file size is 64MB; the
+                // maximum is 512MB."
+                if field == "targetFileSizeMB" && !(64..=512).contains(&positive) {
+                    return Err(TError::bad("targetFileSizeMB is from 64 to 512."));
+                }
                 kept.insert(field.clone(), json!(positive));
             }
         }
@@ -127,8 +158,7 @@ fn checked_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError
 /// A PutTableMaintenanceConfiguration's `value`, checked.
 pub(super) fn put_value(kind: &str, input: &Map<String, Value>) -> Result<Value, TError> {
     match kind {
-        SNAPSHOT_MANAGEMENT => checked_value(kind, input),
-        COMPACTION => Err(TError::not_implemented("Table compaction")),
+        SNAPSHOT_MANAGEMENT | COMPACTION => checked_value(kind, input),
         _ => Err(TError::bad(
             "type is icebergCompaction or icebergSnapshotManagement.",
         )),
@@ -200,7 +230,8 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
 /// A maintenance job of a table.
 #[derive(Clone, Copy)]
 enum Job {
-    /// Its own configuration's.
+    /// Its own configurations'.
+    Compaction,
     Snapshots,
     /// Its table bucket's.
     Files,
@@ -209,6 +240,7 @@ enum Job {
 impl Job {
     fn kind(self) -> &'static str {
         match self {
+            Job::Compaction => COMPACTION,
             Job::Snapshots => SNAPSHOT_MANAGEMENT,
             Job::Files => UNREFERENCED_FILE_REMOVAL,
         }
@@ -227,7 +259,7 @@ async fn pass(state: &S3State) -> Result<(), TError> {
         after = Some(last.clone());
         // One table's (or job's) failure stops no other's.
         for (_, account, bucket, table) in tables {
-            for job in [Job::Snapshots, Job::Files] {
+            for job in [Job::Compaction, Job::Snapshots, Job::Files] {
                 if let Err(err) = maintain(state, (&account, &bucket), &table, job).await {
                     eprintln!("table maintenance of {}: {}", table.id, err.message);
                 }
@@ -251,7 +283,7 @@ async fn maintain(
     let (table, stored, status) = read(state, move |file| {
         let at = (owner.as_str(), looked.as_str());
         let of = match job {
-            Job::Snapshots => Some(id.as_str()),
+            Job::Compaction | Job::Snapshots => Some(id.as_str()),
             Job::Files => None,
         };
         Ok((
@@ -298,6 +330,17 @@ async fn maintain(
             })
         };
         let outcome = match job {
+            Job::Compaction => {
+                let strategy = settings["strategy"].as_str().unwrap_or("auto");
+                compaction::compact(
+                    state,
+                    (account, bucket),
+                    table,
+                    (setting("targetFileSizeMB"), strategy),
+                    now,
+                )
+                .await
+            }
             Job::Snapshots => {
                 let keep = setting("minSnapshotsToKeep");
                 let age_ms = setting("maxSnapshotAgeHours").saturating_mul(3_600_000);
@@ -546,6 +589,13 @@ async fn references(
             .map(|()| None),
         }
     };
+    // The snapshots whose deleted entries are references: those a changelog
+    // reads, every one but a `replace` (see `manifest_files`).
+    let changelog: HashSet<i64> = snapshots
+        .iter()
+        .filter(|snapshot| snapshot["summary"]["operation"].as_str() != Some("replace"))
+        .filter_map(|snapshot| snapshot["snapshot-id"].as_i64())
+        .collect();
     let mut manifests = HashSet::new();
     for snapshot in snapshots {
         // Its manifest list's manifests, or (format version 1) its own.
@@ -569,7 +619,7 @@ async fn references(
             }
             (None, Some(inline)) => inline
                 .iter()
-                .filter_map(|manifest| manifest.as_str().map(str::to_string))
+                .filter_map(|manifest| Some((manifest.as_str()?.to_string(), None)))
                 .collect(),
             (None, None) => {
                 unread(format!(
@@ -579,14 +629,18 @@ async fn references(
                 continue;
             }
         };
-        for manifest in listed {
+        for (manifest, added) in listed {
             let Some(manifest_key) = readable(&manifest, "manifest")? else {
                 continue;
             };
             if manifests.insert(manifest_key.clone()) {
                 let files = stored(state, &bucket, &manifest_key)
                     .await
-                    .and_then(|bytes| crate::iceberg_manifests::manifest_files(&bytes));
+                    .and_then(|bytes| {
+                        crate::iceberg_manifests::manifest_files(&bytes, added, |id| {
+                            changelog.contains(&id)
+                        })
+                    });
                 keys.insert(manifest_key);
                 match files {
                     Ok(files) => {
