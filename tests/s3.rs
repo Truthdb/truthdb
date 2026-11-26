@@ -20426,6 +20426,222 @@ fn requests_through_an_access_point_act_on_its_bucket_as_both_allow() {
     );
 }
 
+#[test]
+fn requests_through_an_access_point_are_counted_logged_and_recorded_for_its_bucket() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "observed");
+    let (outsider, outsider_key, outsider_secret) = account_with_key(&server, "outsider");
+    let script = server.dir.join("observed.py");
+    std::fs::write(&script, OBSERVED_SCRIPT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &outsider,
+            &outsider_key,
+            &outsider_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const OBSERVED_SCRIPT: &str = r#"
+import datetime, gzip, json, re, sys, time, urllib.error, urllib.request
+import boto3, botocore.config, botocore.exceptions
+import socket
+port, account, key, secret, outsider, outsider_key, outsider_secret = sys.argv[1:8]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service, access=key, secret_key=secret):
+    return boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+s3, control, cw, ct = client("s3"), client("s3control"), client("cloudwatch"), client("cloudtrail")
+def wait_for(check):
+    deadline = time.time() + 30
+    while True:
+        try:
+            if check():
+                return
+        except AssertionError:
+            pass
+        assert time.time() < deadline, "never"
+        time.sleep(0.5)
+for bucket in ["data", "logs"]:
+    s3.create_bucket(Bucket=bucket)
+alias = control.create_access_point(AccountId=account, Name="reader", Bucket="data")["Alias"]
+arn = f"arn:aws:s3:us-east-1:{account}:accesspoint/reader"
+control.create_access_point(AccountId=account, Name="other", Bucket="data")
+# Counted: under a filter on the access point, the requests through it on
+# single objects (with a prefix, only those under it too).
+for id, filter in [("Point", {"AccessPointArn": arn}),
+        ("PointDocs", {"And": {"Prefix": "docs/", "AccessPointArn": arn}}),
+        ("Other", {"AccessPointArn": f"arn:aws:s3:us-east-1:{account}:accesspoint/other"})]:
+    s3.put_bucket_metrics_configuration(Bucket="data", Id=id, MetricsConfiguration={"Id": id, "Filter": filter})
+s3.put_bucket_metrics_configuration(Bucket="data", Id="Entire", MetricsConfiguration={"Id": "Entire"})
+s3.put_bucket_logging(Bucket="data", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "logs", "TargetPrefix": "access/"}})
+ct.create_trail(Name="observer", S3BucketName="logs", S3KeyPrefix="trail")
+ct.put_event_selectors(TrailName="observer", EventSelectors=[{"ReadWriteType": "All", "IncludeManagementEvents": True,
+    "DataResources": [{"Type": "AWS::S3::Object", "Values": ["arn:aws:s3:::data/"]}]}])
+ct.start_logging(Name="observer")
+s3.put_bucket_cors(Bucket="data", CORSConfiguration={"CORSRules": [
+    {"AllowedOrigins": ["https://site.test"], "AllowedMethods": ["GET"]}]})
+s3.put_object(Bucket="data", Key="img/b", Body=b"b")
+s3.put_object(Bucket=alias, Key="docs/a", Body=b"a")
+assert s3.get_object(Bucket=alias, Key="docs/a")["Body"].read() == b"a"
+assert s3.get_object(Bucket=alias, Key="img/b")["Body"].read() == b"b"
+s3.list_objects_v2(Bucket=alias)
+assert s3.get_object(Bucket="data", Key="docs/a")["Body"].read() == b"a"
+s3.get_bucket_acl(Bucket=alias)
+now = datetime.datetime.now(datetime.timezone.utc)
+def total(filter_id, bucket="data"):
+    points = cw.get_metric_statistics(Namespace="AWS/S3", MetricName="AllRequests",
+        Dimensions=[{"Name": "BucketName", "Value": bucket}, {"Name": "FilterId", "Value": filter_id}],
+        StartTime=now - datetime.timedelta(minutes=30), EndTime=now + datetime.timedelta(minutes=5),
+        Period=60, Statistics=["Sum"])["Datapoints"]
+    return sum(point["Sum"] for point in points)
+# The bucket's, all of them, through the access point or not: its own
+# configuration's PUT, the logging and CORS ones, two puts, three gets, a
+# listing and an ACL read.
+wait_for(lambda: total("Entire") == 10)
+assert (total("Point"), total("PointDocs"), total("Other")) == (3, 2, 0), (
+    total("Point"), total("PointDocs"), total("Other"))
+assert total("Entire", alias) == 0
+# Its access log lines: its bucket's, with the access point's ARN.
+LINE = re.compile(r'(\S+) (\S+) \[([^\]]+)\] (\S+) (\S+) (\S+) (\S+) (\S+) "([^"]*)" (\S+) (\S+) (\S+) (\S+) '
+    r'(\S+) (\S+) "([^"]*)" "([^"]*)" (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+)$')
+NAMES = ["owner", "bucket", "time", "ip", "requester", "request_id", "operation", "key", "uri", "status",
+    "error", "sent", "size", "total", "turnaround", "referer", "agent", "version", "host_id", "signature",
+    "cipher", "auth", "host", "tls", "access_point", "acl", "region"]
+def lines():
+    out = []
+    for o in s3.list_objects_v2(Bucket="logs", Prefix="access/").get("Contents", []):
+        for line in s3.get_object(Bucket="logs", Key=o["Key"])["Body"].read().decode().splitlines():
+            match = LINE.match(line)
+            assert match, line
+            out.append(dict(zip(NAMES, match.groups())))
+    return out
+wait_for(lambda: len([l for l in lines() if l["operation"] == "REST.GET.OBJECT"]) == 3)
+gets = {(l["key"], l["access_point"], l["bucket"]) for l in lines() if l["operation"] == "REST.GET.OBJECT"}
+assert gets == {("docs/a", arn, "data"), ("img/b", arn, "data"), ("docs/a", "-", "data")}, gets
+assert {l["access_point"] for l in lines() if l["operation"] == "REST.GET.BUCKET"} == {arn}, lines()
+# Its events: its bucket's, with the access point as a resource.
+def records():
+    out = []
+    for o in s3.list_objects_v2(Bucket="logs", Prefix="trail").get("Contents", []):
+        out += json.loads(gzip.decompress(s3.get_object(Bucket="logs", Key=o["Key"])["Body"].read()))["Records"]
+    return out
+wait_for(lambda: len([r for r in records() if r["eventName"] == "GetObject"]) == 3
+    and any(r["eventName"] == "GetBucketAcl" for r in records()))
+point = {"accountId": account, "type": "AWS::S3::AccessPoint", "ARN": arn}
+through = []
+for record in records():
+    if record["eventName"] not in ("GetObject", "ListObjects", "GetBucketAcl"):
+        continue
+    assert record["requestParameters"]["bucketName"] == "data", record
+    assert {"accountId": account, "type": "AWS::S3::Bucket", "ARN": "arn:aws:s3:::data"} in record["resources"], record
+    through.append((record["eventName"], record["requestParameters"].get("key"), point in record["resources"]))
+assert sorted(through) == [("GetBucketAcl", None, True), ("GetObject", "docs/a", False), ("GetObject", "docs/a", True),
+    ("GetObject", "img/b", True), ("ListObjects", None, True)], through
+# Cross-origin answers through it: its bucket's CORS configuration, for a
+# preflight and for the request itself (here an anonymous one, refused).
+def send(method, headers):
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/{alias}/docs/a", method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status, response.headers
+    except urllib.error.HTTPError as error:
+        return error.code, error.headers
+status, headers = send("OPTIONS", {"Origin": "https://site.test", "Access-Control-Request-Method": "GET"})
+assert status == 200 and headers["Access-Control-Allow-Origin"] == "https://site.test", (status, dict(headers))
+status, headers = send("GET", {"Origin": "https://site.test"})
+assert status == 403 and headers["Access-Control-Allow-Origin"] == "https://site.test", (status, dict(headers))
+# Both counted for the bucket.
+wait_for(lambda: total("Entire") == 12)
+# A preflight on a name that is no access point's answers as on one that is
+# no bucket's.
+def preflight(path):
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="OPTIONS",
+        headers={"Origin": "https://site.test", "Access-Control-Request-Method": "GET"})
+    try:
+        urllib.request.urlopen(request)
+        raise SystemExit(f"answered: {path}")
+    except urllib.error.HTTPError as error:
+        return error.code, re.search(r"<Code>(\w+)</Code>", error.read().decode()).group(1)
+assert preflight("/nothing-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-s3alias/k") == preflight("/nobucket/k")
+# Another account's refused requests through it: its own events name what
+# it gave, not the bucket nor the access point; the bucket owner's, both.
+their_s3, their_ct = client("s3", outsider_key, outsider_secret), client("cloudtrail", outsider_key, outsider_secret)
+their_s3.create_bucket(Bucket="their-logs")
+their_ct.create_trail(Name="watcher", S3BucketName="their-logs")
+their_ct.put_event_selectors(TrailName="watcher", AdvancedEventSelectors=[{"Name": "data", "FieldSelectors": [
+    {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": ["AWS::S3::Object"]}]}])
+their_ct.start_logging(Name="watcher")
+for call in [lambda: their_s3.get_object(Bucket=alias, Key="docs/a"), lambda: their_s3.get_bucket_acl(Bucket=alias)]:
+    try:
+        call()
+        raise SystemExit("not refused")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == "AccessDenied", error.response
+# A multiple delete answers its refusals inside a success.
+deleted = their_s3.delete_objects(Bucket=alias, Delete={"Objects": [{"Key": "docs/a"}]})
+assert [e["Code"] for e in deleted["Errors"]] == ["AccessDenied"], deleted
+def their_records(name="GetObject"):
+    out = []
+    for o in their_s3.list_objects_v2(Bucket="their-logs").get("Contents", []):
+        out += json.loads(gzip.decompress(their_s3.get_object(Bucket="their-logs", Key=o["Key"])["Body"].read()))["Records"]
+    return [r for r in out if r["eventName"] == name]
+wait_for(lambda: their_records() and their_records("DeleteObjects"))
+for theirs in [their_records()[0], their_records("DeleteObjects")[0]]:
+    assert theirs["requestParameters"]["bucketName"] == alias, theirs
+    assert "data" not in json.dumps(theirs["resources"]) and "accesspoint" not in json.dumps(theirs), theirs
+    assert account not in json.dumps(theirs["resources"]), theirs
+def their_acl():
+    events = their_ct.lookup_events(LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "GetBucketAcl"}])["Events"]
+    return [json.loads(event["CloudTrailEvent"]) for event in events]
+wait_for(lambda: their_acl())
+acl = their_acl()[0]
+assert acl["requestParameters"]["bucketName"] == alias and "accesspoint" not in json.dumps(acl), acl
+wait_for(lambda: any(r.get("errorCode") == "AccessDenied" and r["eventName"] == "GetObject" for r in records()))
+owners = [r for r in records() if r.get("errorCode") == "AccessDenied" and r["eventName"] == "GetObject"][0]
+assert owners["requestParameters"]["bucketName"] == "data" and point in owners["resources"], owners
+# Its own access point on the bucket, refused by the bucket: the bucket's
+# owner is told the bucket, and the access point (another account's).
+their_control = client("s3control", outsider_key, outsider_secret)
+their_alias = their_control.create_access_point(AccountId=outsider, Name="theirs", Bucket="data",
+    BucketAccountId=account)["Alias"]
+try:
+    their_s3.get_object(Bucket=their_alias, Key="img/b")
+    raise SystemExit("not refused")
+except botocore.exceptions.ClientError as error:
+    assert error.response["Error"]["Code"] == "AccessDenied", error.response
+def refused_through_theirs():
+    return [r for r in records() if r.get("errorCode") == "AccessDenied" and r["eventName"] == "GetObject"
+        and r["requestParameters"].get("key") == "img/b"]
+wait_for(lambda: refused_through_theirs())
+told = refused_through_theirs()[0]
+assert told["requestParameters"]["bucketName"] == "data", told
+assert {"accountId": outsider, "type": "AWS::S3::AccessPoint",
+    "ARN": f"arn:aws:s3:us-east-1:{outsider}:accesspoint/theirs"} in told["resources"], told
+print("ok")
+"#;
+
 const THROUGH_SCRIPT: &str = r#"
 import json, socket, sys
 import boto3, botocore.config, botocore.exceptions

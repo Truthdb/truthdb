@@ -102,13 +102,35 @@ pub(crate) struct Call {
     /// (a refused call's may be another's), and its access point (its
     /// name; none: ListAccessPoints) and query parameters.
     control: Option<ControlCall>,
+    /// The access point the request was made through.
+    through: Option<Through>,
     host: Option<String>,
     user_agent: Option<String>,
     source_ip: Option<String>,
     tls: bool,
 }
 
+/// The access point a request was made through, as its event tells it.
+struct Through {
+    /// The name the request gave in place of the bucket's.
+    given: Option<String>,
+    arn: String,
+    /// The access point's account.
+    account: String,
+}
+
 impl Call {
+    /// This event for a request made through the access point of ARN `arn`,
+    /// on its bucket `bucket` (the name the request gave was the access
+    /// point's).
+    pub(crate) fn through(&mut self, bucket: &str, arn: &str) {
+        self.through = Some(Through {
+            given: self.bucket.replace(bucket.to_string()),
+            arn: arn.to_string(),
+            account: arn.split(':').nth(4).unwrap_or("").to_string(),
+        });
+    }
+
     /// The management event `request` makes, if it is one.
     pub(crate) fn of(request: &hyper::Request<Incoming>) -> Option<Call> {
         if request
@@ -263,6 +285,7 @@ impl Call {
             source: None,
             express,
             control: None,
+            through: None,
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
@@ -487,6 +510,18 @@ fn record(
     error: Option<(&str, &str)>,
     fit: Fit,
 ) -> Value {
+    // Through an access point: its bucket and the access point, except in
+    // the event of an account owning neither (it gave the access point's
+    // name; whether it was let through or not, its answers need not have
+    // named the bucket, as a DeleteObjects' refusals or a GetObject's do
+    // not).
+    let through = call.through.as_ref();
+    let hidden =
+        through.is_some_and(|through| recipient != through.account && owner != Some(recipient));
+    let (bucket_named, through, owner) = match through {
+        Some(through) if hidden => (through.given.as_ref(), None, None),
+        through => (call.bucket.as_ref(), through, owner),
+    };
     let (principal, signed) = who;
     let account = &principal.account;
     let identity = match &principal.user {
@@ -512,7 +547,7 @@ fn record(
     };
     let iso = crate::time::iso8601(time_ms);
     let mut parameters = json!({});
-    if let Some(bucket) = &call.bucket {
+    if let Some(bucket) = bucket_named {
         parameters["bucketName"] = json!(bucket);
     }
     if let Some(host) = &call.host {
@@ -560,7 +595,7 @@ fn record(
         "recipientAccountId": recipient,
         "eventCategory": if call.data { "Data" } else { "Management" },
     });
-    if let Some(bucket) = &call.bucket {
+    if let Some(bucket) = bucket_named {
         // A name no bucket can have (a refused call's) made printable and
         // cut short.
         let bucket = truncated(&printable(bucket), 255).to_string();
@@ -615,6 +650,14 @@ fn record(
             }
             if let Some(source) = &call.source {
                 resources.insert(1, source_resource(state, source, source_owner, account));
+            }
+            // And the access point it was made through.
+            if let Some(through) = through {
+                resources.push(json!({
+                    "accountId": through.account,
+                    "type": "AWS::S3::AccessPoint",
+                    "ARN": through.arn,
+                }));
             }
             record["resources"] = json!(resources);
         }

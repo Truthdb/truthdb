@@ -38,6 +38,8 @@ struct Seen {
     requester: Mutex<(Option<String>, Option<crate::server::Signed>)>,
     /// A copy's source bucket, and its owner when the read was allowed.
     copy_source: Mutex<Option<(String, String)>>,
+    /// The access point the request was made through: its bucket and ARN.
+    through: Mutex<Option<(String, String)>>,
 }
 
 impl BucketSeen {
@@ -108,6 +110,24 @@ impl BucketSeen {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|(bucket, _)| bucket.clone())
+    }
+
+    pub(crate) fn mark_through(&self, bucket: &str, arn: &str) {
+        *self
+            .0
+            .through
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((bucket.to_string(), arn.to_string()));
+    }
+
+    /// The access point the request was made through: its bucket and ARN.
+    pub(crate) fn through(&self) -> Option<(String, String)> {
+        self.0
+            .through
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The copy source bucket's owner when the read was allowed.

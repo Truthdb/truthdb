@@ -811,11 +811,16 @@ pub(crate) async fn resolve<B>(
         .map(|text| Policy::parse(&text, PolicyKind::Bucket))
         .transpose()
         .map_err(|err| S3Error::internal(format!("stored access point policy: {}", err.0)))?;
-    request.extensions_mut().insert(Via {
+    let via = Via {
         point,
         policy,
         reads_tags,
-    });
+    };
+    // What the request's metrics, log line and events count it for.
+    if let Some(seen) = crate::metering::seen_of(request) {
+        seen.mark_through(&via.point.bucket, &via.arn(&state.region));
+    }
+    request.extensions_mut().insert(via);
     Ok(())
 }
 
