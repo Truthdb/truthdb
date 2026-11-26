@@ -1031,16 +1031,33 @@ impl ArrowParquet {
         &self,
         group: usize,
     ) -> Result<impl Iterator<Item = Result<arrow_array::RecordBatch, String>>, String> {
+        self.batches_of(group, None)
+    }
+
+    /// [`Self::batches`] of the top-level columns `roots` only (all, with
+    /// none).
+    pub fn batches_of(
+        &self,
+        group: usize,
+        roots: Option<&[usize]>,
+    ) -> Result<impl Iterator<Item = Result<arrow_array::RecordBatch, String>>, String> {
         let message = |err: SqlError| err.message;
         let mut reader = parquet_guarded(|| {
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::new_with_metadata(
-                self.file.clone(),
-                self.metadata.clone(),
-            )
-            .with_row_groups(vec![group])
-            .with_batch_size(self.batch_rows)
-            .build()
-            .map_err(parquet_error)
+            let mut builder =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    self.file.clone(),
+                    self.metadata.clone(),
+                )
+                .with_row_groups(vec![group])
+                .with_batch_size(self.batch_rows);
+            if let Some(roots) = roots {
+                let mask = parquet::arrow::ProjectionMask::roots(
+                    self.metadata.metadata().file_metadata().schema_descr(),
+                    roots.iter().copied(),
+                );
+                builder = builder.with_projection(mask);
+            }
+            builder.build().map_err(parquet_error)
         })
         .map_err(message)?;
         let mut failed = false;
