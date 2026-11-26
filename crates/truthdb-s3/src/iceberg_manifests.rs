@@ -32,26 +32,48 @@ fn records(bytes: &[u8], what: &str) -> Result<Vec<Avro>, String> {
         .collect()
 }
 
-/// The manifests a manifest list names (its entries' `manifest_path`).
-pub(crate) fn manifest_list(bytes: &[u8]) -> Result<Vec<String>, String> {
+/// The manifests a manifest list names (its entries' `manifest_path`), each
+/// with the snapshot that added it (`added_snapshot_id`, if given).
+pub(crate) fn manifest_list(bytes: &[u8]) -> Result<Vec<(String, Option<i64>)>, String> {
     records(bytes, "A manifest list")?
         .iter()
         .map(|entry| {
-            text(field(entry, "manifest_path"))
+            let path = text(field(entry, "manifest_path"))
                 .map(str::to_string)
-                .ok_or_else(|| "A manifest list entry has no manifest_path.".to_string())
+                .ok_or_else(|| "A manifest list entry has no manifest_path.".to_string())?;
+            Ok((path, long(field(entry, "added_snapshot_id"))))
         })
         .collect()
 }
 
-/// The data and delete files a manifest's live entries name (each
-/// `data_file.file_path`). A deleted entry (status 2) is not a reference: a
-/// snapshot that still holds the file holds it in a live entry of its own
-/// manifests, and no reader reads a deleted one.
-pub(crate) fn manifest_files(bytes: &[u8]) -> Result<Vec<String>, String> {
+fn long(value: Option<&Avro>) -> Option<i64> {
+    match value? {
+        Avro::Long(value) => Some(*value),
+        Avro::Int(value) => Some(i64::from(*value)),
+        _ => None,
+    }
+}
+
+/// The data and delete files a manifest names (each `data_file.file_path`):
+/// its live entries', and its deleted entries' (status 2) whose snapshot
+/// `counts` (the entry's `snapshot_id`, else the snapshot that added the
+/// manifest, `added`; one not known counts). A deleted entry is read by a
+/// changelog of the snapshot that deleted the file (its deleted rows), not
+/// by a scan: so it is a reference while that snapshot is, unless it is a
+/// `replace` (which a changelog skips), as Iceberg's expiry keeps it.
+pub(crate) fn manifest_files(
+    bytes: &[u8],
+    added: Option<i64>,
+    counts: impl Fn(i64) -> bool,
+) -> Result<Vec<String>, String> {
     records(bytes, "A manifest")?
         .iter()
-        .filter(|entry| !matches!(field(entry, "status"), Some(Avro::Int(2))))
+        .filter(|entry| {
+            !matches!(field(entry, "status"), Some(Avro::Int(2)))
+                || long(field(entry, "snapshot_id"))
+                    .or(added)
+                    .is_none_or(&counts)
+        })
         .map(|entry| {
             field(entry, "data_file")
                 .and_then(|file| text(field(file, "file_path")))
@@ -323,7 +345,10 @@ mod tests {
         let bytes = writer.into_inner().unwrap();
         assert_eq!(
             manifest_list(&bytes).unwrap(),
-            ["s3://t/metadata/m1.avro", "s3://t/metadata/m2.avro"]
+            [
+                ("s3://t/metadata/m1.avro".to_string(), None),
+                ("s3://t/metadata/m2.avro".to_string(), None)
+            ]
         );
         let manifest = Schema::parse_str(
             r#"{"type": "record", "name": "manifest_entry", "fields": [
@@ -348,10 +373,18 @@ mod tests {
             writer.append(record).unwrap();
         }
         let bytes = writer.into_inner().unwrap();
-        // Not the deleted entry's file.
-        assert_eq!(manifest_files(&bytes).unwrap(), ["s3://t/data/a.parquet"]);
+        // The deleted entry's file while its snapshot (7) counts, or when
+        // whose it is is not known; not otherwise.
+        assert_eq!(
+            manifest_files(&bytes, None, |id| id == 7).unwrap(),
+            ["s3://t/data/a.parquet", "s3://t/data/b.parquet"]
+        );
+        assert_eq!(
+            manifest_files(&bytes, None, |_| false).unwrap(),
+            ["s3://t/data/a.parquet"]
+        );
         assert!(manifest_list(b"not avro").is_err());
-        assert!(manifest_files(&manifest_list_bytes_without_path()).is_err());
+        assert!(manifest_files(&manifest_list_bytes_without_path(), None, |_| true).is_err());
     }
 
     /// The `data_file` record's schema of `manifest`.

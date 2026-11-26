@@ -589,6 +589,13 @@ async fn references(
             .map(|()| None),
         }
     };
+    // The snapshots whose deleted entries are references: those a changelog
+    // reads, every one but a `replace` (see `manifest_files`).
+    let changelog: HashSet<i64> = snapshots
+        .iter()
+        .filter(|snapshot| snapshot["summary"]["operation"].as_str() != Some("replace"))
+        .filter_map(|snapshot| snapshot["snapshot-id"].as_i64())
+        .collect();
     let mut manifests = HashSet::new();
     for snapshot in snapshots {
         // Its manifest list's manifests, or (format version 1) its own.
@@ -612,7 +619,7 @@ async fn references(
             }
             (None, Some(inline)) => inline
                 .iter()
-                .filter_map(|manifest| manifest.as_str().map(str::to_string))
+                .filter_map(|manifest| Some((manifest.as_str()?.to_string(), None)))
                 .collect(),
             (None, None) => {
                 unread(format!(
@@ -622,14 +629,18 @@ async fn references(
                 continue;
             }
         };
-        for manifest in listed {
+        for (manifest, added) in listed {
             let Some(manifest_key) = readable(&manifest, "manifest")? else {
                 continue;
             };
             if manifests.insert(manifest_key.clone()) {
                 let files = stored(state, &bucket, &manifest_key)
                     .await
-                    .and_then(|bytes| crate::iceberg_manifests::manifest_files(&bytes));
+                    .and_then(|bytes| {
+                        crate::iceberg_manifests::manifest_files(&bytes, added, |id| {
+                            changelog.contains(&id)
+                        })
+                    });
                 keys.insert(manifest_key);
                 match files {
                     Ok(files) => {

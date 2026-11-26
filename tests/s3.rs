@@ -19584,6 +19584,25 @@ for _ in range(300):
 else:
     raise SystemExit(f"the compacted-away files were kept: {[k for k in old_keys if not gone(k)]}")
 assert len(c.load_table(("lake", "plain")).scan().to_arrow()) == 18
+# A file a kept delete's snapshot names as deleted is read by its changelog
+# (the deleted rows): kept, though no snapshot holds it live.
+changelog = table("changelog")
+changelog.append(rows(0))
+appended = changelog.current_snapshot().snapshot_id
+[deleted_file] = [f["file_path"] for f in files(changelog)]
+changelog.delete("id = 0")
+c._session.post(c.url("namespaces/lake/tables/changelog", prefixed=True), json={"requirements": [],
+    "updates": [{"action": "remove-snapshots", "snapshot-ids": [appended]}]}).raise_for_status()
+since = time.time()
+for _ in range(300):
+    removal = t.get_table_maintenance_job_status(**at, name="changelog")["status"]["icebergUnreferencedFileRemoval"]
+    if removal["status"] == "Successful" and removal["lastRunTimestamp"].timestamp() > since + 3:
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"no removal run: {removal}")
+changelog_store = deleted_file.split("/")[2]
+s3.head_object(Bucket=changelog_store, Key=deleted_file.split("/", 3)[3])
 t.put_table_bucket_maintenance_configuration(tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
     value={"status": "disabled"})
 
