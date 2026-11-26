@@ -1012,17 +1012,20 @@ fn rewrite_files(
 /// takes (a key holds its columns' values).
 const MAX_ROWS: i64 = 1 << 33;
 const MAX_DELETE_BYTES: usize = 512 << 20;
-/// What one held key takes besides its bytes.
-const DELETE_OVERHEAD: usize = 32;
+/// What one held key takes besides its bytes (its box, its sequence
+/// number, the table's control bytes and slack, and allocation rounding).
+const DELETE_OVERHEAD: usize = 64;
 /// Position delete files' columns.
 const FILE_PATH: i32 = 2_147_483_546;
 const POS: i32 = 2_147_483_545;
 
-/// A data file's deleted rows, a bit a row (rows past those its manifest
-/// counts are not marked: the file is then refused for its count).
+/// A data file's deleted rows, a bit a row, held from the first one marked
+/// (rows past those its manifest counts are not marked: the file is then
+/// refused for its count).
 struct Deleted {
     bits: Vec<u64>,
     rows: u64,
+    marked: u64,
 }
 
 impl Deleted {
@@ -1032,26 +1035,36 @@ impl Deleted {
                 "A data file of {records} rows is not rewritten here."
             ));
         }
-        let rows = records as u64;
         Ok(Deleted {
-            bits: vec![0; rows.div_ceil(64) as usize],
-            rows,
+            bits: Vec::new(),
+            rows: records as u64,
+            marked: 0,
         })
     }
 
     fn mark(&mut self, row: u64) {
-        if row < self.rows {
-            self.bits[(row / 64) as usize] |= 1 << (row % 64);
+        if row >= self.rows {
+            return;
+        }
+        if self.bits.is_empty() {
+            self.bits = vec![0; self.rows.div_ceil(64) as usize];
+        }
+        let (word, bit) = ((row / 64) as usize, 1 << (row % 64));
+        if self.bits[word] & bit == 0 {
+            self.bits[word] |= bit;
+            self.marked += 1;
         }
     }
 
     fn is_marked(&self, row: u64) -> bool {
-        row < self.rows && self.bits[(row / 64) as usize] & (1 << (row % 64)) != 0
+        self.marked > 0
+            && row < self.rows
+            && self.bits[(row / 64) as usize] & (1 << (row % 64)) != 0
     }
 
     /// Which of `count` rows from row `first` are kept (none: all).
     fn kept(&self, first: u64, count: usize) -> Option<arrow_array::BooleanArray> {
-        if self.bits.iter().all(|word| *word == 0) {
+        if self.marked == 0 {
             return None;
         }
         Some(arrow_array::BooleanArray::from(
@@ -2386,9 +2399,12 @@ mod tests {
         assert!(Deleted::new(MAX_ROWS + 1).is_err());
         let mut deleted = Deleted::new(130).unwrap();
         assert!(deleted.kept(0, 130).is_none());
-        for row in [0, 63, 64, 129, 130, 1000] {
+        // Nothing held until a row is marked.
+        assert!(deleted.bits.is_empty());
+        for row in [0, 63, 64, 129, 130, 1000, 64] {
             deleted.mark(row);
         }
+        assert_eq!(deleted.marked, 4);
         let kept = deleted.kept(60, 10).unwrap();
         let kept: Vec<bool> = (0..10).map(|at| kept.value(at)).collect();
         assert_eq!(
