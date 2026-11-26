@@ -20378,6 +20378,168 @@ print("ok")
 "#;
 
 #[test]
+fn object_lambda_access_points_are_made_configured_and_listed_through_s3_control() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "shaping");
+    let (other, other_key, other_secret) = account_with_key(&server, "elsewhere");
+    let (nobody_key, nobody_secret) = user_with_key(&server, &account, "nobody", None);
+    let script = server.dir.join("object_lambda_points.py");
+    std::fs::write(&script, OBJECT_LAMBDA_POINTS_SCRIPT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other,
+            &other_key,
+            &other_secret,
+            &nobody_key,
+            &nobody_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const OBJECT_LAMBDA_POINTS_SCRIPT: &str = r#"
+import datetime, json, socket, sys, time
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other, other_key, other_secret, nobody_key, nobody_secret = sys.argv[1:10]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service, access, secret_key):
+    return boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+s3, control = client("s3", key, secret), client("s3control", key, secret)
+s3.create_bucket(Bucket="data")
+control.create_access_point(AccountId=account, Name="reader", Bucket="data")
+supporting = f"arn:aws:s3:us-east-1:{account}:accesspoint/reader"
+function = f"arn:aws:lambda:us-east-1:{account}:function:shape"
+def configuration(*transformations, features=(), metrics=False, supporting=supporting):
+    out = {"SupportingAccessPoint": supporting, "CloudWatchMetricsEnabled": metrics,
+        "AllowedFeatures": list(features), "TransformationConfigurations": [
+            {"Actions": list(actions), "ContentTransformation": {"AwsLambda": dict(
+                {"FunctionArn": arn}, **({"FunctionPayload": payload} if payload else {}))}}
+            for actions, arn, payload in transformations]}
+    return out
+first = configuration((["GetObject", "HeadObject"], function, '{"mode": "upper"}'), (["ListObjectsV2"], "lister", None),
+    features=["GetObject-Range"], metrics=True)
+made = control.create_access_point_for_object_lambda(AccountId=account, Name="shaper", Configuration=first)
+assert made["ObjectLambdaAccessPointArn"] == f"arn:aws:s3-object-lambda:us-east-1:{account}:accesspoint/shaper", made
+alias = made["Alias"]
+assert alias["Status"] == "READY" and alias["Value"].startswith("shaper-") and alias["Value"].endswith("--ol-s3") \
+    and len(alias["Value"]) <= 63, alias
+got = control.get_access_point_for_object_lambda(AccountId=account, Name="shaper")
+assert got["Name"] == "shaper" and got["Alias"] == alias, got
+assert got["PublicAccessBlockConfiguration"] == {"BlockPublicAcls": True, "IgnorePublicAcls": True,
+    "BlockPublicPolicy": True, "RestrictPublicBuckets": True}, got
+assert abs(got["CreationDate"] - datetime.datetime.now(datetime.timezone.utc)) < datetime.timedelta(minutes=5), got
+assert control.get_access_point_configuration_for_object_lambda(AccountId=account, Name="shaper")["Configuration"] == first
+# A new configuration replaces it.
+second = configuration((["GetObject"], "shape", None))
+control.put_access_point_configuration_for_object_lambda(AccountId=account, Name="shaper", Configuration=second)
+assert control.get_access_point_configuration_for_object_lambda(AccountId=account, Name="shaper")["Configuration"] == second
+# Refused: its name taken; names not allowed; a configuration lacking or
+# repeating; a supporting access point missing, of another Region or of
+# another account.
+refused(lambda: control.create_access_point_for_object_lambda(AccountId=account, Name="shaper", Configuration=second),
+    "AccessPointAlreadyOwnedByYou")
+for name in ["Bad_Name", "a" * 46, "ends-"]:
+    refused(lambda: control.create_access_point_for_object_lambda(AccountId=account, Name=name, Configuration=second),
+        "InvalidRequest")
+for bad in [configuration((["GetObject"], "shape", None), (["GetObject"], "other", None)),
+        configuration((["PutObject"], "shape", None)),
+        configuration((["GetObject"], "arn:aws:s3:::nope", None)),
+        configuration((["GetObject"], "shape", None), features=["PutObject-Range"]),
+        configuration((["GetObject"], "shape", None), supporting=f"arn:aws:s3:eu-west-1:{account}:accesspoint/reader"),
+        configuration((["GetObject"], "shape", None), supporting=f"arn:aws:s3:us-east-1:{other}:accesspoint/theirs")]:
+    refused(lambda: control.create_access_point_for_object_lambda(AccountId=account, Name="bad", Configuration=bad),
+        "InvalidRequest")
+    refused(lambda: control.put_access_point_configuration_for_object_lambda(AccountId=account, Name="shaper",
+        Configuration=bad), "InvalidRequest")
+refused(lambda: control.create_access_point_for_object_lambda(AccountId=account, Name="bad",
+    Configuration=configuration((["GetObject"], "shape", None), supporting=f"arn:aws:s3:us-east-1:{account}:accesspoint/gone")),
+    "NoSuchAccessPoint")
+refused(lambda: control.put_access_point_configuration_for_object_lambda(AccountId=account, Name="missing",
+    Configuration=second), "NoSuchAccessPoint")
+# Listed by name, a page at a time.
+for name in ["alpha", "omega"]:
+    control.create_access_point_for_object_lambda(AccountId=account, Name=name, Configuration=second)
+page = control.list_access_points_for_object_lambda(AccountId=account, MaxResults=2)
+assert [p["Name"] for p in page["ObjectLambdaAccessPointList"]] == ["alpha", "omega"], page
+assert page["ObjectLambdaAccessPointList"][0]["ObjectLambdaAccessPointArn"].endswith(":accesspoint/alpha"), page
+rest = control.list_access_points_for_object_lambda(AccountId=account, MaxResults=2, NextToken=page["NextToken"])
+assert [p["Name"] for p in rest["ObjectLambdaAccessPointList"]] == ["shaper"] and "NextToken" not in rest, rest
+assert rest["ObjectLambdaAccessPointList"][0]["Alias"] == alias, rest
+# Not an access point's listing, nor the other way round.
+assert [p["Name"] for p in control.list_access_points(AccountId=account)["AccessPointList"]] == ["reader"]
+# Its policy: put, read, its status; a public one refused (its Block Public
+# Access is on for good); deleted.
+arn = made["ObjectLambdaAccessPointArn"]
+policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+    "Principal": {"AWS": f"arn:aws:iam::{account}:user/nobody"}, "Action": "s3-object-lambda:GetObject", "Resource": arn}]})
+control.put_access_point_policy_for_object_lambda(AccountId=account, Name="shaper", Policy=policy)
+assert control.get_access_point_policy_for_object_lambda(AccountId=account, Name="shaper")["Policy"] == policy
+assert control.get_access_point_policy_status_for_object_lambda(AccountId=account, Name="shaper")["PolicyStatus"] == {"IsPublic": False}
+refused(lambda: control.put_access_point_policy_for_object_lambda(AccountId=account, Name="shaper",
+    Policy=json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*",
+    "Action": "s3-object-lambda:GetObject", "Resource": arn}]})), "AccessDenied")
+refused(lambda: control.put_access_point_policy_for_object_lambda(AccountId=account, Name="shaper", Policy="{"),
+    "MalformedPolicy")
+control.delete_access_point_policy_for_object_lambda(AccountId=account, Name="shaper")
+refused(lambda: control.get_access_point_policy_for_object_lambda(AccountId=account, Name="shaper"),
+    "NoSuchAccessPointPolicy")
+assert control.get_access_point_policy_status_for_object_lambda(AccountId=account, Name="shaper")["PolicyStatus"] == {"IsPublic": False}
+# Not another account's, nor without a grant.
+theirs = client("s3control", other_key, other_secret)
+refused(lambda: theirs.get_access_point_for_object_lambda(AccountId=account, Name="shaper"), "AccessDenied")
+nobody = client("s3control", nobody_key, nobody_secret)
+refused(lambda: nobody.get_access_point_for_object_lambda(AccountId=account, Name="shaper"), "AccessDenied")
+refused(lambda: nobody.list_access_points_for_object_lambda(AccountId=account), "AccessDenied")
+# Recorded as management events on the Object Lambda access point.
+trail = client("cloudtrail", key, secret)
+for _ in range(60):
+    events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
+        "AttributeValue": "CreateAccessPointForObjectLambda"}])["Events"]
+    if events:
+        break
+    time.sleep(0.5)
+created = [json.loads(e["CloudTrailEvent"]) for e in events]
+assert any(e["resources"] == [{"accountId": account, "type": "AWS::S3ObjectLambda::AccessPoint", "ARN": arn}]
+    for e in created), created
+# Deleted with its policy; then it does not exist.
+control.put_access_point_policy_for_object_lambda(AccountId=account, Name="shaper", Policy=policy)
+control.delete_access_point_for_object_lambda(AccountId=account, Name="shaper")
+refused(lambda: control.get_access_point_for_object_lambda(AccountId=account, Name="shaper"), "NoSuchAccessPoint")
+refused(lambda: control.delete_access_point_for_object_lambda(AccountId=account, Name="shaper"), "NoSuchAccessPoint")
+control.create_access_point_for_object_lambda(AccountId=account, Name="shaper", Configuration=second)
+refused(lambda: control.get_access_point_policy_for_object_lambda(AccountId=account, Name="shaper"),
+    "NoSuchAccessPointPolicy")
+print("ok")
+"#;
+
+#[test]
 fn requests_through_an_access_point_act_on_its_bucket_as_both_allow() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

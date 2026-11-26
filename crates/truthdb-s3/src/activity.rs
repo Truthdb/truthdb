@@ -79,6 +79,8 @@ impl Who {
 struct ControlCall {
     account: String,
     access_point: Option<String>,
+    /// An Object Lambda access point's call.
+    object_lambda: bool,
     parameters: Vec<(&'static str, String)>,
 }
 
@@ -154,28 +156,48 @@ impl Call {
                 _ => return None,
             };
             (name, None)
-        } else if crate::api::control_route(request) == Some(crate::api::ControlRoute::AccessPoints)
+        } else if let Some(
+            route @ (crate::api::ControlRoute::AccessPoints
+            | crate::api::ControlRoute::ObjectLambdaPoints),
+        ) = crate::api::control_route(request)
         {
-            let rest = request
-                .uri()
-                .path()
-                .strip_prefix("/v20180820/accesspoint")
-                .unwrap_or("");
+            let lambda = route == crate::api::ControlRoute::ObjectLambdaPoints;
+            let prefix = match lambda {
+                true => crate::object_lambda::PREFIX,
+                false => "/v20180820/accesspoint",
+            };
+            let rest = request.uri().path().strip_prefix(prefix).unwrap_or("");
             let segments: Vec<&str> = rest.split('/').skip(1).collect();
             let point = segments.first().map(|name| {
                 percent_encoding::percent_decode_str(name)
                     .decode_utf8_lossy()
                     .into_owned()
             });
-            let name = match (method, segments.as_slice()) {
-                (&Method::GET, []) => "ListAccessPoints",
-                (&Method::PUT, [_]) => "CreateAccessPoint",
-                (&Method::GET, [_]) => "GetAccessPoint",
-                (&Method::DELETE, [_]) => "DeleteAccessPoint",
-                (&Method::PUT, [_, "policy"]) => "PutAccessPointPolicy",
-                (&Method::GET, [_, "policy"]) => "GetAccessPointPolicy",
-                (&Method::DELETE, [_, "policy"]) => "DeleteAccessPointPolicy",
-                (&Method::GET, [_, "policyStatus"]) => "GetAccessPointPolicyStatus",
+            let name = match (lambda, method, segments.as_slice()) {
+                (false, &Method::GET, []) => "ListAccessPoints",
+                (false, &Method::PUT, [_]) => "CreateAccessPoint",
+                (false, &Method::GET, [_]) => "GetAccessPoint",
+                (false, &Method::DELETE, [_]) => "DeleteAccessPoint",
+                (false, &Method::PUT, [_, "policy"]) => "PutAccessPointPolicy",
+                (false, &Method::GET, [_, "policy"]) => "GetAccessPointPolicy",
+                (false, &Method::DELETE, [_, "policy"]) => "DeleteAccessPointPolicy",
+                (false, &Method::GET, [_, "policyStatus"]) => "GetAccessPointPolicyStatus",
+                (true, &Method::GET, []) => "ListAccessPointsForObjectLambda",
+                (true, &Method::PUT, [_]) => "CreateAccessPointForObjectLambda",
+                (true, &Method::GET, [_]) => "GetAccessPointForObjectLambda",
+                (true, &Method::DELETE, [_]) => "DeleteAccessPointForObjectLambda",
+                (true, &Method::PUT, [_, "configuration"]) => {
+                    "PutAccessPointConfigurationForObjectLambda"
+                }
+                (true, &Method::GET, [_, "configuration"]) => {
+                    "GetAccessPointConfigurationForObjectLambda"
+                }
+                (true, &Method::PUT, [_, "policy"]) => "PutAccessPointPolicyForObjectLambda",
+                (true, &Method::GET, [_, "policy"]) => "GetAccessPointPolicyForObjectLambda",
+                (true, &Method::DELETE, [_, "policy"]) => "DeleteAccessPointPolicyForObjectLambda",
+                (true, &Method::GET, [_, "policyStatus"]) => {
+                    "GetAccessPointPolicyStatusForObjectLambda"
+                }
                 _ => return None,
             };
             let mut call = Call::build(request, name, None, None, false);
@@ -188,6 +210,7 @@ impl Call {
                     .unwrap_or("")
                     .to_string(),
                 access_point: point,
+                object_lambda: lambda,
                 parameters: ["bucket", "maxResults", "nextToken"]
                     .into_iter()
                     .filter_map(|name| {
@@ -668,11 +691,15 @@ fn record(
         && let Some(point) = &control.access_point
     {
         let named = truncated(&printable(&control.account), 64).to_string();
+        let (kind, service) = match control.object_lambda {
+            true => ("AWS::S3ObjectLambda::AccessPoint", "s3-object-lambda"),
+            false => ("AWS::S3::AccessPoint", "s3"),
+        };
         record["resources"] = json!([{
             "accountId": named,
-            "type": "AWS::S3::AccessPoint",
+            "type": kind,
             "ARN": format!(
-                "arn:aws:s3:{}:{named}:accesspoint/{}",
+                "arn:aws:{service}:{}:{named}:accesspoint/{}",
                 state.region,
                 truncated(&printable(point), 255)
             ),

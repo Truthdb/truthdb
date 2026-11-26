@@ -39,7 +39,7 @@ const MAX_ALIAS: usize = 63;
 /// Whether `name` is an access point name: 3 to 50 characters, lowercase
 /// letters, digits and hyphens, beginning with a letter or digit, not
 /// ending with a hyphen, nor with `-s3alias` or `-ext-s3alias`.
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     (3..=50).contains(&name.len())
         && name
             .bytes()
@@ -68,7 +68,7 @@ fn new_alias(name: &str) -> String {
     format!("{prefix}-{random}-s3alias")
 }
 
-fn no_such_access_point() -> S3Error {
+pub(crate) fn no_such_access_point() -> S3Error {
     S3Error::new(
         404,
         "NoSuchAccessPoint",
@@ -76,11 +76,11 @@ fn no_such_access_point() -> S3Error {
     )
 }
 
-fn invalid(message: impl Into<String>) -> S3Error {
+pub(crate) fn invalid(message: impl Into<String>) -> S3Error {
     S3Error::new(400, "InvalidRequest", message)
 }
 
-fn malformed() -> S3Error {
+pub(crate) fn malformed() -> S3Error {
     S3Error::new(
         400,
         "MalformedXML",
@@ -88,7 +88,7 @@ fn malformed() -> S3Error {
     )
 }
 
-fn xml(status: StatusCode, body: String) -> Response<Body> {
+pub(crate) fn xml(status: StatusCode, body: String) -> Response<Body> {
     Response::builder()
         .status(status)
         .header("content-type", "application/xml")
@@ -98,7 +98,7 @@ fn xml(status: StatusCode, body: String) -> Response<Body> {
         .expect("a valid response")
 }
 
-fn empty(status: StatusCode) -> Response<Body> {
+pub(crate) fn empty(status: StatusCode) -> Response<Body> {
     Response::builder()
         .status(status)
         .body(full(Vec::new()))
@@ -107,7 +107,7 @@ fn empty(status: StatusCode) -> Response<Body> {
 
 /// The elements of an XML document as paths (`A/B/C`) and their text, in
 /// order (an element with no text, as `A/B` and nothing).
-fn elements(body: &[u8]) -> Result<Vec<(String, String)>, S3Error> {
+pub(crate) fn elements(body: &[u8]) -> Result<Vec<(String, String)>, S3Error> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
     let mut reader = Reader::from_reader(body);
@@ -151,7 +151,7 @@ fn elements(body: &[u8]) -> Result<Vec<(String, String)>, S3Error> {
     Ok(out)
 }
 
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     quick_xml::escape::escape(text).into_owned()
 }
 
@@ -479,7 +479,7 @@ async fn delete(state: &S3State, account: &str, name: &str) -> Result<Response<B
 }
 
 /// The query parameter `name` of `query`, decoded.
-fn param(query: &str, name: &str) -> Option<String> {
+pub(crate) fn param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         (key == name).then(|| {

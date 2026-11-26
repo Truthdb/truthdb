@@ -32,6 +32,7 @@ mod listing;
 mod locks;
 mod metric_history;
 mod notifications;
+mod object_lambda;
 mod objects;
 mod pack;
 mod remote_buckets;
@@ -90,6 +91,7 @@ pub use notifications::{
     Destination, EVENT_TYPES, NOTIFICATIONS_CONSUMER, NotificationConfig, NotificationRule,
     event_message, event_type, test_message,
 };
+pub use object_lambda::ObjectLambdaPoint;
 pub use objects::{
     CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, StoredChecksum,
     VersionSel, version_id,
@@ -249,7 +251,9 @@ const WAREHOUSE_PURGES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 55;
 /// status (record 2), JSON (see `tables`).
 const TABLE_MAINTENANCE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 56;
 /// (P, account, 0, name) -> an access point; (A, alias) -> (account, 0,
-/// name); (Q, account, 0, name) -> its policy (see `access_points`).
+/// name); (Q, account, 0, name) -> its policy (see `access_points`); and
+/// the same of Object Lambda access points as L, M and N (see
+/// `object_lambda`).
 const ACCESS_POINTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 57;
 
 /// The object id stamped into every body page's header. Not a tree.

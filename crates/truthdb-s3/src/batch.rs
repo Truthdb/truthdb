@@ -84,7 +84,7 @@ pub(crate) struct LambdaSpec {
 /// A function ARN (`arn:<partition>:lambda:<region>:<account>:function:
 /// <name>[:<qualifier>]`) or a bare name (`<name>[:<qualifier>]`): the
 /// name, its qualifier and the account named.
-fn function_name(arn: &str) -> Option<(String, Option<String>, Option<String>)> {
+pub(crate) fn function_name(arn: &str) -> Option<(String, Option<String>, Option<String>)> {
     let (account, rest) = match arn.strip_prefix("arn:") {
         Some(rest) => {
             let parts: Vec<&str> = rest.splitn(6, ':').collect();
