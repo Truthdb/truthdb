@@ -218,7 +218,7 @@ pub(super) async fn compact(
         partitions.entry((spec, partition)).or_default().push(at);
     }
     let rewritten = |files: &[usize]| {
-        let size: u64 = files.iter().map(|&at| data[at].size as u64).sum();
+        let size = sum_sizes(files, &data);
         let n = files.len();
         // (Iceberg's "more than one" is implied by at least five.)
         n >= MIN_INPUT_FILES || (n > 1 && size > target) || size > max
@@ -244,18 +244,23 @@ pub(super) async fn compact(
     // Per rewritten group: its files, and its outputs (indexes into
     // `written`).
     let mut rewrites: Vec<Rewrite> = Vec::new();
+    // Why the first group that could not be rewritten could not: the job's
+    // failure if no group could be (a group that fails is left as it is,
+    // and stops no other).
+    let mut failure: Option<String> = None;
     for files in groups.into_values() {
         if !rewritten(&files) {
             continue;
         }
-        let size: u64 = files.iter().map(|&at| data[at].size as u64).sum();
+        let size = sum_sizes(&files, &data);
         let split = split_size(size, (target, min, write_max));
         let keys: Vec<String> = files.iter().map(|&at| data[at].key.clone()).collect();
-        let outputs = match rewrite(state, &warehouse, &keys, (split, write_max), &codec).await {
+        let outputs = match rewrite(state, &warehouse, &keys, (split, write_max), &codec, now).await
+        {
             Ok(outputs) => outputs,
             Err(err) => {
-                remove(state, &warehouse, &stored_keys(&written), now).await;
-                return Err(err);
+                failure.get_or_insert(err);
+                continue;
             }
         };
         // Every row the inputs hold, and no other.
@@ -275,7 +280,7 @@ pub(super) async fn compact(
         rewrites.push((files, (first..written.len()).collect()));
     }
     if rewrites.is_empty() {
-        return Ok(());
+        return failure.map_or(Ok(()), Err);
     }
     let outcome = commit(
         state,
@@ -291,6 +296,15 @@ pub(super) async fn compact(
         remove(state, &warehouse, &stored_keys(&written), now).await;
     }
     outcome
+}
+
+/// The sizes of data files `files` together (a size a manifest gives as
+/// negative counted as none).
+fn sum_sizes(files: &[usize], data: &[DataFile]) -> u64 {
+    files
+        .iter()
+        .map(|&at| data[at].size.max(0) as u64)
+        .fold(0, u64::saturating_add)
 }
 
 /// The keys and versions of `written`.
@@ -529,6 +543,7 @@ async fn rewrite(
     keys: &[String],
     (split, write_max): (u64, u64),
     codec: &parquet::basic::Compression,
+    now: u64,
 ) -> Result<Vec<Output>, String> {
     let (storage, from, keys, codec) = (
         Arc::clone(&state.storage),
@@ -540,14 +555,20 @@ async fn rewrite(
         rewrite_files(&storage, &from, &keys, (split, write_max), codec)
     })
     .await
-    .map_err(|_| "The compaction's rewrite stopped.".to_string())??;
+    .map_err(|_| "A data file could not be rewritten: its rewrite stopped.".to_string())??;
     let mut outputs = Vec::new();
     for (sealed, size, metadata) in files {
         if metadata.file_metadata().num_rows() == 0 {
             continue;
         }
         let key = format!("data/{}-compacted.parquet", crate::tables::uuid());
-        let version = put(state, warehouse, &key, sealed).await?;
+        let version = match put(state, warehouse, &key, sealed).await {
+            Ok(version) => version,
+            Err(err) => {
+                remove(state, warehouse, &stored_keys(&outputs), now).await;
+                return Err(err);
+            }
+        };
         outputs.push(Output {
             key,
             version,
@@ -569,10 +590,30 @@ fn rewrite_files(
 ) -> Result<Vec<Written>, String> {
     let props = parquet::file::properties::WriterProperties::builder()
         .set_compression(codec)
-        .set_statistics_truncate_length(None)
+        // Iceberg's default metrics mode, truncate(16): a long value's
+        // bounds are a prefix and an incremented prefix.
+        .set_statistics_truncate_length(Some(16))
         .build();
     let failed =
         |err: parquet::errors::ParquetError| format!("A compacted file cannot be written: {err}");
+    let begin = |schema: arrow_schema::SchemaRef,
+                 descr: &parquet::schema::types::SchemaDescriptor|
+     -> Result<Writing, String> {
+        let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
+            .with_properties(props.clone())
+            .with_skip_arrow_metadata(true)
+            .with_parquet_schema(descr.clone());
+        let writer = parquet::arrow::ArrowWriter::try_new_with_options(
+            BodySink::begin(storage)?,
+            schema,
+            options,
+        )
+        .map_err(failed)?;
+        Ok(Writing {
+            writer,
+            consumed: 0,
+        })
+    };
     let finish = |writing: Writing| -> Result<Written, String> {
         let mut writer = writing.writer;
         let metadata = writer.finish().map_err(failed)?;
@@ -587,34 +628,33 @@ fn rewrite_files(
             .map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
         let descr = file.metadata().file_metadata().schema_descr_ptr();
         for group in 0..file.metadata().num_row_groups() {
-            if writing.is_none() {
-                let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
-                    .with_properties(props.clone())
-                    .with_skip_arrow_metadata(true)
-                    .with_parquet_schema((*descr).clone());
-                let writer = parquet::arrow::ArrowWriter::try_new_with_options(
-                    BodySink::begin(storage)?,
-                    file.schema(),
-                    options,
-                )
-                .map_err(failed)?;
-                writing = Some(Writing {
-                    writer,
-                    consumed: 0,
-                });
-            }
-            let out = writing.as_mut().expect("begun above");
+            // The row group's input bytes, spread over its rows.
+            let metadata = file.metadata().row_group(group);
+            let (group_bytes, group_rows) = (
+                metadata.compressed_size().max(0) as u64,
+                metadata.num_rows().max(1) as u64,
+            );
             for batch in file.batches(group)? {
                 let batch =
                     batch.map_err(|err| format!("The data file {key} cannot be read: {err}"))?;
+                let out = match writing.as_mut() {
+                    Some(out) => out,
+                    None => writing.insert(begin(file.schema(), &descr)?),
+                };
                 out.writer.write(&batch).map_err(failed)?;
                 if out.writer.in_progress_size() >= ROW_GROUP_BYTES {
                     out.writer.flush().map_err(failed)?;
                 }
-            }
-            out.consumed += file.metadata().row_group(group).compressed_size().max(0) as u64;
-            if out.consumed >= split || out.writer.bytes_written() as u64 >= write_max {
-                done.push(finish(writing.take().expect("written"))?);
+                out.consumed = out.consumed.saturating_add(
+                    group_bytes.saturating_mul(batch.num_rows() as u64) / group_rows,
+                );
+                // An output ends at its share of the inputs, or at the
+                // largest file written, within a row group too: an output
+                // over the range would be rewritten again on every pass.
+                let written = (out.writer.bytes_written() + out.writer.in_progress_size()) as u64;
+                if out.consumed >= split || written >= write_max {
+                    done.push(finish(writing.take().expect("written"))?);
+                }
             }
         }
     }
@@ -1036,6 +1076,9 @@ async fn commit(
                         (102, Set::To((*partition).clone())),
                         (103, Set::To(Avro::Long(rows))),
                         (104, Set::To(Avro::Long(output.size as i64))),
+                        // Format version 1's (a table upgraded from it):
+                        // "deprecated ... write 64MB".
+                        (105, Set::To(Avro::Long(64 << 20))),
                         (108, map(108, metrics.sizes)?),
                         (109, map(109, metrics.values)?),
                         (110, map(110, metrics.nulls)?),
@@ -1286,6 +1329,85 @@ mod tests {
         assert_eq!(of(&metrics.lower, 2), Some(Avro::Bytes(b"m".to_vec())));
         assert_eq!(of(&metrics.upper, 2), Some(Avro::Bytes(b"z".to_vec())));
         assert_eq!(metrics.offsets.len(), 3);
+    }
+
+    #[test]
+    fn an_output_ends_at_the_largest_file_written_inside_a_row_group() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use truthdb_core::storage::StorageOptions;
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-compaction-{}-{}",
+            std::process::id(),
+            crate::objects::now_ms()
+        ));
+        const RING: u64 = 8 * 1024 * 1024;
+        let storage = Arc::new(
+            Storage::create_with_wal_bounds(
+                path.clone(),
+                StorageOptions {
+                    size_bytes: 64 << 20,
+                    wal_ratio: 0.05,
+                    metadata_ratio: 0.08,
+                    snapshot_ratio: 0.02,
+                    allocator_ratio: 0.02,
+                    reserved_ratio: 0.17,
+                    default_collation: None,
+                },
+                RING,
+                RING,
+                truthdb_engine::database_engines,
+            )
+            .expect("create"),
+        );
+        // One row group of 30000 rows: four batches.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..30_000))],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut body = BodyWriter::begin(&storage, 1).unwrap();
+        body.write(&storage, &bytes, 1).unwrap();
+        let sealed = body.finish(&storage, 1).unwrap();
+        truthdb_object::ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_bucket("www", truthdb_object::DEFAULT_ACCOUNT, 1)?
+                    .expect("bucket");
+                tx.put_object(
+                    "www",
+                    "data/one.parquet",
+                    &sealed,
+                    &truthdb_object::ObjectAttrs::default(),
+                    truthdb_object::StorageClass::Standard,
+                    2,
+                    0,
+                )
+                .map(|put| {
+                    put.expect("put");
+                })
+            })
+            .unwrap();
+        let outputs = rewrite_files(
+            &storage,
+            "www",
+            &["data/one.parquet".to_string()],
+            (u64::MAX, 1),
+            parquet::basic::Compression::UNCOMPRESSED,
+        )
+        .unwrap();
+        assert!(outputs.len() > 1, "{} outputs", outputs.len());
+        let rows: i64 = outputs
+            .iter()
+            .map(|(_, _, metadata)| metadata.file_metadata().num_rows())
+            .sum();
+        assert_eq!(rows, 30_000);
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

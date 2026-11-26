@@ -44,12 +44,14 @@ pub(crate) fn manifest_list(bytes: &[u8]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// The data and delete files a manifest names: every entry's
-/// `data_file.file_path`, deleted entries' too (a file one names may be an
-/// older snapshot's still).
+/// The data and delete files a manifest's live entries name (each
+/// `data_file.file_path`). A deleted entry (status 2) is not a reference: a
+/// snapshot that still holds the file holds it in a live entry of its own
+/// manifests, and no reader reads a deleted one.
 pub(crate) fn manifest_files(bytes: &[u8]) -> Result<Vec<String>, String> {
     records(bytes, "A manifest")?
         .iter()
+        .filter(|entry| !matches!(field(entry, "status"), Some(Avro::Int(2))))
         .map(|entry| {
             field(entry, "data_file")
                 .and_then(|file| text(field(file, "file_path")))
@@ -346,11 +348,8 @@ mod tests {
             writer.append(record).unwrap();
         }
         let bytes = writer.into_inner().unwrap();
-        // The deleted entry's file too.
-        assert_eq!(
-            manifest_files(&bytes).unwrap(),
-            ["s3://t/data/a.parquet", "s3://t/data/b.parquet"]
-        );
+        // Not the deleted entry's file.
+        assert_eq!(manifest_files(&bytes).unwrap(), ["s3://t/data/a.parquet"]);
         assert!(manifest_list(b"not avro").is_err());
         assert!(manifest_files(&manifest_list_bytes_without_path()).is_err());
     }

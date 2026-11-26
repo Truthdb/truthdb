@@ -19560,6 +19560,33 @@ since = time.time()
 ran("plain", since)
 assert c.load_table(("lake", "plain")).current_snapshot().snapshot_id == after.snapshot_id
 
+# The files compacted away, once no snapshot holds them live, are removed
+# (compaction's manifests name them only as deleted entries).
+plain = c.load_table(("lake", "plain"))
+old_keys = [f["file_path"].split("/", 3)[3] for f in plain.inspect.files(snapshot_id=before.snapshot_id).to_pylist()]
+older = [s.snapshot_id for s in plain.snapshots() if s.snapshot_id != after.snapshot_id]
+c._session.post(c.url("namespaces/lake/tables/plain", prefixed=True), json={"requirements": [],
+    "updates": [{"action": "remove-snapshots", "snapshot-ids": older}]}).raise_for_status()
+t.put_table_bucket_maintenance_configuration(tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
+    value={"status": "enabled", "settings": {"icebergUnreferencedFileRemoval": {"unreferencedDays": 1,
+    "nonCurrentDays": 1}}})
+def gone(key):
+    try:
+        s3.head_object(Bucket=store, Key=key)
+        return False
+    except botocore.exceptions.ClientError as error:
+        return error.response["Error"]["Code"] == "404"
+import botocore.exceptions
+for _ in range(300):
+    if all(gone(key) for key in old_keys):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit(f"the compacted-away files were kept: {[k for k in old_keys if not gone(k)]}")
+assert len(c.load_table(("lake", "plain")).scan().to_arrow()) == 18
+t.put_table_bucket_maintenance_configuration(tableBucketARN=arn, type="icebergUnreferencedFileRemoval",
+    value={"status": "disabled"})
+
 # A partition at a time: five files of one partition rewritten, two of another not.
 parts = table("parts", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
     transform=IdentityTransform(), name="region")))
@@ -19773,6 +19800,54 @@ ran("ranged", since)
 ranged = c.load_table(("lake", "ranged"))
 after = sorted((f["file_path"] == big_file["file_path"], f["record_count"]) for f in files(ranged))
 assert after == [(False, 15), (True, 48)], after
+
+# A partition whose rewrite fails (a file that opens, and then cannot be
+# read) is left as it is; the other partition is still compacted.
+broken = table("broken", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for region in ["a", "b"]:
+    for i in range(5):
+        broken.append(rows(i * 3, region))
+[victim] = [f for f in files(broken) if f["partition"]["region"] == "b"][:1]
+victim_store = victim["file_path"].split("/")[2]
+victim_key = victim["file_path"].split("/", 3)[3]
+good = s3.get_object(Bucket=victim_store, Key=victim_key)["Body"].read()
+s3.put_object(Bucket=victim_store, Key=victim_key, Body=good[:4] + b"\xff" * 24 + good[28:])
+since = time.time()
+configure("broken", targetFileSizeMB=64)
+ran("broken", since)
+broken = c.load_table(("lake", "broken"))
+by_region = sorted((f["partition"]["region"], f["record_count"]) for f in files(broken))
+assert by_region == [("a", 15)] + [("b", 3)] * 5, by_region
+# Its only group failing, the job fails with why.
+unreadable = table("unreadable")
+for i in range(5):
+    unreadable.append(rows(i * 3))
+victim = files(unreadable)[0]["file_path"]
+good = s3.get_object(Bucket=victim.split("/")[2], Key=victim.split("/", 3)[3])["Body"].read()
+s3.put_object(Bucket=victim.split("/")[2], Key=victim.split("/", 3)[3], Body=good[:4] + b"\xff" * 24 + good[28:])
+current = c.load_table(("lake", "unreadable")).current_snapshot().snapshot_id
+since = time.time()
+configure("unreadable", targetFileSizeMB=64)
+failed = ran("unreadable", since, "Failed")
+assert "cannot be read" in failed["failureMessage"], failed
+assert c.load_table(("lake", "unreadable")).current_snapshot().snapshot_id == current
+
+# Long values' bounds are truncated to 16 bytes (Iceberg's truncate(16)):
+# a prefix below, and an incremented prefix above.
+long = table("long")
+for i in range(5):
+    batch = rows(i * 3).to_pylist()
+    for row in batch:
+        row["name"] = f"{row['id']:03}" + "x" * 97
+    long.append(pa.Table.from_pylist(batch, schema=schema.as_arrow()))
+since = time.time()
+configure("long", targetFileSizeMB=64)
+ran("long", since)
+[compacted] = files(c.load_table(("lake", "long")))
+name = compacted["readable_metrics"]["name"]
+assert name["lower_bound"] == "000" + "x" * 13, name
+assert name["upper_bound"] == "014" + "x" * 12 + "y", name
 
 # A table whose metadata is of format version 1: not compacted.
 old = table("old")
