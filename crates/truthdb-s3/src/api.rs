@@ -393,7 +393,7 @@ pub async fn dispatch(
     crate::access_points::resolve(state, &mut request, auth.principal.as_ref()).await?;
     // A request through a URL presigned for an Object Lambda function: its
     // mark checked, it is one made through Object Lambda.
-    let called_via = crate::object_lambda_run::called_via(&request, auth.principal.as_ref())?;
+    let called_via = crate::object_lambda_run::called_via(&request, &auth)?;
     let target = target(&request)?;
     let via = request
         .extensions()

@@ -202,6 +202,10 @@ pub(crate) async fn route(
     request: Request<Incoming>,
     auth: Authenticated,
 ) -> Result<Response<Body>, S3Error> {
+    // A directory bucket's session acts in its bucket only.
+    if auth.session.is_some() {
+        return Err(session_refused());
+    }
     if request.method() == Method::POST && request.uri().path() == "/WriteGetObjectResponse" {
         return write_get_object_response(state, request, auth).await;
     }
@@ -220,6 +224,9 @@ pub(crate) async fn serve(
     auth: Authenticated,
     via: ViaLambda,
 ) -> Result<Response<Body>, S3Error> {
+    if auth.session.is_some() {
+        return Err(session_refused());
+    }
     let Some(principal) = auth.principal.clone() else {
         return Err(S3Error::access_denied("Access Denied"));
     };
@@ -415,6 +422,7 @@ pub(crate) async fn serve(
     .to_string();
     let (answered, answer) = oneshot::channel();
     lock_waiting().insert(token.clone(), answered);
+    let _waiting = Waiting(token.clone());
     let (url, webhook_secret) = webhook;
     let delivery = format!("object-lambda/{request_id}");
     let invocation = tokio::spawn(async move {
@@ -451,17 +459,71 @@ pub(crate) async fn serve(
             "The Object Lambda access point's function did not answer",
         )
     };
+    // An answer that came is the caller's, even if the function has ended
+    // since.
     let answer = tokio::select! {
+        biased;
         answer = answer => answer.ok(),
         _ = invocation => None,
         _ = tokio::time::sleep(ANSWER_WITHIN) => None,
     };
     let Some(answer) = answer else {
-        lock_waiting().remove(&token);
         return Err(failed());
     };
     Ok(answer_response(answer, &request_id, request.uri().path()))
 }
+
+fn session_refused() -> S3Error {
+    S3Error::access_denied("A session's credentials are its directory bucket's only")
+}
+
+/// Removes a waiting GetObject's entry when its wait ends however it does
+/// (its caller gone too).
+struct Waiting(String);
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        lock_waiting().remove(&self.0);
+    }
+}
+
+/// The headers a WriteGetObjectResponse forwards (`x-amz-fwd-header-<name>`),
+/// as botocore's model lists them.
+const FORWARDED: &[&str] = &[
+    "accept-ranges",
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "content-range",
+    "content-type",
+    "etag",
+    "expires",
+    "last-modified",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+    "x-amz-delete-marker",
+    "x-amz-expiration",
+    "x-amz-missing-meta",
+    "x-amz-mp-parts-count",
+    "x-amz-object-lock-legal-hold",
+    "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date",
+    "x-amz-replication-status",
+    "x-amz-request-charged",
+    "x-amz-restore",
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-storage-class",
+    "x-amz-tagging-count",
+    "x-amz-version-id",
+];
 
 fn function_not_found() -> S3Error {
     S3Error::new(
@@ -538,10 +600,14 @@ fn identity(principal: &crate::server::Principal) -> serde_json::Value {
     }
 }
 
-/// What the mark of a URL presigned for a function is of: its access key,
-/// path, signing time and expiry.
-fn marked(access_key: &str, path: &str, amz_date: &str, expires: &str) -> String {
-    format!("{access_key}\n{path}\n{amz_date}\n{expires}")
+/// What the mark of a URL presigned for a function is of: a GET, by its
+/// access key, to its host and path, with its query (all of it but the mark
+/// and the signature: its signing time and expiry among it).
+fn marked(access_key: &str, host: &str, path: &str, query: &str) -> String {
+    format!(
+        "GET\n{access_key}\n{host}\n{path}\n{}",
+        crate::sigv4::canonical_query(query)
+    )
 }
 
 /// A GetObject URL for `key` through the access point of alias `alias` at
@@ -592,12 +658,12 @@ fn presign(
         format!("X-Amz-Date={amz_date}"),
         format!("X-Amz-Expires={expires}"),
         "X-Amz-SignedHeaders=host".to_string(),
-        format!(
-            "{MARK}={}",
-            crate::sigv4::sign(&MARK_KEY, &marked(access_key, &path, &amz_date, &expires))
-        ),
     ]);
-    let query = query.join("&");
+    let unmarked = query.join("&");
+    let query = format!(
+        "{unmarked}&{MARK}={}",
+        crate::sigv4::sign(&MARK_KEY, &marked(access_key, host, &path, &unmarked))
+    );
     let canonical = crate::sigv4::canonical_request(
         "GET",
         &path,
@@ -621,33 +687,59 @@ const QUERY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-/// Whether `request` was made through a URL presigned for a function (one
-/// [`presign`] made, by `principal`'s key): its mark checks out. A request
-/// marked otherwise is refused; one not marked is not one.
-pub(crate) fn called_via<B>(
-    request: &Request<B>,
-    principal: Option<&crate::server::Principal>,
-) -> Result<bool, S3Error> {
+/// Whether `request` was made through a URL presigned for a function: the
+/// very GET [`presign`] made (its access key, host, path and whole query,
+/// the signing time and expiry among it), sent as it was presigned (so its
+/// expiry was checked with its signature), by `auth`'s key and not a
+/// session's. A request marked otherwise is refused; one not marked is not
+/// one.
+pub(crate) fn called_via<B>(request: &Request<B>, auth: &Authenticated) -> Result<bool, S3Error> {
     let query = request.uri().query().unwrap_or("");
-    let param = |name: &str| {
-        query.split('&').find_map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            key.eq_ignore_ascii_case(name).then_some(value)
-        })
+    let name_of = |pair: &str| {
+        pair.split_once('=')
+            .map_or(pair, |(name, _)| name)
+            .to_string()
     };
-    let Some(given) = param(MARK) else {
+    let marks: Vec<&str> = query
+        .split('&')
+        .filter(|pair| name_of(pair).eq_ignore_ascii_case(MARK))
+        .collect();
+    if marks.is_empty() {
         return Ok(false);
-    };
+    }
     let refused = || S3Error::access_denied("Access Denied");
-    let principal = principal.ok_or_else(refused)?;
-    let (Some(amz_date), Some(expires)) = (param("X-Amz-Date"), param("X-Amz-Expires")) else {
+    let (Some(principal), Some(signed)) = (&auth.principal, &auth.signed) else {
         return Err(refused());
     };
+    let [mark] = marks.as_slice() else {
+        return Err(refused());
+    };
+    let Some(given) = mark.strip_prefix(&format!("{MARK}=")) else {
+        return Err(refused());
+    };
+    if signed.auth_type != "REST-QUERY-STRING"
+        || auth.session.is_some()
+        || request.method() != Method::GET
+    {
+        return Err(refused());
+    }
+    let unmarked: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let name = name_of(pair);
+            !name.eq_ignore_ascii_case(MARK) && !name.eq_ignore_ascii_case("X-Amz-Signature")
+        })
+        .collect();
+    let host = request
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
     let wanted = marked(
         &principal.access_key,
+        host,
         request.uri().path(),
-        amz_date,
-        expires,
+        &unmarked.join("&"),
     );
     match crate::sigv4::verify(&MARK_KEY, &wanted, given) {
         true => Ok(true),
@@ -714,12 +806,6 @@ async fn write_get_object_response(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
     };
-    let token = header("x-amz-request-token").unwrap_or_default();
-    let Some(waiting) = lock_waiting().remove(&token) else {
-        return Err(S3Error::invalid_request(
-            "The request token names no GetObject waiting for its answer",
-        ));
-    };
     let status = match header("x-amz-fwd-status") {
         None => 200,
         Some(status) => status
@@ -737,15 +823,32 @@ async fn write_get_object_response(
         };
         let name = name.as_str();
         if let Some(forwarded) = name.strip_prefix("x-amz-fwd-header-") {
-            headers.push((forwarded.to_string(), value.to_string()));
+            if FORWARDED.contains(&forwarded) {
+                headers.push((forwarded.to_string(), value.to_string()));
+            }
         } else if name.starts_with("x-amz-meta-") {
             headers.push((name.to_string(), value.to_string()));
         }
     }
+    // Its length given, so a body cut short (one that does not verify) is
+    // seen as such by its caller.
     let length = header("x-amz-decoded-content-length").or_else(|| header("content-length"));
-    if let Some(length) = length.filter(|_| error.is_none()) {
+    if error.is_none() {
+        let Some(length) = length else {
+            return Err(S3Error::new(
+                411,
+                "MissingContentLength",
+                "You must provide the Content-Length HTTP header.",
+            ));
+        };
         headers.push(("content-length".to_string(), length));
     }
+    let token = header("x-amz-request-token").unwrap_or_default();
+    let Some(waiting) = lock_waiting().remove(&token) else {
+        return Err(S3Error::invalid_request(
+            "The request token names no GetObject waiting for its answer",
+        ));
+    };
     let (sender, body) = mpsc::channel(4);
     let _ = waiting.send(Answer {
         status,

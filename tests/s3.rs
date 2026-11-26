@@ -20557,7 +20557,7 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
         r#"{{"Version": "2012-10-17", "Statement": [
         {{"Effect": "Allow", "Action": "s3-object-lambda:GetObject", "Resource": "{point}"}},
         {{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": "{}", "Condition": {called_via}}},
-        {{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "{supporting}/object/*", "Condition": {called_via}}}]}}"#,
+        {{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "{supporting}/object/*", "Condition": {called_via}}}]}}"#,
         lambda_arn("shape")
     );
     let no_invoke = format!(
@@ -20657,7 +20657,47 @@ def refused(call, code):
         assert error.response["Error"]["Code"] == code, error.response
         return error.response
 writer = client("s3", function_key, function_secret)
-events = []
+events, answers = [], []
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
+import http.client
+def signed(method, path, query, credentials, body=b"", headers=None, service="s3", host=None):
+    host = host or f"s3.test:{port}"
+    request = AWSRequest(method=method, url=f"http://{host}{path}" + (f"?{query}" if query else ""),
+        data=body, headers=dict(headers or {}))
+    S3SigV4Auth(Credentials(*credentials), service, "us-east-1").add_auth(request)
+    return request
+def send(request, sized=True):
+    parsed = urllib.parse.urlsplit(request.url)
+    connection = http.client.HTTPConnection("127.0.0.1", int(port))
+    headers = dict(request.headers)
+    headers.setdefault("Host", parsed.netloc)
+    target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    if sized:
+        connection.putrequest(request.method, target, skip_host=True, skip_accept_encoding=True)
+        for name, value in headers.items():
+            connection.putheader(name, value)
+        connection.putheader("Content-Length", str(len(request.body or b"")))
+        connection.endheaders(request.body or b"")
+    else:
+        connection.putrequest(request.method, target, skip_host=True, skip_accept_encoding=True)
+        for name, value in headers.items():
+            connection.putheader(name, value)
+        connection.putheader("Transfer-Encoding", "chunked")
+        connection.endheaders()
+        body = request.body or b""
+        connection.send(b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
+    answer = connection.getresponse()
+    return answer.status, dict(answer.getheaders()), answer.read()
+# A WriteGetObjectResponse sent by hand: headers of its choosing, and with
+# its length or not.
+def raw_answer(context, headers, body, sized):
+    headers = dict(headers, **{"x-amz-request-route": context["outputRoute"],
+        "x-amz-request-token": context["outputToken"], "x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+    request = signed("POST", "/WriteGetObjectResponse", "", (function_key, function_secret), body, headers,
+        service="s3-object-lambda", host=f"{context['outputRoute']}.s3.test:{port}")
+    return send(request, sized)[0]
 # The functions: "shape" answers with the object upper-cased (or its range,
 # or an error, or what reading it gave); "early" returns without answering.
 class Function(http.server.BaseHTTPRequestHandler):
@@ -20676,7 +20716,10 @@ class Function(http.server.BaseHTTPRequestHandler):
             except urllib.error.HTTPError as error:
                 original = f"read: {error.code}".encode()
             ranged = {k.lower(): v for k, v in event["userRequest"]["headers"].items()}.get("range")
-            if key == "secret":
+            if key in ("unsized", "cookie"):
+                headers = {"x-amz-fwd-header-Content-Type": "text/plain", "x-amz-fwd-header-Set-Cookie": "taken=yes"}
+                answers.append(raw_answer(context, headers, original.upper(), sized=key == "cookie"))
+            elif key == "secret":
                 writer.write_get_object_response(StatusCode=403, ErrorCode="NoSecretsHere",
                     ErrorMessage="not this one", **answer)
             elif ranged:
@@ -20696,7 +20739,7 @@ print(f"PORT {functions.server_address[1]}", flush=True)
 sys.stdin.readline()
 s3, control = client("s3", key, secret), client("s3control", key, secret)
 s3.create_bucket(Bucket="data")
-for name, body in [("doc", b"hello"), ("secret", b"x")]:
+for name, body in [("doc", b"hello"), ("secret", b"x"), ("unsized", b"u"), ("cookie", b"c")]:
     s3.put_object(Bucket="data", Key=name, Body=body)
 supporting = control.create_access_point(AccountId=account, Name="reader", Bucket="data")["Alias"]
 # The bucket delegating to its account's access points.
@@ -20729,6 +20772,37 @@ reader = client("s3", reader_key, reader_secret)
 assert reader.get_object(Bucket=alias, Key="doc")["Body"].read() == b"HELLO"
 assert events[-1][1]["userIdentity"]["arn"] == f"arn:aws:iam::{account}:user/reader"
 refused(lambda: reader.get_object(Bucket=supporting, Key="doc"), "AccessDenied")
+# The URL the function was given, with its mark: good as it is (for its
+# validity), not for another request. Sent signed in a header instead, as a
+# PUT or as a GET, it is no request through Object Lambda.
+given = [e for _, e in events if e["userIdentity"]["arn"].endswith("user/reader")][-1]["getObjectContext"]["inputS3Url"]
+assert urllib.request.urlopen(given).read() == b"hello"
+parsed = urllib.parse.urlsplit(given)
+kept = "&".join(part for part in parsed.query.split("&")
+    if part.split("=")[0] in ("X-Amz-Date", "X-Amz-Expires", "x-truthdb-object-lambda"))
+for method, body in [("PUT", b"overwritten"), ("GET", b"")]:
+    status, _, answer = send(signed(method, parsed.path, kept, (reader_key, reader_secret), body))
+    assert status == 403 and b"<Code>AccessDenied</Code>" in answer, (method, status, answer)
+# Nor with the whole presigned query but its signature, signed in a header.
+whole = "&".join(part for part in parsed.query.split("&") if not part.startswith("X-Amz-Signature="))
+status, _, answer = send(signed("PUT", parsed.path, whole, (reader_key, reader_secret), b"overwritten"))
+assert status == 403 and b"<Code>AccessDenied</Code>" in answer, (status, answer)
+assert s3.get_object(Bucket="data", Key="doc")["Body"].read() == b"hello"
+# The given mark on a URL the reader presigns afresh (a new signing time):
+# refused, the mark being of the URL it was made for.
+mark_param = [part for part in parsed.query.split("&") if part.startswith("x-truthdb-object-lambda=")][0]
+fresh = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=reader_key, aws_secret_access_key=reader_secret,
+    config=botocore.config.Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+fresh.meta.events.register("before-sign.s3.GetObject", lambda request, **_: setattr(request, "url",
+    request.url + ("&" if "?" in request.url else "?") + mark_param))
+time.sleep(1.1)
+again = fresh.generate_presigned_url("get_object", Params={"Bucket": supporting, "Key": "doc"})
+try:
+    urllib.request.urlopen(again)
+    raise SystemExit("a mark was taken on another URL")
+except urllib.error.HTTPError as error:
+    assert error.code == 403 and b"<Code>AccessDenied</Code>" in error.read(), error
 # A URL the reader presigns itself with a mark of its own making: refused.
 presigner = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
     aws_access_key_id=reader_key, aws_secret_access_key=reader_secret,
@@ -20755,6 +20829,36 @@ def anonymous(path):
         return error.code, error.read().decode()
 status, body = anonymous(f"/{alias}/doc")
 assert status == 403 and "<Code>AccessDenied</Code>" in body, (status, body)
+# The function's own headers: only those WriteGetObjectResponse forwards;
+# and its length must be given.
+cookie = s3.get_object(Bucket=alias, Key="cookie")
+assert cookie["Body"].read() == b"C" and cookie["ContentType"] == "text/plain", cookie
+assert "set-cookie" not in cookie["ResponseMetadata"]["HTTPHeaders"], cookie
+def answered(count):
+    deadline = time.time() + 10
+    while len(answers) < count:
+        assert time.time() < deadline, answers
+        time.sleep(0.05)
+    return answers[count - 1]
+assert answered(1) == 200, answers
+refused(lambda: s3.get_object(Bucket=alias, Key="unsized"), "InternalError")
+assert answered(2) == 411, answers
+# A directory bucket's session: not through Object Lambda.
+express = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret, config=botocore.config.Config(
+    s3={"addressing_style": "path", "disable_s3_express_session_auth": True}))
+express.create_bucket(Bucket="dir--use1-az4--x-s3", CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+made_session = s3.create_session(Bucket="dir--use1-az4--x-s3")["Credentials"]
+for endpoint, bucket in [("s3.test", alias), ("s3-object-lambda.us-east-1.s3.test", arn)]:
+    session = client("s3", made_session["AccessKeyId"], made_session["SecretAccessKey"], endpoint)
+    session.meta.events.register("before-sign.s3", lambda request, **_:
+        request.headers.__setitem__("x-amz-s3session-token", made_session["SessionToken"]))
+    refused(lambda: session.get_object(Bucket=bucket, Key="doc"), "AccessDenied")
+    # Nor its WriteGetObjectResponse.
+    refused(lambda: session.write_get_object_response(RequestRoute="io-truthdb", RequestToken="nothing",
+        Body=b"x"), "AccessDenied")
 # The function's error is the caller's.
 error = refused(lambda: s3.get_object(Bucket=alias, Key="secret"), "NoSecretsHere")
 assert error["Error"]["Message"] == "not this one" and error["ResponseMetadata"]["HTTPStatusCode"] == 403, error
