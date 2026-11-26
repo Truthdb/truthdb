@@ -19857,6 +19857,45 @@ for name, deleting, other in [("ratio", [0, 1, 2], False), ("ratio_low", [0, 1],
     else:
         assert alone.current_snapshot().snapshot_id == 80
 
+# Data files written without field ids (added as they were): their
+# columns are not known by id, so equality deletes are not applied to
+# them; the files are left as they are.
+imported = table("imported")
+imported_store = imported.location().removeprefix("s3://")
+def without_ids(kind):
+    if pa.types.is_large_list(kind):
+        return pa.large_list(without_ids(kind.value_type))
+    if pa.types.is_list(kind):
+        return pa.list_(without_ids(kind.value_type))
+    return kind
+plain_schema = pa.schema([pa.field(f.name, without_ids(f.type), nullable=f.nullable) for f in schema.as_arrow()])
+added = []
+for i in range(5):
+    out = io.BytesIO()
+    pq.write_table(rows(i * 3).cast(plain_schema), out)
+    s3.put_object(Bucket=imported_store, Key=f"data/imported-{i}.parquet", Body=out.getvalue())
+    added.append(f"{imported.location()}/data/imported-{i}.parquet")
+imported.add_files(added)
+imported = c.load_table(("lake", "imported"))
+imported = add_deletes(imported, "imported", 83, [equalities(imported, data_files(imported)[0].partition, [1])])
+since = time.time()
+configure("imported", targetFileSizeMB=64)
+failed = ran("imported", since, "Failed")
+assert "without field ids" in failed["failureMessage"], failed
+assert c.load_table(("lake", "imported")).current_snapshot().snapshot_id == 83
+# An equality delete of a floating point column is not applied (NaNs of
+# other bits would not match): left as they are.
+floaty = table("floaty")
+for i in range(5):
+    floaty.append(rows(i * 3))
+float_rows = pa.Table.from_arrays([pa.array([1.5], pa.float64())], schema=pa.schema([field("name", pa.float64(), 2)]))
+floaty = add_deletes(floaty, "floaty", 84, [delete_file(floaty, DataFileContent.EQUALITY_DELETES, float_rows,
+    data_files(floaty)[0].partition, equality_ids=[2])])
+since = time.time()
+configure("floaty", targetFileSizeMB=64)
+failed = ran("floaty", since, "Failed")
+assert "floating point" in failed["failureMessage"], failed
+
 # A delete file outside the table's storage cannot be applied: the files
 # it may apply to are left as they are.
 foreign = table("foreign")
