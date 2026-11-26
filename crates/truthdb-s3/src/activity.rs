@@ -120,6 +120,26 @@ impl Call {
                 _ => return None,
             };
             (name, None)
+        } else if crate::api::control_route(request) == Some(crate::api::ControlRoute::AccessPoints)
+        {
+            let rest = request
+                .uri()
+                .path()
+                .strip_prefix("/v20180820/accesspoint")
+                .unwrap_or("");
+            let segments: Vec<&str> = rest.split('/').skip(1).collect();
+            let name = match (method, segments.as_slice()) {
+                (&Method::GET, []) => "ListAccessPoints",
+                (&Method::PUT, [_]) => "CreateAccessPoint",
+                (&Method::GET, [_]) => "GetAccessPoint",
+                (&Method::DELETE, [_]) => "DeleteAccessPoint",
+                (&Method::PUT, [_, "policy"]) => "PutAccessPointPolicy",
+                (&Method::GET, [_, "policy"]) => "GetAccessPointPolicy",
+                (&Method::DELETE, [_, "policy"]) => "DeleteAccessPointPolicy",
+                (&Method::GET, [_, "policyStatus"]) => "GetAccessPointPolicyStatus",
+                _ => return None,
+            };
+            (name, None)
         } else if crate::api::control_route(request).is_some() {
             return None;
         } else {

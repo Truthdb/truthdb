@@ -78,6 +78,9 @@ pub(crate) fn target<B>(request: &Request<B>) -> Result<Target, S3Error> {
 pub(crate) enum ControlRoute {
     PublicAccessBlock,
     Jobs,
+    AccessPoints,
+    /// Another S3 Control path: refused, never taken for a bucket's.
+    Unknown,
 }
 
 /// The S3 Control operation a request is for, if any. S3 Control carries
@@ -101,6 +104,10 @@ pub(crate) fn control_route<B>(request: &Request<B>) -> Option<ControlRoute> {
         Some(ControlRoute::PublicAccessBlock)
     } else if path == "/v20180820/jobs" || path.starts_with("/v20180820/jobs/") {
         Some(ControlRoute::Jobs)
+    } else if path == "/v20180820/accesspoint" || path.starts_with("/v20180820/accesspoint/") {
+        Some(ControlRoute::AccessPoints)
+    } else if path == "/v20180820" || path.starts_with("/v20180820/") {
+        Some(ControlRoute::Unknown)
     } else {
         None
     }
@@ -340,6 +347,15 @@ pub async fn dispatch(
         }
         Some(ControlRoute::Jobs) => {
             return crate::batch::handle(state, request, auth, method).await;
+        }
+        Some(ControlRoute::AccessPoints) => {
+            return crate::access_points::handle(state, request, auth, method).await;
+        }
+        Some(ControlRoute::Unknown) => {
+            return Err(S3Error::not_implemented(format!(
+                "{method} {}",
+                request.uri().path()
+            )));
         }
         None => {}
     }
