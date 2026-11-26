@@ -53,6 +53,23 @@ pub(crate) fn host_bucket(host: &str, domains: &[String]) -> Option<String> {
 }
 
 pub(crate) fn target<B>(request: &Request<B>) -> Result<Target, S3Error> {
+    let target = named_target(request)?;
+    // Through an access point: its bucket's.
+    Ok(
+        match (
+            request.extensions().get::<crate::access_points::Via>(),
+            target,
+        ) {
+            (Some(via), Target::Bucket(_)) => Target::Bucket(via.point.bucket.clone()),
+            (Some(via), Target::Object(_, key)) => Target::Object(via.point.bucket.clone(), key),
+            (_, target) => target,
+        },
+    )
+}
+
+/// The target as the request names it (its bucket, an access point's alias
+/// or host label as it is).
+fn named_target<B>(request: &Request<B>) -> Result<Target, S3Error> {
     let path = crate::sigv4::decode_path(request.uri().path())
         .ok_or_else(|| S3Error::invalid_request("the path is not UTF-8"))?;
     let path = path.strip_prefix('/').unwrap_or(&path);
@@ -322,7 +339,7 @@ pub(crate) fn owner_xml(account: &str) -> String {
 /// the policies that apply (see `authz`).
 pub async fn dispatch(
     state: &S3State,
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     auth: Authenticated,
 ) -> Result<Response<Body>, S3Error> {
     let method = request.method().clone();
@@ -359,7 +376,17 @@ pub async fn dispatch(
         }
         None => {}
     }
+    crate::access_points::resolve(state, &mut request, auth.principal.as_ref()).await?;
     let target = target(&request)?;
+    let via = request
+        .extensions()
+        .get::<crate::access_points::Via>()
+        .cloned();
+    if via.is_some() && !crate::access_points::allowed(&request, &target, &method) {
+        return Err(S3Error::invalid_request(
+            "This operation is not supported through an access point",
+        ));
+    }
     if let Some(scope) = &auth.session
         && !matches!(&target, Target::Bucket(bucket) | Target::Object(bucket, _) if *bucket == scope.bucket)
     {
@@ -423,6 +450,10 @@ pub async fn dispatch(
     .await?;
     let authz = match &auth.session {
         Some(scope) => authz.with_session(scope.clone()),
+        None => authz,
+    };
+    let authz = match via {
+        Some(via) => authz.through(via),
         None => authz,
     };
     // The request's bucket exists: it counts in the request metrics.

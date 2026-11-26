@@ -65,6 +65,8 @@ pub struct Authz {
     region: Option<String>,
     /// The session the request was signed with.
     session: Option<crate::session::Scope>,
+    /// The access point the request is made through.
+    via: Option<crate::access_points::Via>,
 }
 
 /// The changes of a bucket (not its objects') a ReadOnly session may not
@@ -375,6 +377,7 @@ impl Authz {
             context,
             region: Some(state.region.clone()),
             session: None,
+            via: None,
         })
     }
 
@@ -397,6 +400,7 @@ impl Authz {
             context: context(&HeaderMap::new(), "", &[], None, None, now_ms),
             region: None,
             session: None,
+            via: None,
         })
     }
 
@@ -535,6 +539,12 @@ impl Authz {
             }
             _ => context,
         };
+        // Through an access point, on its bucket: as both allow.
+        if let Some(via) = &self.via
+            && bucket == Some(via.point.bucket.as_str())
+        {
+            return self.check_through(action, &resource, via, grant, context);
+        }
         // The owning account's root always manages its bucket's policy, so a
         // policy cannot lock it out.
         if matches!(
@@ -694,6 +704,116 @@ impl Authz {
             Resource::Bucket(bucket),
             &context,
         )
+    }
+
+    /// This authorization for a request made through access point `via`.
+    pub(crate) fn through(mut self, via: crate::access_points::Via) -> Authz {
+        self.via = Some(via);
+        self
+    }
+
+    /// A request through access point `via` on its bucket: allowed when
+    /// both allow it ("both the access point and the underlying bucket ...
+    /// must permit the request"):
+    /// - the access point's side: the caller's own policies and the access
+    ///   point's policy, on the access point's ARN (`.../object/<key>` for
+    ///   an object), weighed as a resource of the access point's account;
+    /// - the bucket's side: its policy on the bucket's ARN (a grant to an
+    ///   account counting only as that account's policies allow the
+    ///   access point's request), or its owner's root.
+    ///
+    /// Both see `s3:DataAccessPointArn`, `s3:DataAccessPointAccount` and
+    /// `s3:AccessPointNetworkOrigin`; RestrictPublicBuckets of the access
+    /// point, the bucket or its owner's account restricts both.
+    fn check_through(
+        &self,
+        action: &str,
+        resource: &Resource<'_>,
+        via: &crate::access_points::Via,
+        grant: Option<&BucketGrant>,
+        context: &Context,
+    ) -> Result<(), S3Error> {
+        let denied = || S3Error::access_denied("Access Denied");
+        let (Some(region), Some(grant)) = (&self.region, grant) else {
+            return Err(denied());
+        };
+        let owner = grant.owner.as_deref();
+        let point_arn = via.arn(region);
+        let (through_arn, bucket_arn) = match resource {
+            Resource::Bucket(bucket) => (point_arn.clone(), format!("arn:aws:s3:::{bucket}")),
+            Resource::Object(bucket, key) => (
+                format!("{point_arn}/object/{key}"),
+                format!("arn:aws:s3:::{bucket}/{key}"),
+            ),
+            _ => return Err(denied()),
+        };
+        let mut context = context.clone();
+        context.set("s3:DataAccessPointArn", vec![point_arn]);
+        context.set("s3:DataAccessPointAccount", vec![via.point.account.clone()]);
+        context.set("s3:AccessPointNetworkOrigin", vec!["Internet".to_string()]);
+        let restrict = via.point.block_public[3]
+            || grant.public_block & crate::public_access::RESTRICT_PUBLIC_BUCKETS != 0;
+        // The access point's side.
+        let point_public = via.policy.as_ref().is_some_and(truthdb_iam::is_public);
+        if restrict && point_public && self.identity.account() != Some(via.point.account.as_str()) {
+            return Err(denied());
+        }
+        let unrestricted;
+        let point_policies: Vec<&Policy> = match via.policy.as_ref() {
+            Some(policy) if restrict && point_public => {
+                unrestricted = truthdb_iam::without_public_grants(policy);
+                vec![&unrestricted]
+            }
+            policy => policy.into_iter().collect(),
+        };
+        self.decide_all(
+            action,
+            &through_arn,
+            Some(&via.point.account),
+            &point_policies,
+            &context,
+        )?;
+        // The bucket's side.
+        if matches!(&self.identity, Identity::Root { account } if Some(account.as_str()) == owner) {
+            return Ok(());
+        }
+        if restrict && grant.policy_public && self.identity.account() != owner {
+            return Err(denied());
+        }
+        let bucket_unrestricted;
+        let bucket_policies: Vec<&Policy> = match grant.policy.as_ref() {
+            Some(policy) if restrict && grant.policy_public => {
+                bucket_unrestricted = truthdb_iam::without_public_grants(policy);
+                vec![&bucket_unrestricted]
+            }
+            policy => policy.into_iter().collect(),
+        };
+        if let Some(owner) = owner {
+            context.set("s3:ResourceAccount", vec![owner.to_string()]);
+        }
+        let policies: Vec<&Policy> = self.policies.iter().collect();
+        let identity_allows = truthdb_iam::evaluate_identity(
+            &truthdb_iam::Request {
+                identity: &self.identity,
+                action,
+                resource: &through_arn,
+                context: &context,
+            },
+            &policies,
+        ) == Decision::Allow;
+        match truthdb_iam::evaluate_resource(
+            &truthdb_iam::Request {
+                identity: &self.identity,
+                action,
+                resource: &bucket_arn,
+                context: &context,
+            },
+            &bucket_policies,
+            identity_allows,
+        ) {
+            Decision::Allow => Ok(()),
+            _ => Err(denied()),
+        }
     }
 
     /// This authorization for a request signed with session `scope`.

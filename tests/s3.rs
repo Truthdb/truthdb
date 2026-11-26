@@ -20376,3 +20376,206 @@ refused(lambda: control.get_access_point_policy(AccountId=account, Name="open"),
 refused(lambda: control.list_storage_lens_configurations(AccountId=account), "NotImplemented")
 print("ok")
 "#;
+
+#[test]
+fn requests_through_an_access_point_act_on_its_bucket_as_both_allow() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "owning");
+    let (other, other_key, other_secret) = account_with_key(&server, "visiting");
+    let point_only = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [{{"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],
+        "Resource": ["arn:aws:s3:us-east-1:{account}:accesspoint/reader", "arn:aws:s3:us-east-1:{account}:accesspoint/reader/object/*"]}}]}}"#
+    );
+    let bucket_only = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::data/*"}]}"#;
+    let (user_key, user_secret) = user_with_key(&server, &account, "through", Some(&point_only));
+    let (direct_key, direct_secret) = user_with_key(&server, &account, "direct", Some(bucket_only));
+    let (bare_key, bare_secret) = user_with_key(&server, &account, "bare", None);
+    let script = server.dir.join("through.py");
+    std::fs::write(&script, THROUGH_SCRIPT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other,
+            &other_key,
+            &other_secret,
+            &user_key,
+            &user_secret,
+            &direct_key,
+            &direct_secret,
+            &bare_key,
+            &bare_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const THROUGH_SCRIPT: &str = r#"
+import json, socket, sys
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other, other_key, other_secret, user_key, user_secret, direct_key, direct_secret, bare_key, bare_secret = sys.argv[1:14]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service, access, secret_key, endpoint="s3.test"):
+    return boto3.client(service, endpoint_url=f"http://{endpoint}:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+s3, control = client("s3", key, secret), client("s3control", key, secret)
+# Through an access point's host: an SDK given its ARN and the access
+# point endpoint (s3-accesspoint.<region>.<domain>).
+points = lambda access, secret_key: client("s3", access, secret_key, "s3-accesspoint.us-east-1.s3.test")
+s3.create_bucket(Bucket="data")
+s3.put_object(Bucket="data", Key="k", Body=b"kept")
+alias = control.create_access_point(AccountId=account, Name="reader", Bucket="data")["Alias"]
+arn = f"arn:aws:s3:us-east-1:{account}:accesspoint/reader"
+# Its owner's root: by its ARN (host) and by its alias, reads and writes
+# acting on its bucket.
+through = points(key, secret)
+assert through.get_object(Bucket=arn, Key="k")["Body"].read() == b"kept"
+assert s3.get_object(Bucket=alias, Key="k")["Body"].read() == b"kept"
+assert [o["Key"] for o in s3.list_objects_v2(Bucket=alias)["Contents"]] == ["k"]
+assert [o["Key"] for o in through.list_objects_v2(Bucket=arn)["Contents"]] == ["k"]
+s3.put_object(Bucket=alias, Key="via-alias", Body=b"a")
+through.put_object(Bucket=arn, Key="via-host", Body=b"h")
+assert s3.get_object(Bucket="data", Key="via-alias")["Body"].read() == b"a"
+assert s3.get_object(Bucket="data", Key="via-host")["Body"].read() == b"h"
+s3.head_bucket(Bucket=alias)
+# Not the bucket's changes.
+refused(lambda: s3.put_bucket_versioning(Bucket=alias, VersioningConfiguration={"Status": "Enabled"}),
+    "InvalidRequest")
+refused(lambda: s3.delete_bucket(Bucket=alias), "InvalidRequest")
+# A user whose own policy allows the access point: its bucket must allow
+# too (by its policy: none yet).
+user = client("s3", user_key, user_secret)
+user_points = points(user_key, user_secret)
+refused(lambda: user_points.get_object(Bucket=arn, Key="k"), "AccessDenied")
+refused(lambda: user.get_object(Bucket=alias, Key="k"), "AccessDenied")
+# The bucket delegating to its account's access points.
+def delegate(*accounts):
+    s3.put_bucket_policy(Bucket="data", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "*", "Resource": ["arn:aws:s3:::data", "arn:aws:s3:::data/*"],
+         "Condition": {"StringEquals": {"s3:DataAccessPointAccount": list(accounts)}}}]}))
+delegate(account)
+assert user_points.get_object(Bucket=arn, Key="k")["Body"].read() == b"kept"
+assert user.get_object(Bucket=alias, Key="k")["Body"].read() == b"kept"
+assert [o["Key"] for o in user.list_objects_v2(Bucket=alias)["Contents"]] == ["k", "via-alias", "via-host"]
+# What its own policy does not allow through the access point.
+refused(lambda: user.put_object(Bucket=alias, Key="no", Body=b"n"), "AccessDenied")
+# Not the bucket itself: the delegation holds only through an access point.
+refused(lambda: user.get_object(Bucket="data", Key="k"), "AccessDenied")
+# A user whose own policy allows the bucket but not the access point.
+direct = client("s3", direct_key, direct_secret)
+assert direct.get_object(Bucket="data", Key="k")["Body"].read() == b"kept"
+refused(lambda: direct.get_object(Bucket=alias, Key="k"), "AccessDenied")
+# The access point's policy may deny what the user's allows.
+control.put_access_point_policy(AccountId=account, Name="reader", Policy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Deny", "Principal": {"AWS": f"arn:aws:iam::{account}:user/through"},
+    "Action": "s3:GetObject", "Resource": f"{arn}/object/k"}]}))
+refused(lambda: user.get_object(Bucket=alias, Key="k"), "AccessDenied")
+assert user.get_object(Bucket=alias, Key="via-alias")["Body"].read() == b"a"
+control.delete_access_point_policy(AccountId=account, Name="reader")
+# A user with no policy of its own, granted by the access point's policy:
+# the bucket's grant to its account counts only as its own policies allow
+# (none do), its grant naming the user does.
+bare = client("s3", bare_key, bare_secret)
+control.put_access_point_policy(AccountId=account, Name="reader", Policy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:user/bare"},
+    "Action": "s3:GetObject", "Resource": f"{arn}/object/*"}]}))
+def bucket_grant(principal):
+    s3.put_bucket_policy(Bucket="data", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": principal}, "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/*",
+         "Condition": {"StringEquals": {"s3:DataAccessPointAccount": account}}}]}))
+bucket_grant(f"arn:aws:iam::{account}:root")
+refused(lambda: bare.get_object(Bucket=alias, Key="k"), "AccessDenied")
+bucket_grant(f"arn:aws:iam::{account}:user/bare")
+assert bare.get_object(Bucket=alias, Key="k")["Body"].read() == b"kept"
+control.delete_access_point_policy(AccountId=account, Name="reader")
+delegate(account)
+# Another account's access point on the bucket: only as the bucket's
+# policy delegates to that account too.
+their_control = client("s3control", other_key, other_secret)
+their_alias = their_control.create_access_point(AccountId=other, Name="theirs", Bucket="data",
+    BucketAccountId=account)["Alias"]
+theirs = client("s3", other_key, other_secret)
+refused(lambda: theirs.get_object(Bucket=their_alias, Key="k"), "AccessDenied")
+delegate(account, other)
+assert theirs.get_object(Bucket=their_alias, Key="k")["Body"].read() == b"kept"
+their_points = points(other_key, other_secret)
+assert their_points.get_object(Bucket=f"arn:aws:s3:us-east-1:{other}:accesspoint/theirs", Key="k")["Body"].read() == b"kept"
+# The bucket delegating by the access point's ARN instead.
+s3.put_bucket_policy(Bucket="data", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/*",
+     "Condition": {"StringEquals": {"s3:DataAccessPointArn": f"arn:aws:s3:us-east-1:{other}:accesspoint/theirs"}}}]}))
+assert theirs.get_object(Bucket=their_alias, Key="k")["Body"].read() == b"kept"
+refused(lambda: user.get_object(Bucket=alias, Key="k"), "AccessDenied")
+delegate(account, other)
+# A public access point (its policy allows anyone): another account's
+# caller reads through it, unless a RestrictPublicBuckets is on: the
+# access point's, or its bucket's (on for a new bucket).
+control.create_access_point(AccountId=account, Name="early", Bucket="data",
+    PublicAccessBlockConfiguration={"BlockPublicAcls": True, "IgnorePublicAcls": True,
+    "BlockPublicPolicy": False, "RestrictPublicBuckets": False})
+control.put_access_point_policy(AccountId=account, Name="early", Policy=json.dumps({"Version": "2012-10-17",
+    "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+    "Resource": f"arn:aws:s3:us-east-1:{account}:accesspoint/early/object/*"}]}))
+early = control.get_access_point(AccountId=account, Name="early")["Alias"]
+refused(lambda: theirs.get_object(Bucket=early, Key="k"), "AccessDenied")
+control.delete_access_point(AccountId=account, Name="early")
+s3.put_public_access_block(Bucket="data", PublicAccessBlockConfiguration={"BlockPublicAcls": False,
+    "IgnorePublicAcls": False, "BlockPublicPolicy": False, "RestrictPublicBuckets": False})
+for name, restrict in [("open", False), ("shut", True)]:
+    control.create_access_point(AccountId=account, Name=name, Bucket="data",
+        PublicAccessBlockConfiguration={"BlockPublicAcls": True, "IgnorePublicAcls": True,
+        "BlockPublicPolicy": False, "RestrictPublicBuckets": restrict})
+    control.put_access_point_policy(AccountId=account, Name=name, Policy=json.dumps({"Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:us-east-1:{account}:accesspoint/{name}/object/*"}]}))
+    public_alias = control.get_access_point(AccountId=account, Name=name)["Alias"]
+    if restrict:
+        refused(lambda: theirs.get_object(Bucket=public_alias, Key="k"), "AccessDenied")
+    else:
+        assert theirs.get_object(Bucket=public_alias, Key="k")["Body"].read() == b"kept"
+    control.delete_access_point(AccountId=account, Name=name)
+# Its access point is its own: the bucket owner's root through another's
+# access point needs that access point's grant.
+refused(lambda: s3.get_object(Bucket=their_alias, Key="k"), "AccessDenied")
+# Names that are no access point.
+refused(lambda: s3.get_object(Bucket="nothing-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-s3alias", Key="k"), "NoSuchBucket")
+refused(lambda: through.get_object(Bucket=f"arn:aws:s3:us-east-1:{account}:accesspoint/nothing", Key="k"),
+    "NoSuchAccessPoint")
+# Its bucket deleted, and one of its name made by another account: not
+# the access point's.
+for name in ["k", "via-alias", "via-host"]:
+    s3.delete_object(Bucket="data", Key=name)
+s3.delete_bucket_policy(Bucket="data")
+s3.delete_bucket(Bucket="data")
+refused(lambda: s3.get_object(Bucket=alias, Key="k"), "NoSuchBucket")
+theirs.create_bucket(Bucket="data")
+theirs.put_object(Bucket="data", Key="k", Body=b"another's")
+refused(lambda: s3.get_object(Bucket=alias, Key="k"), "NoSuchBucket")
+refused(lambda: through.get_object(Bucket=arn, Key="k"), "NoSuchBucket")
+print("ok")
+"#;

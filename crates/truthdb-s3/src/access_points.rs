@@ -6,8 +6,11 @@
 //! named with `BucketAccountId`), with Block Public Access settings fixed
 //! at creation (all on by default) and a generated alias. Its network
 //! origin is the Internet: a VPC configuration is not built (501).
-//! Requests through access points (their ARN, alias or host) are the data
-//! plane's, not built here.
+//!
+//! Requests through an access point (see [`resolve`]) name it by its host,
+//! `<name>-<account>.s3-accesspoint.<region>.<domain>`, or by its alias in
+//! place of a bucket's name; they act on its bucket, authorized as both
+//! the access point and its bucket allow (see `authz`).
 
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
@@ -677,6 +680,166 @@ async fn policy_status(
             "<GetAccessPointPolicyStatusResult xmlns=\"{XMLNS}\"><PolicyStatus><IsPublic>{public}</IsPublic></PolicyStatus></GetAccessPointPolicyStatusResult>"
         ),
     ))
+}
+
+/// The access point a request is made through, in its extensions: the
+/// access point and its policy.
+#[derive(Debug, Clone)]
+pub(crate) struct Via {
+    pub(crate) point: AccessPoint,
+    pub(crate) policy: Option<Policy>,
+}
+
+impl Via {
+    /// The access point's ARN.
+    pub(crate) fn arn(&self, region: &str) -> String {
+        format!(
+            "arn:aws:s3:{region}:{}:accesspoint/{}",
+            self.point.account, self.point.name
+        )
+    }
+}
+
+/// How a request names an access point.
+enum Named {
+    /// By its host: its account and name.
+    Host(String, String),
+    /// By its alias, in place of a bucket's name.
+    Alias(String),
+}
+
+/// The access point `request` is made through, if it names one (its host,
+/// `<name>-<account>.s3-accesspoint.<region>.<domain>`, or its alias in
+/// place of a bucket's name), put in its extensions ([`Via`]); its bucket
+/// is then the request's. Not by `<name>-<account>.<domain>` (an SDK's
+/// form under a custom endpoint): a bucket may have that name, and either
+/// reading would let one party take the other's requests. An access point
+/// whose bucket is gone, or is another account's than when it was made, is
+/// not one to act through.
+pub(crate) async fn resolve<B>(
+    state: &S3State,
+    request: &mut Request<B>,
+    principal: Option<&crate::server::Principal>,
+) -> Result<(), S3Error> {
+    let label = request
+        .extensions()
+        .get::<crate::api::VirtualHost>()
+        .map(|host| host.0.clone());
+    let suffix = format!(".s3-accesspoint.{}", state.region);
+    let named = match label
+        .as_deref()
+        .and_then(|label| label.strip_suffix(&suffix))
+    {
+        Some(named) => {
+            let (name, account) = named
+                .rsplit_once('-')
+                .filter(|(name, account)| {
+                    valid_name(name)
+                        && account.len() == 12
+                        && account.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .ok_or_else(no_such_access_point)?;
+            Named::Host(account.to_string(), name.to_string())
+        }
+        None => {
+            let bucket = match label {
+                Some(label) => label,
+                None => crate::sigv4::decode_path(request.uri().path())
+                    .unwrap_or_default()
+                    .trim_start_matches('/')
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            if !bucket.ends_with("-s3alias") {
+                return Ok(());
+            }
+            Named::Alias(bucket)
+        }
+    };
+    let alias = matches!(named, Named::Alias(_));
+    // Read in the request's own scope: its key still valid.
+    let scope = crate::scope::Scope {
+        key: principal.map(|principal| (principal.access_key.clone(), principal.account.clone())),
+        buckets: Vec::new(),
+        origin: None,
+    };
+    let found = crate::scope::within(
+        scope,
+        crate::scope::object(state, move |file| {
+            let point = match &named {
+                Named::Host(account, name) => file.access_point(account, name)?,
+                Named::Alias(alias) => file.access_point_by_alias(alias)?,
+            };
+            let Some(point) = point else {
+                return Ok(None);
+            };
+            let policy = file.access_point_policy(&point.account, &point.name)?;
+            let owner = file.bucket(&point.bucket)?.map(|info| info.owner);
+            Ok(Some((point, policy, owner)))
+        }),
+    )
+    .await?;
+    let Some((point, policy, owner)) = found else {
+        return Err(if alias {
+            S3Error::new(404, "NoSuchBucket", "The specified bucket does not exist")
+        } else {
+            no_such_access_point()
+        });
+    };
+    if owner.as_deref() != Some(point.bucket_account.as_str()) {
+        return Err(S3Error::new(
+            404,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+        ));
+    }
+    let policy = policy
+        .map(|text| Policy::parse(&text, PolicyKind::Bucket))
+        .transpose()
+        .map_err(|err| S3Error::internal(format!("stored access point policy: {}", err.0)))?;
+    request.extensions_mut().insert(Via { point, policy });
+    Ok(())
+}
+
+/// Whether a request through an access point may do this: an object's
+/// operations, and the bucket's reads AWS lists for access points (its
+/// listings, HeadBucket, GetBucketLocation, -Acl, -Policy, -Cors and
+/// -NotificationConfiguration) and DeleteObjects; nothing that changes the
+/// bucket.
+pub(crate) fn allowed(
+    request: &Request<Incoming>,
+    target: &crate::api::Target,
+    method: &Method,
+) -> bool {
+    use crate::api::Target;
+    match target {
+        Target::Object(..) => true,
+        Target::Service => false,
+        Target::Bucket(_) => {
+            let has = |name: &str| crate::api::has_param(request, name);
+            match *method {
+                Method::HEAD => true,
+                Method::GET => {
+                    [
+                        "location",
+                        "acl",
+                        "policy",
+                        "cors",
+                        "notification",
+                        "versions",
+                        "uploads",
+                    ]
+                    .iter()
+                    .any(|name| has(name))
+                        || crate::api::subresource_count(request) == 0
+                }
+                Method::POST => has("delete"),
+                _ => false,
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -155,6 +155,60 @@ pub fn evaluate_all(
     }
 }
 
+/// The caller's own policies' decision on `request` alone: allowed (a
+/// root's always is), denied by one, or allowed by none.
+pub fn evaluate_identity(request: &Request<'_>, identity_policies: &[&Policy]) -> Decision {
+    let mut allowed = matches!(request.identity, Identity::Root { .. });
+    for policy in identity_policies {
+        for statement in &policy.statements {
+            if !applies(policy, statement, request) {
+                continue;
+            }
+            match statement.effect {
+                Effect::Deny => return Decision::ExplicitDeny,
+                Effect::Allow => allowed = true,
+            }
+        }
+    }
+    if allowed {
+        Decision::Allow
+    } else {
+        Decision::ImplicitDeny
+    }
+}
+
+/// A resource's policies' decision on `request` alone (a bucket's, for a
+/// request through an access point, which the access point's side has
+/// authorized): a Deny naming the caller denies; an Allow naming it
+/// directly (or anyone) allows; one naming its account allows only with
+/// `identity_allows` (the caller's own policies allowing the request, as a
+/// grant to an account delegates to that account's policies).
+pub fn evaluate_resource(
+    request: &Request<'_>,
+    resource_policies: &[&Policy],
+    identity_allows: bool,
+) -> Decision {
+    let (mut direct, mut by_account) = (false, false);
+    for policy in resource_policies {
+        for statement in &policy.statements {
+            let named = named(&statement.principals, request.identity);
+            if named == Named::No || !applies(policy, statement, request) {
+                continue;
+            }
+            match statement.effect {
+                Effect::Deny => return Decision::ExplicitDeny,
+                Effect::Allow if named == Named::Directly => direct = true,
+                Effect::Allow => by_account = true,
+            }
+        }
+    }
+    if direct || (by_account && identity_allows) {
+        Decision::Allow
+    } else {
+        Decision::ImplicitDeny
+    }
+}
+
 /// The condition keys that, pinned to fixed values, keep a statement naming
 /// anyone from being public (S3's rule for Block Public Access).
 const PINNING_KEYS: &[&str] = &[
