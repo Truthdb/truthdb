@@ -19860,6 +19860,54 @@ promoted = c.load_table(("lake", "promoted"))
 assert promoted.current_snapshot().summary.operation == Operation.REPLACE
 assert sorted(row["id"] for row in promoted.scan().to_arrow().to_pylist()) == expected
 
+# A spec whose fields are all void is unpartitioned (as Iceberg's Java has
+# it): its equality deletes apply to every older file. And a position
+# delete applies by path, whatever spec or partition it is written in.
+from pyiceberg.typedef import Record
+def voided(name):
+    tbl = table(name, spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+        transform=IdentityTransform(), name="region")))
+    for i in range(5):
+        tbl.append(rows(i * 3))
+    c._session.post(c.url(f"namespaces/lake/tables/{name}", prefixed=True), json={"requirements": [],
+        "updates": [{"action": "add-spec", "spec": {"spec-id": 1, "fields": [{"source-id": 6, "field-id": 1000,
+        "name": "region", "transform": "void"}]}}, {"action": "set-default-spec", "spec-id": -1}]}).raise_for_status()
+    return c.load_table(("lake", name))
+voideq = voided("voideq")
+voideq = add_deletes(voideq, "voideq", 91, [equalities(voideq, Record(None), [4, 7])], spec=voideq.spec())
+since = time.time()
+configure("voideq", targetFileSizeMB=64)
+ran("voideq", since)
+voideq = c.load_table(("lake", "voideq"))
+assert voideq.current_snapshot().summary.operation == Operation.REPLACE
+assert compacted_rows(voideq) == [i for i in range(15) if i not in (4, 7)], compacted_rows(voideq)
+voidpos = voided("voidpos")
+[first, *_] = sorted(data_files(voidpos), key=lambda f: f.file_path)
+voidpos = add_deletes(voidpos, "voidpos", 92, [positions(voidpos, Record(None), [(first.file_path, [0, 2])],
+    scoped=first.file_path)], spec=voidpos.spec())
+expected = sorted(row["id"] for row in voidpos.scan().to_arrow().to_pylist())
+since = time.time()
+configure("voidpos", targetFileSizeMB=64)
+ran("voidpos", since)
+voidpos = c.load_table(("lake", "voidpos"))
+assert voidpos.current_snapshot().summary.operation == Operation.REPLACE
+assert len(compacted_rows(voidpos)) == 13 and sorted(row["id"] for row in voidpos.scan().to_arrow().to_pylist()) == expected
+# One written in another partition of the same spec, naming a file of
+# partition a: applied by its path.
+otherpos = table("otherpos", spec=PartitionSpec(PartitionField(source_id=6, field_id=1000,
+    transform=IdentityTransform(), name="region")))
+for i in range(5):
+    otherpos.append(rows(i * 3, "a"))
+otherpos.append(rows(100, "b"))
+[first, *_] = sorted(data_files(otherpos, "a"), key=lambda f: f.file_path)
+otherpos = add_deletes(otherpos, "otherpos", 93, [positions(otherpos, data_files(otherpos, "b")[0].partition,
+    [(first.file_path, [0, 2])])])
+since = time.time()
+configure("otherpos", targetFileSizeMB=64)
+ran("otherpos", since)
+otherpos = c.load_table(("lake", "otherpos"))
+assert sorted((f["partition"]["region"], f["record_count"]) for f in files(otherpos)) == [("a", 13), ("b", 3)]
+
 # Iceberg's delete ratio: a single file whose file-scoped position deletes
 # delete 30% of its rows is rewritten without them; at 20% it is not.
 # One whose deletes name another file is not this file's.

@@ -185,7 +185,15 @@ pub(super) async fn compact(
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|spec| spec["fields"].as_array().is_none_or(Vec::is_empty))
+        // Unpartitioned as Iceberg's Java has it: no field that is not
+        // `void` (a field a version 1 table dropped).
+        .filter(|spec| {
+            spec["fields"].as_array().is_none_or(|fields| {
+                fields
+                    .iter()
+                    .all(|field| field["transform"].as_str() == Some("void"))
+            })
+        })
         .filter_map(|spec| spec["spec-id"].as_i64())
         .collect();
     // The live data files and delete files.
@@ -256,11 +264,11 @@ pub(super) async fn compact(
         }
     }
     // The deletes that apply to each data file ("Scan Planning"): a
-    // position delete to one of its partition (or of an unpartitioned
-    // spec, read by path all the same) not older than it, naming it if it
-    // names one file; an equality delete to one of its partition, or of an
-    // unpartitioned spec, newer than it. A data file a delete applies to
-    // that cannot be read here is left as it is.
+    // position delete not older than it, naming it if it names one file
+    // (one of any partition or spec is read, and applied by path: positions
+    // never hang on partitions comparing equal); an equality delete to one
+    // of its partition, or of an unpartitioned spec, newer than it. A data
+    // file a delete applies to that cannot be read here is left as it is.
     data.retain_mut(|file| {
         let spec = manifests[file.manifest].spec;
         let partition = partition_key(&file.partition);
@@ -272,8 +280,7 @@ pub(super) async fn compact(
                     || unpartitioned.contains(&i64::from(delete.spec));
                 match delete.content {
                     1 => {
-                        scope
-                            && file.sequence <= delete.sequence
+                        file.sequence <= delete.sequence
                             && delete.scoped.as_ref().is_none_or(|one| *one == file.path)
                     }
                     _ => scope && file.sequence < delete.sequence,
