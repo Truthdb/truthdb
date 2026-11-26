@@ -69,7 +69,7 @@ pub(crate) fn target<B>(request: &Request<B>) -> Result<Target, S3Error> {
 
 /// The target as the request names it (its bucket, an access point's alias
 /// or host label as it is).
-fn named_target<B>(request: &Request<B>) -> Result<Target, S3Error> {
+pub(crate) fn named_target<B>(request: &Request<B>) -> Result<Target, S3Error> {
     let path = crate::sigv4::decode_path(request.uri().path())
         .ok_or_else(|| S3Error::invalid_request("the path is not UTF-8"))?;
     let path = path.strip_prefix('/').unwrap_or(&path);
@@ -445,7 +445,7 @@ pub async fn dispatch(
         &raw_query,
         connection,
         buckets,
-        objects,
+        objects.clone(),
     )
     .await?;
     let authz = match &auth.session {
@@ -453,7 +453,7 @@ pub async fn dispatch(
         None => authz,
     };
     let authz = match via {
-        Some(via) => authz.through(via),
+        Some(via) => authz.through(state, via, objects).await?,
         None => authz,
     };
     // The request's bucket exists: it counts in the request metrics.

@@ -230,22 +230,33 @@ fn load(
     let reads_tags = texts
         .iter()
         .any(|text| text.to_ascii_lowercase().contains("existingobjecttag"));
-    let mut existing_tags = HashMap::new();
-    if reads_tags {
-        for (bucket, key, which) in objects {
-            if let Ok(info) = file.head_object(bucket, key, *which)?
-                && !info.delete_marker
-            {
-                existing_tags.insert((bucket.clone(), key.clone()), info.attrs.tags);
-            }
-        }
-    }
+    let existing_tags = match reads_tags {
+        true => existing_tags(file, objects)?,
+        false => HashMap::new(),
+    };
     Ok(Loaded {
         identity,
         policies,
         buckets: grants,
         existing_tags,
     })
+}
+
+/// Objects' tags, by bucket and key.
+type ObjectTags = HashMap<(String, String), Vec<(String, String)>>;
+
+/// The current tags of `objects` (those that exist and are not delete
+/// markers).
+fn existing_tags(file: &mut ObjFile<'_>, objects: &[Named]) -> Result<ObjectTags, StorageError> {
+    let mut tags = HashMap::new();
+    for (bucket, key, which) in objects {
+        if let Ok(info) = file.head_object(bucket, key, *which)?
+            && !info.delete_marker
+        {
+            tags.insert((bucket.clone(), key.clone()), info.attrs.tags);
+        }
+    }
+    Ok(tags)
 }
 
 /// Sets `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys`.
@@ -706,10 +717,24 @@ impl Authz {
         )
     }
 
-    /// This authorization for a request made through access point `via`.
-    pub(crate) fn through(mut self, via: crate::access_points::Via) -> Authz {
+    /// This authorization for a request made through access point `via`;
+    /// `objects` are those it names (as [`Self::load`]'s), whose tags are
+    /// read when the access point's policy reads them.
+    pub(crate) async fn through(
+        mut self,
+        state: &S3State,
+        via: crate::access_points::Via,
+        objects: Vec<Named>,
+    ) -> Result<Authz, S3Error> {
+        if via.reads_tags {
+            self.existing_tags = state
+                .engine
+                .run_object(move |file| existing_tags(file, &objects))
+                .await
+                .map_err(|err| S3Error::internal(err.to_string()))?;
+        }
         self.via = Some(via);
-        self
+        Ok(self)
     }
 
     /// A request through access point `via` on its bucket: allowed when
@@ -739,6 +764,16 @@ impl Authz {
             return Err(denied());
         };
         let owner = grant.owner.as_deref();
+        // Its bucket as authorized against still the one it was made for
+        // (not deleted and made again by another account since it was
+        // resolved).
+        if owner != Some(via.point.bucket_account.as_str()) {
+            return Err(S3Error::new(
+                404,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            ));
+        }
         let point_arn = via.arn(region);
         let (through_arn, bucket_arn) = match resource {
             Resource::Bucket(bucket) => (point_arn.clone(), format!("arn:aws:s3:::{bucket}")),

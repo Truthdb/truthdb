@@ -20497,6 +20497,26 @@ control.put_access_point_policy(AccountId=account, Name="reader", Policy=json.du
 refused(lambda: user.get_object(Bucket=alias, Key="k"), "AccessDenied")
 assert user.get_object(Bucket=alias, Key="via-alias")["Body"].read() == b"a"
 control.delete_access_point_policy(AccountId=account, Name="reader")
+# The access point's policy reading the object's tags (no other policy
+# does): denying a tagged object, and allowing all but it.
+s3.put_object(Bucket="data", Key="secret", Body=b"s", Tagging="classification=secret")
+def point_policy(*statements):
+    control.put_access_point_policy(AccountId=account, Name="reader", Policy=json.dumps({"Version": "2012-10-17",
+        "Statement": list(statements)}))
+point_policy({"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": f"{arn}/object/*",
+    "Condition": {"StringEquals": {"s3:ExistingObjectTag/classification": "secret"}}})
+refused(lambda: user.get_object(Bucket=alias, Key="secret"), "AccessDenied")
+assert user.get_object(Bucket=alias, Key="k")["Body"].read() == b"kept"
+bare_user = client("s3", bare_key, bare_secret)
+point_policy({"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:user/bare"}, "Action": "s3:GetObject",
+    "Resource": f"{arn}/object/*", "Condition": {"StringNotEquals": {"s3:ExistingObjectTag/classification": "secret"}}})
+s3.put_bucket_policy(Bucket="data", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:user/bare"}, "Action": "s3:GetObject",
+     "Resource": "arn:aws:s3:::data/*", "Condition": {"StringEquals": {"s3:DataAccessPointAccount": account}}}]}))
+assert bare_user.get_object(Bucket=alias, Key="k")["Body"].read() == b"kept"
+refused(lambda: bare_user.get_object(Bucket=alias, Key="secret"), "AccessDenied")
+delegate(account)
+s3.delete_object(Bucket="data", Key="secret")
 # A user with no policy of its own, granted by the access point's policy:
 # the bucket's grant to its account counts only as its own policies allow
 # (none do), its grant naming the user does.
@@ -20593,6 +20613,9 @@ def anonymous(host, path):
         return error.code, error.read().decode()
 status, body = anonymous("s3.test", f"/{alias}/k")
 assert status == 403 and "<Code>AccessDenied</Code>" in body, (status, body)
+# A path read as routing reads it: "//<alias>/k" names no bucket ("").
+status, body = anonymous("s3.test", f"//{alias}/k")
+assert status == 404 and "<Code>NoSuchBucket</Code>" in body, (status, body)
 status, body = anonymous("x-12.s3-accesspoint.us-east-1.s3.test", "/k")
 assert status == 404 and "<Code>NoSuchAccessPoint</Code>" in body, (status, body)
 # More of what acts on objects: a copy, and a multiple delete.

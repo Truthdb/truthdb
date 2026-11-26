@@ -688,6 +688,8 @@ async fn policy_status(
 pub(crate) struct Via {
     pub(crate) point: AccessPoint,
     pub(crate) policy: Option<Policy>,
+    /// Whether its policy reads `s3:ExistingObjectTag/...`.
+    pub(crate) reads_tags: bool,
 }
 
 impl Via {
@@ -744,15 +746,12 @@ pub(crate) async fn resolve<B>(
             Named::Host(label.clone().unwrap_or_default(), parts)
         }
         None => {
-            let bucket = match label {
-                Some(label) => label,
-                None => crate::sigv4::decode_path(request.uri().path())
-                    .unwrap_or_default()
-                    .trim_start_matches('/')
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
+            // The bucket the request names, read as its routing reads it.
+            let bucket = match crate::api::named_target(request)? {
+                crate::api::Target::Bucket(bucket) | crate::api::Target::Object(bucket, _) => {
+                    bucket
+                }
+                _ => return Ok(()),
             };
             if !bucket.ends_with("-s3alias") {
                 return Ok(());
@@ -805,11 +804,18 @@ pub(crate) async fn resolve<B>(
             "The specified bucket does not exist",
         ));
     }
+    let reads_tags = policy
+        .as_ref()
+        .is_some_and(|text| text.to_ascii_lowercase().contains("existingobjecttag"));
     let policy = policy
         .map(|text| Policy::parse(&text, PolicyKind::Bucket))
         .transpose()
         .map_err(|err| S3Error::internal(format!("stored access point policy: {}", err.0)))?;
-    request.extensions_mut().insert(Via { point, policy });
+    request.extensions_mut().insert(Via {
+        point,
+        policy,
+        reads_tags,
+    });
     Ok(())
 }
 
