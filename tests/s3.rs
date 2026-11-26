@@ -20347,6 +20347,24 @@ assert put["requestParameters"]["name"] in ("reader", "open"), put
 assert put["requestParameters"]["x-amz-account-id"] == account, put
 assert put["resources"] == [{"accountId": account, "type": "AWS::S3::AccessPoint",
     "ARN": f"arn:aws:s3:us-east-1:{account}:accesspoint/{put['requestParameters']['name']}"}], put
+# A refused call on another account's: recorded as the account it named.
+for _ in range(60):
+    denied = [json.loads(event["CloudTrailEvent"]) for event in trail.lookup_events(LookupAttributes=[
+        {"AttributeKey": "EventName", "AttributeValue": "GetAccessPoint"}])["Events"]]
+    denied = [event for event in denied if event.get("errorCode") == "AccessDenied"
+        and event["requestParameters"]["x-amz-account-id"] == other]
+    if denied:
+        break
+    time.sleep(0.5)
+assert denied and denied[0]["resources"][0]["ARN"] == f"arn:aws:s3:us-east-1:{other}:accesspoint/reader", denied
+for _ in range(60):
+    lists = [json.loads(event["CloudTrailEvent"]) for event in trail.lookup_events(LookupAttributes=[
+        {"AttributeKey": "EventName", "AttributeValue": "ListAccessPoints"}])["Events"]]
+    lists = [event for event in lists if event["requestParameters"].get("bucket") == "points"]
+    if lists:
+        break
+    time.sleep(0.5)
+assert lists and lists[0]["requestParameters"]["x-amz-account-id"] == account, lists
 # Gone with its policy; then it does not exist.
 control.delete_access_point(AccountId=account, Name="open")
 refused(lambda: control.get_access_point(AccountId=account, Name="open"), "NoSuchAccessPoint")
