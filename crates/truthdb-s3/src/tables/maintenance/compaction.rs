@@ -939,6 +939,7 @@ fn rewrite_files(
     };
     // Each input's deleted rows, a bit a row, marked a delete file at a
     // time: what is held does not grow with the deletes.
+    check_rows(inputs)?;
     let mut deleted = inputs
         .iter()
         .map(|input| Deleted::new(input.records))
@@ -1007,8 +1008,9 @@ fn rewrite_files(
     Ok((done, read))
 }
 
-/// The most rows a rewritten data file may count (its deleted rows are
-/// held a bit a row), and the most memory a chunk of equality delete keys
+/// The most rows a rewritten group's data files may count together (their
+/// deleted rows are held a bit a row: a GiB at most), and the most memory a
+/// chunk of equality delete keys
 /// takes (a key holds its columns' values).
 const MAX_ROWS: i64 = 1 << 33;
 const MAX_DELETE_BYTES: usize = 512 << 20;
@@ -1018,6 +1020,22 @@ const DELETE_OVERHEAD: usize = 64;
 /// Position delete files' columns.
 const FILE_PATH: i32 = 2_147_483_546;
 const POS: i32 = 2_147_483_545;
+
+/// Refuses a group whose inputs' manifests count more rows than its deleted
+/// rows may be held for, a bit a row ([`MAX_ROWS`] in all): what manifests
+/// count is not checked against the files until they are read.
+fn check_rows(inputs: &[Input]) -> Result<(), String> {
+    let rows = inputs
+        .iter()
+        .map(|input| input.records.max(0))
+        .fold(0i64, i64::saturating_add);
+    if rows > MAX_ROWS {
+        return Err(format!(
+            "Data files of {rows} rows in all are not rewritten together here."
+        ));
+    }
+    Ok(())
+}
 
 /// A data file's deleted rows, a bit a row, held from the first one marked
 /// (rows past those its manifest counts are not marked: the file is then
@@ -2391,6 +2409,19 @@ mod tests {
             partition_key(&record(Avro::Int(1))),
             partition_key(&record(Avro::Int(2)))
         );
+    }
+
+    #[test]
+    fn a_group_counting_too_many_rows_is_refused_before_any_is_held() {
+        let input = |records| Input {
+            key: String::new(),
+            path: String::new(),
+            sequence: 1,
+            records,
+        };
+        assert!(check_rows(&[input(MAX_ROWS / 2), input(MAX_ROWS / 2)]).is_ok());
+        assert!(check_rows(&[input(MAX_ROWS / 2), input(MAX_ROWS / 2 + 1)]).is_err());
+        assert!(check_rows(&[input(i64::MAX), input(i64::MAX)]).is_err());
     }
 
     #[test]
