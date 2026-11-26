@@ -20559,6 +20559,51 @@ for name, restrict in [("open", False), ("shut", True)]:
     else:
         assert theirs.get_object(Bucket=public_alias, Key="k")["Body"].read() == b"kept"
     control.delete_access_point(AccountId=account, Name=name)
+# The bucket's public policy serves another account's caller through an
+# access point only while no RestrictPublicBuckets is on: the bucket's, or
+# the access point's (on by default).
+s3.put_bucket_policy(Bucket="data", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/*"}]}))
+loose = their_control.create_access_point(AccountId=other, Name="loose", Bucket="data", BucketAccountId=account,
+    PublicAccessBlockConfiguration={"BlockPublicAcls": True, "IgnorePublicAcls": True,
+    "BlockPublicPolicy": True, "RestrictPublicBuckets": False})["Alias"]
+assert theirs.get_object(Bucket=loose, Key="k")["Body"].read() == b"kept"
+refused(lambda: theirs.get_object(Bucket=their_alias, Key="k"), "AccessDenied")
+s3.put_public_access_block(Bucket="data", PublicAccessBlockConfiguration={"BlockPublicAcls": False,
+    "IgnorePublicAcls": False, "BlockPublicPolicy": False, "RestrictPublicBuckets": True})
+refused(lambda: theirs.get_object(Bucket=loose, Key="k"), "AccessDenied")
+s3.put_public_access_block(Bucket="data", PublicAccessBlockConfiguration={"BlockPublicAcls": False,
+    "IgnorePublicAcls": False, "BlockPublicPolicy": False, "RestrictPublicBuckets": False})
+# The bucket's policy denying: its owner's root too, as directly.
+s3.put_bucket_policy(Bucket="data", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::data/k"}]}))
+refused(lambda: s3.get_object(Bucket="data", Key="k"), "AccessDenied")
+refused(lambda: s3.get_object(Bucket=alias, Key="k"), "AccessDenied")
+assert s3.get_object(Bucket=alias, Key="via-alias")["Body"].read() == b"a"
+delegate(account, other)
+# Not anonymously (no grant names anyone), and a host that is no access
+# point's.
+import urllib.error, urllib.request
+def anonymous(host, path):
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Host": f"{host}:{port}"})
+    try:
+        urllib.request.urlopen(request)
+        raise SystemExit(f"served: {host}{path}")
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
+status, body = anonymous("s3.test", f"/{alias}/k")
+assert status == 403 and "<Code>AccessDenied</Code>" in body, (status, body)
+status, body = anonymous("x-12.s3-accesspoint.us-east-1.s3.test", "/k")
+assert status == 404 and "<Code>NoSuchAccessPoint</Code>" in body, (status, body)
+# More of what acts on objects: a copy, and a multiple delete.
+s3.copy_object(Bucket=alias, Key="copied", CopySource={"Bucket": "data", "Key": "k"})
+assert s3.get_object(Bucket="data", Key="copied")["Body"].read() == b"kept"
+deleted = s3.delete_objects(Bucket=alias, Delete={"Objects": [{"Key": "copied"}]})
+assert [d["Key"] for d in deleted["Deleted"]] == ["copied"], deleted
+refused(lambda: s3.head_object(Bucket="data", Key="copied"), "404")
+# Not a bucket's configuration other than those listed.
+refused(lambda: s3.get_bucket_versioning(Bucket=alias), "InvalidRequest")
+refused(lambda: s3.get_bucket_tagging(Bucket=alias), "InvalidRequest")
 # Its access point is its own: the bucket owner's root through another's
 # access point needs that access point's grant.
 refused(lambda: s3.get_object(Bucket=their_alias, Key="k"), "AccessDenied")

@@ -191,6 +191,14 @@ pub fn validate_bucket_name(name: &str) -> Result<(), BucketError> {
             return Err(BucketError::InvalidName("uses a reserved suffix"));
         }
     }
+    // Not AWS's rule: here access point hosts share the buckets' domains
+    // (`<name>-<account>.s3-accesspoint.<region>.<domain>`), so a bucket's
+    // virtual host must not be one.
+    if name.contains(".s3-accesspoint.") {
+        return Err(BucketError::InvalidName(
+            "must not contain \".s3-accesspoint.\"",
+        ));
+    }
     Ok(())
 }
 
@@ -550,6 +558,7 @@ mod tests {
             "192.168.5.4",
             "xn--bucket",
             "bucket-s3alias",
+            "reader-111111111111.s3-accesspoint.us-east-1",
         ] {
             assert!(validate_bucket_name(bad).is_err(), "{bad}");
         }

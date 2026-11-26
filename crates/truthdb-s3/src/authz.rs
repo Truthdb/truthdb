@@ -720,7 +720,8 @@ impl Authz {
     ///   an object), weighed as a resource of the access point's account;
     /// - the bucket's side: its policy on the bucket's ARN (a grant to an
     ///   account counting only as that account's policies allow the
-    ///   access point's request), or its owner's root.
+    ///   access point's request), or its owner's root when the policy does
+    ///   not deny it.
     ///
     /// Both see `s3:DataAccessPointArn`, `s3:DataAccessPointAccount` and
     /// `s3:AccessPointNetworkOrigin`; RestrictPublicBuckets of the access
@@ -774,9 +775,6 @@ impl Authz {
             &context,
         )?;
         // The bucket's side.
-        if matches!(&self.identity, Identity::Root { account } if Some(account.as_str()) == owner) {
-            return Ok(());
-        }
         if restrict && grant.policy_public && self.identity.account() != owner {
             return Err(denied());
         }
@@ -812,6 +810,11 @@ impl Authz {
             identity_allows,
         ) {
             Decision::Allow => Ok(()),
+            Decision::ExplicitDeny => Err(denied()),
+            // Its owner's root, unless the policy denies it.
+            _ if matches!(&self.identity, Identity::Root { account } if Some(account.as_str()) == owner) => {
+                Ok(())
+            }
             _ => Err(denied()),
         }
     }

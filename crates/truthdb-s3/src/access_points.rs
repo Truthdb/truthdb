@@ -702,8 +702,9 @@ impl Via {
 
 /// How a request names an access point.
 enum Named {
-    /// By its host: its account and name.
-    Host(String, String),
+    /// By its host: the virtual host label, and its account and name
+    /// (none when the label is not a well-formed one).
+    Host(String, Option<(String, String)>),
     /// By its alias, in place of a bucket's name.
     Alias(String),
 }
@@ -715,7 +716,8 @@ enum Named {
 /// form under a custom endpoint): a bucket may have that name, and either
 /// reading would let one party take the other's requests. An access point
 /// whose bucket is gone, or is another account's than when it was made, is
-/// not one to act through.
+/// not one to act through. A bucket named as an access point's host (made
+/// before such names were refused) keeps its requests.
 pub(crate) async fn resolve<B>(
     state: &S3State,
     request: &mut Request<B>,
@@ -731,15 +733,15 @@ pub(crate) async fn resolve<B>(
         .and_then(|label| label.strip_suffix(&suffix))
     {
         Some(named) => {
-            let (name, account) = named
+            let parts = named
                 .rsplit_once('-')
                 .filter(|(name, account)| {
                     valid_name(name)
                         && account.len() == 12
                         && account.bytes().all(|byte| byte.is_ascii_digit())
                 })
-                .ok_or_else(no_such_access_point)?;
-            Named::Host(account.to_string(), name.to_string())
+                .map(|(name, account)| (account.to_string(), name.to_string()));
+            Named::Host(label.clone().unwrap_or_default(), parts)
         }
         None => {
             let bucket = match label {
@@ -769,7 +771,11 @@ pub(crate) async fn resolve<B>(
         scope,
         crate::scope::object(state, move |file| {
             let point = match &named {
-                Named::Host(account, name) => file.access_point(account, name)?,
+                Named::Host(label, _) if file.bucket(label)?.is_some() => {
+                    return Ok(Some(None));
+                }
+                Named::Host(_, Some((account, name))) => file.access_point(account, name)?,
+                Named::Host(_, None) => None,
                 Named::Alias(alias) => file.access_point_by_alias(alias)?,
             };
             let Some(point) = point else {
@@ -777,11 +783,15 @@ pub(crate) async fn resolve<B>(
             };
             let policy = file.access_point_policy(&point.account, &point.name)?;
             let owner = file.bucket(&point.bucket)?.map(|info| info.owner);
-            Ok(Some((point, policy, owner)))
+            Ok(Some(Some((point, policy, owner))))
         }),
     )
     .await?;
-    let Some((point, policy, owner)) = found else {
+    let Some((point, policy, owner)) = (match found {
+        Some(None) => return Ok(()),
+        Some(Some(found)) => Some(found),
+        None => None,
+    }) else {
         return Err(if alias {
             S3Error::new(404, "NoSuchBucket", "The specified bucket does not exist")
         } else {
