@@ -74,6 +74,14 @@ impl Who {
 }
 
 /// What a management request's event says that the request itself tells.
+/// An S3 Control access point call, as [`Call::control`] records it.
+#[derive(Debug, Clone)]
+struct ControlCall {
+    account: String,
+    access_point: Option<String>,
+    parameters: Vec<(&'static str, String)>,
+}
+
 pub(crate) struct Call {
     name: &'static str,
     read_only: bool,
@@ -90,6 +98,10 @@ pub(crate) struct Call {
     /// `s3express.amazonaws.com` and its resources S3 Express's, as AWS
     /// records a directory bucket's events.
     express: bool,
+    /// An S3 Control access point call's account, as its header names it
+    /// (a refused call's may be another's), and its access point (its
+    /// name; none: ListAccessPoints) and query parameters.
+    control: Option<ControlCall>,
     host: Option<String>,
     user_agent: Option<String>,
     source_ip: Option<String>,
@@ -120,6 +132,58 @@ impl Call {
                 _ => return None,
             };
             (name, None)
+        } else if crate::api::control_route(request) == Some(crate::api::ControlRoute::AccessPoints)
+        {
+            let rest = request
+                .uri()
+                .path()
+                .strip_prefix("/v20180820/accesspoint")
+                .unwrap_or("");
+            let segments: Vec<&str> = rest.split('/').skip(1).collect();
+            let point = segments.first().map(|name| {
+                percent_encoding::percent_decode_str(name)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            });
+            let name = match (method, segments.as_slice()) {
+                (&Method::GET, []) => "ListAccessPoints",
+                (&Method::PUT, [_]) => "CreateAccessPoint",
+                (&Method::GET, [_]) => "GetAccessPoint",
+                (&Method::DELETE, [_]) => "DeleteAccessPoint",
+                (&Method::PUT, [_, "policy"]) => "PutAccessPointPolicy",
+                (&Method::GET, [_, "policy"]) => "GetAccessPointPolicy",
+                (&Method::DELETE, [_, "policy"]) => "DeleteAccessPointPolicy",
+                (&Method::GET, [_, "policyStatus"]) => "GetAccessPointPolicyStatus",
+                _ => return None,
+            };
+            let mut call = Call::build(request, name, None, None, false);
+            let query = request.uri().query().unwrap_or("");
+            call.control = Some(ControlCall {
+                account: request
+                    .headers()
+                    .get("x-amz-account-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string(),
+                access_point: point,
+                parameters: ["bucket", "maxResults", "nextToken"]
+                    .into_iter()
+                    .filter_map(|name| {
+                        query.split('&').find_map(|pair| {
+                            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                            (key == name).then(|| {
+                                (
+                                    name,
+                                    percent_encoding::percent_decode_str(value)
+                                        .decode_utf8_lossy()
+                                        .into_owned(),
+                                )
+                            })
+                        })
+                    })
+                    .collect(),
+            });
+            return Some(call);
         } else if crate::api::control_route(request).is_some() {
             return None;
         } else {
@@ -198,6 +262,7 @@ impl Call {
             sub: subresource(request),
             source: None,
             express,
+            control: None,
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
@@ -456,6 +521,15 @@ fn record(
     if let Some(sub) = call.sub {
         parameters[sub] = json!("");
     }
+    if let Some(control) = &call.control {
+        parameters["x-amz-account-id"] = json!(truncated(&printable(&control.account), 64));
+        if let Some(point) = &control.access_point {
+            parameters["name"] = json!(truncated(&printable(point), 255));
+        }
+        for (name, value) in &control.parameters {
+            parameters[*name] = json!(truncated(&printable(value), 1024));
+        }
+    }
     let mut record = json!({
         "eventVersion": "1.11",
         "userIdentity": identity,
@@ -544,6 +618,22 @@ fn record(
             }
             record["resources"] = json!(resources);
         }
+    }
+    // An access point's, by its ARN in the account the request named (a
+    // refused call's may be another's than the caller's).
+    if let Some(control) = &call.control
+        && let Some(point) = &control.access_point
+    {
+        let named = truncated(&printable(&control.account), 64).to_string();
+        record["resources"] = json!([{
+            "accountId": named,
+            "type": "AWS::S3::AccessPoint",
+            "ARN": format!(
+                "arn:aws:s3:{}:{named}:accesspoint/{}",
+                state.region,
+                truncated(&printable(point), 255)
+            ),
+        }]);
     }
     if let Some((code, message)) = error {
         record["errorCode"] = json!(code);

@@ -11,6 +11,7 @@
 //! here runs one transaction start to finish inside one lock hold (see
 //! `RelCtx::allocate_extent_in_txn`).
 
+mod access_points;
 mod accounts;
 mod activity;
 mod append;
@@ -56,6 +57,7 @@ use truthdb_core::storage::{
 };
 use truthdb_core::wal::records::RelRecord;
 
+pub use access_points::{AccessPoint, SetPolicy};
 pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_account_id};
 pub use activity::{ACTIVITY_KEEP_MS, ActivityEvent, MAX_ACTIVITY_RECORD};
 pub use append::{AppendError, MAX_APPEND_PARTS};
@@ -246,6 +248,9 @@ const WAREHOUSE_PURGES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 55;
 /// table bucket's or table's maintenance configuration (record 1) or job
 /// status (record 2), JSON (see `tables`).
 const TABLE_MAINTENANCE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 56;
+/// (P, account, 0, name) -> an access point; (A, alias) -> (account, 0,
+/// name); (Q, account, 0, name) -> its policy (see `access_points`).
+const ACCESS_POINTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 57;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -370,7 +375,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 57;
+const TREE_COUNT: usize = 58;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.

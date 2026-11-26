@@ -86,6 +86,8 @@ pub enum Resource<'a> {
     Service,
     Bucket(&'a str),
     Object(&'a str, &'a str),
+    /// A resource by its ARN, of no bucket (an access point's).
+    Arn(&'a str),
 }
 
 fn corrupt_policy(what: &str, err: truthdb_iam::MalformedPolicy) -> StorageError {
@@ -484,6 +486,7 @@ impl Authz {
             Resource::Service => ("arn:aws:s3:::*".to_string(), None),
             Resource::Bucket(bucket) => (format!("arn:aws:s3:::{bucket}"), Some(bucket)),
             Resource::Object(bucket, key) => (format!("arn:aws:s3:::{bucket}/{key}"), Some(bucket)),
+            Resource::Arn(arn) => (arn.to_string(), None),
         };
         // A session's bucket is the very one it was made for (its name,
         // owner and creation): one of its name made since is refused it

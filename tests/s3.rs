@@ -20189,3 +20189,190 @@ failed = ran("old", since, "Failed")
 assert "format version 2" in failed["failureMessage"], failed
 print("ok")
 "#;
+
+#[test]
+fn access_points_are_made_listed_and_given_policies_through_s3_control() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "pointing");
+    let (other, other_key, other_secret) = account_with_key(&server, "owning");
+    let (nobody_key, nobody_secret) = user_with_key(&server, &account, "nobody", None);
+    let script = server.dir.join("access_points.py");
+    std::fs::write(&script, ACCESS_POINTS_SCRIPT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other,
+            &other_key,
+            &other_secret,
+            &nobody_key,
+            &nobody_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const ACCESS_POINTS_SCRIPT: &str = r#"
+import datetime, json, re, socket, sys
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other, other_key, other_secret, nobody_key, nobody_secret = sys.argv[1:10]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service, access, secret_key):
+    return boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3, control = client("s3", key, secret), client("s3control", key, secret)
+their_s3 = client("s3", other_key, other_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+s3.create_bucket(Bucket="points")
+s3.create_bucket(Bucket="others")
+made = control.create_access_point(AccountId=account, Name="reader", Bucket="points")
+assert made["AccessPointArn"] == f"arn:aws:s3:us-east-1:{account}:accesspoint/reader", made
+assert re.fullmatch(r"reader-[a-z0-9]{34}-s3alias", made["Alias"]), made
+got = control.get_access_point(AccountId=account, Name="reader")
+assert got["Name"] == "reader" and got["Bucket"] == "points" and got["NetworkOrigin"] == "Internet", got
+assert got["Alias"] == made["Alias"] and got["AccessPointArn"] == made["AccessPointArn"], got
+assert got["BucketAccountId"] == account, got
+# Block Public Access: all on unless set.
+assert got["PublicAccessBlockConfiguration"] == {"BlockPublicAcls": True, "IgnorePublicAcls": True,
+    "BlockPublicPolicy": True, "RestrictPublicBuckets": True}, got
+assert isinstance(got["CreationDate"], datetime.datetime), got
+assert got["Endpoints"] == {"ipv4": "s3-accesspoint.us-east-1.s3.test"}, got
+# One of a name per account; names as AWS has them; a bucket that is.
+refused(lambda: control.create_access_point(AccountId=account, Name="reader", Bucket="others"),
+    "AccessPointAlreadyOwnedByYou")
+for bad in ["Bad-Name", "bad_name", "ends-", "-starts", "ends-s3alias", "a" * 51]:
+    refused(lambda: control.create_access_point(AccountId=account, Name=bad, Bucket="points"), "InvalidRequest")
+refused(lambda: control.create_access_point(AccountId=account, Name="nowhere", Bucket="missing"), "NoSuchBucket")
+# A general purpose bucket's: not a directory bucket's (not built), nor a
+# table's storage (S3 Tables' only).
+s3x = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret, config=botocore.config.Config(
+    retries={"max_attempts": 1}, s3={"addressing_style": "path", "disable_s3_express_session_auth": True}))
+s3x.create_bucket(Bucket="fast--use1-az4--x-s3", CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+refused(lambda: control.create_access_point(AccountId=account, Name="fast", Bucket="fast--use1-az4--x-s3"),
+    "NotImplemented")
+tables = client("s3tables", key, secret)
+lake = tables.create_table_bucket(name="lake")["arn"]
+tables.create_namespace(tableBucketARN=lake, namespace=["sales"])
+table_storage = tables.create_table(tableBucketARN=lake, namespace="sales", name="orders",
+    format="ICEBERG")["tableARN"]
+store = tables.get_table(tableBucketARN=lake, namespace="sales", name="orders")["warehouseLocation"].removeprefix("s3://")
+refused(lambda: control.create_access_point(AccountId=account, Name="store", Bucket=store), "NoSuchBucket")
+assert len(control.list_access_points(AccountId=account, MaxResults=0)["AccessPointList"]) == 1
+# Not built: refused, not ignored.
+refused(lambda: control.create_access_point(AccountId=account, Name="private", Bucket="points",
+    VpcConfiguration={"VpcId": "vpc-1"}), "NotImplemented")
+control.create_access_point(AccountId=account, Name="open", Bucket="others",
+    PublicAccessBlockConfiguration={"BlockPublicAcls": True, "IgnorePublicAcls": True,
+    "BlockPublicPolicy": False, "RestrictPublicBuckets": False})
+assert control.get_access_point(AccountId=account, Name="open")["PublicAccessBlockConfiguration"][
+    "BlockPublicPolicy"] is False
+# Another account's bucket: named with its owner, which it must be.
+their_s3.create_bucket(Bucket="theirs")
+refused(lambda: control.create_access_point(AccountId=account, Name="theirs", Bucket="theirs"), "InvalidRequest")
+refused(lambda: control.create_access_point(AccountId=account, Name="theirs", Bucket="theirs",
+    BucketAccountId=account), "InvalidRequest")
+control.create_access_point(AccountId=account, Name="theirs", Bucket="theirs", BucketAccountId=other)
+assert control.get_access_point(AccountId=account, Name="theirs")["BucketAccountId"] == other
+# Listed by name, a page at a time, by bucket.
+names = lambda listed: [point["Name"] for point in listed["AccessPointList"]]
+listed = control.list_access_points(AccountId=account)
+assert names(listed) == ["open", "reader", "theirs"] and "NextToken" not in listed, listed
+first = control.list_access_points(AccountId=account, MaxResults=2)
+assert names(first) == ["open", "reader"], first
+rest = control.list_access_points(AccountId=account, MaxResults=2, NextToken=first["NextToken"])
+assert names(rest) == ["theirs"] and "NextToken" not in rest, rest
+assert names(control.list_access_points(AccountId=account, Bucket="points")) == ["reader"]
+entry = control.list_access_points(AccountId=account, Bucket="points")["AccessPointList"][0]
+assert entry["Alias"] == made["Alias"] and entry["NetworkOrigin"] == "Internet", entry
+# Policies: put, read, its status; a public one only where not blocked.
+private_policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+    "Principal": {"AWS": f"arn:aws:iam::{account}:root"}, "Action": "s3:GetObject",
+    "Resource": f"arn:aws:s3:us-east-1:{account}:accesspoint/reader/object/*"}]})
+public_policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+    "Principal": "*", "Action": "s3:GetObject",
+    "Resource": f"arn:aws:s3:us-east-1:{account}:accesspoint/open/object/*"}]})
+refused(lambda: control.get_access_point_policy(AccountId=account, Name="reader"), "NoSuchAccessPointPolicy")
+assert control.get_access_point_policy_status(AccountId=account, Name="reader")["PolicyStatus"]["IsPublic"] is False
+control.put_access_point_policy(AccountId=account, Name="reader", Policy=private_policy)
+assert json.loads(control.get_access_point_policy(AccountId=account, Name="reader")["Policy"]) == json.loads(private_policy)
+refused(lambda: control.put_access_point_policy(AccountId=account, Name="reader", Policy=public_policy), "AccessDenied")
+control.put_access_point_policy(AccountId=account, Name="open", Policy=public_policy)
+assert control.get_access_point_policy_status(AccountId=account, Name="open")["PolicyStatus"]["IsPublic"] is True
+refused(lambda: control.put_access_point_policy(AccountId=account, Name="reader", Policy="{"), "MalformedPolicy")
+control.delete_access_point_policy(AccountId=account, Name="reader")
+refused(lambda: control.get_access_point_policy(AccountId=account, Name="reader"), "NoSuchAccessPointPolicy")
+# Its account's own: another account's header, a user without the grant.
+refused(lambda: control.get_access_point(AccountId=other, Name="reader"), "AccessDenied")
+nobody = client("s3control", nobody_key, nobody_secret)
+refused(lambda: nobody.get_access_point(AccountId=account, Name="reader"), "AccessDenied")
+refused(lambda: nobody.list_access_points(AccountId=account), "AccessDenied")
+# CloudTrail records each call's access point: its name, account and ARN.
+import time
+trail = client("cloudtrail", key, secret)
+for _ in range(60):
+    events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
+        "AttributeValue": "PutAccessPointPolicy"}])["Events"]
+    if events:
+        break
+    time.sleep(0.5)
+assert events, events
+put = json.loads(events[0]["CloudTrailEvent"])
+assert put["requestParameters"]["name"] in ("reader", "open"), put
+assert put["requestParameters"]["x-amz-account-id"] == account, put
+assert put["resources"] == [{"accountId": account, "type": "AWS::S3::AccessPoint",
+    "ARN": f"arn:aws:s3:us-east-1:{account}:accesspoint/{put['requestParameters']['name']}"}], put
+# A refused call on another account's: recorded as the account it named.
+for _ in range(60):
+    denied = [json.loads(event["CloudTrailEvent"]) for event in trail.lookup_events(LookupAttributes=[
+        {"AttributeKey": "EventName", "AttributeValue": "GetAccessPoint"}])["Events"]]
+    denied = [event for event in denied if event.get("errorCode") == "AccessDenied"
+        and event["requestParameters"]["x-amz-account-id"] == other]
+    if denied:
+        break
+    time.sleep(0.5)
+assert denied and denied[0]["resources"][0]["ARN"] == f"arn:aws:s3:us-east-1:{other}:accesspoint/reader", denied
+for _ in range(60):
+    lists = [json.loads(event["CloudTrailEvent"]) for event in trail.lookup_events(LookupAttributes=[
+        {"AttributeKey": "EventName", "AttributeValue": "ListAccessPoints"}])["Events"]]
+    lists = [event for event in lists if event["requestParameters"].get("bucket") == "points"]
+    if lists:
+        break
+    time.sleep(0.5)
+assert lists and lists[0]["requestParameters"]["x-amz-account-id"] == account, lists
+# Gone with its policy; then it does not exist.
+control.delete_access_point(AccountId=account, Name="open")
+refused(lambda: control.get_access_point(AccountId=account, Name="open"), "NoSuchAccessPoint")
+refused(lambda: control.get_access_point_policy(AccountId=account, Name="open"), "NoSuchAccessPoint")
+refused(lambda: control.delete_access_point(AccountId=account, Name="open"), "NoSuchAccessPoint")
+control.create_access_point(AccountId=account, Name="open", Bucket="others")
+refused(lambda: control.get_access_point_policy(AccountId=account, Name="open"), "NoSuchAccessPointPolicy")
+# Another S3 Control path: refused, not taken for a bucket's.
+refused(lambda: control.list_storage_lens_configurations(AccountId=account), "NotImplemented")
+print("ok")
+"#;
