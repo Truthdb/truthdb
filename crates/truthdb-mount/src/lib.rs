@@ -949,6 +949,11 @@ impl Filesystem for Mount {
         if state.writing(&node.path).is_some() {
             return reply.error(Errno::EPERM);
         }
+        // Its size as it is now (settled, it may just have been put empty).
+        let size = match state.nodes.get(&ino.0).map(|node| &node.kind) {
+            Some(Kind::File { size, .. }) => *size,
+            _ => size,
+        };
         let fh = state.handle();
         state.readers.insert(
             fh,
