@@ -20589,7 +20589,8 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
     let tagless = format!(
         r#"{{"Version": "2012-10-17", "Statement": [
         {{"Effect": "Allow", "Action": "s3-object-lambda:*", "Resource": "{point}"}},
-        {{"Effect": "Deny", "Action": ["s3-object-lambda:PutObjectTagging", "s3-object-lambda:DeleteObjectVersion"], "Resource": "{point}"}},
+        {{"Effect": "Deny", "Action": "s3-object-lambda:PutObjectTagging", "Resource": "{point}", "Condition": {{"Null": {{"aws:CalledVia": "true"}}}}}},
+        {{"Effect": "Deny", "Action": "s3-object-lambda:DeleteObjectVersion", "Resource": "{point}"}},
         {{"Effect": "Allow", "Action": "s3:*", "Resource": ["{supporting}", "{supporting}/object/*"], "Condition": {called_via}}}]}}"#
     );
     let users: Vec<(String, String)> = [

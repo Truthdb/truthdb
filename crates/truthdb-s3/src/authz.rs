@@ -803,12 +803,18 @@ impl Authz {
             && crate::object_lambda_run::LAMBDA_ACTIONS.contains(&name)
         {
             let policies: Vec<&Policy> = gate.policy.iter().collect();
+            // As the caller's own request to it, which is made through no
+            // other service (only Object Lambda's to S3 is).
+            let mut direct = context.clone();
+            for (key, _) in crate::object_lambda_run::called_via_keys() {
+                direct.remove(key);
+            }
             self.decide_all(
                 &format!("s3-object-lambda:{name}"),
                 &gate.arn,
                 Some(&gate.account),
                 &policies,
-                context,
+                &direct,
             )?;
         }
         let point_arn = via.arn(region);
