@@ -22725,6 +22725,9 @@ fn a_bucket_mounts_as_a_read_only_file_system_with_mountpoints_semantics() {
         file_mode: 0o644,
         dir_mode: 0o755,
         allow_other: false,
+        read_only: true,
+        allow_delete: false,
+        allow_overwrite: false,
     };
     let session = truthdb_mount::spawn(new_client(), options.clone(), &dir).expect("mount");
     let names = |path: &std::path::Path| {
@@ -22872,4 +22875,302 @@ fn process_ids() -> (u32, u32) {
             .expect("an id")
     };
     (field("Uid:"), field("Gid:"))
+}
+
+#[test]
+fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
+    let fuse = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse");
+    let fusermount = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join("fusermount3").exists())
+    });
+    if fuse.is_err() || !fusermount {
+        eprintln!("skipped: no /dev/fuse or fusermount3");
+        return;
+    }
+    let server = start_server();
+    let (_, key, secret) = account_with_key(&server, "writes");
+    let new_client = || {
+        truthdb_s3client::Client::new(truthdb_s3client::Config {
+            endpoint: format!("http://127.0.0.1:{}", server.s3_port),
+            region: "us-east-1".into(),
+            access_key: key.clone(),
+            secret: secret.clone(),
+            ca_pem: None,
+        })
+        .expect("client")
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let client = new_client();
+    runtime.block_on(async {
+        client.create_bucket("written").await.expect("bucket");
+        for (name, body) in [("old.txt", b"old\n".to_vec()), ("remote/x", b"x".to_vec())] {
+            client
+                .put_object("written", name, &[], body.into())
+                .await
+                .expect("put");
+        }
+    });
+    let read = |key: &str| {
+        runtime.block_on(async {
+            let mut download = match client.get_object("written", key).await {
+                Ok(download) => download,
+                Err(err) => return Err(err.to_string()),
+            };
+            let mut out = Vec::new();
+            while let Some(chunk) = download.next_chunk().await.map_err(|err| err.to_string())? {
+                out.extend_from_slice(&chunk);
+            }
+            Ok(out)
+        })
+    };
+    let dir = server.dir.join("mnt");
+    std::fs::create_dir_all(&dir).expect("mount point");
+    let (uid, gid) = process_ids();
+    let options = truthdb_mount::Options {
+        bucket: "written".into(),
+        prefix: String::new(),
+        uid,
+        gid,
+        file_mode: 0o644,
+        dir_mode: 0o755,
+        allow_other: false,
+        read_only: false,
+        allow_delete: false,
+        allow_overwrite: false,
+    };
+    let errno = |err: std::io::Error| err.raw_os_error();
+    let session = truthdb_mount::spawn(new_client(), options.clone(), &dir).expect("mount");
+    // New files: in the bucket once closed; one of several parts too.
+    std::fs::write(dir.join("new.txt"), b"new\n").unwrap();
+    assert_eq!(read("new.txt").unwrap(), b"new\n");
+    let big: Vec<u8> = (0..20 * 1024 * 1024u32).map(|n| (n % 253) as u8).collect();
+    std::fs::write(dir.join("big.bin"), &big).unwrap();
+    assert!(read("big.bin").unwrap() == big);
+    assert_eq!(
+        std::fs::metadata(dir.join("big.bin")).unwrap().len(),
+        big.len() as u64
+    );
+    // Written in order only; not read while written; nothing after a sync.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        let mut file = std::fs::File::create(dir.join("ordered.txt")).unwrap();
+        file.write_all(b"fir").unwrap();
+        // A child closes what it inherited of the file (exec closes it): that
+        // close is not the file's, which is written on.
+        assert!(Command::new("true").status().unwrap().success());
+        file.write_all(b"st").unwrap();
+        assert_eq!(
+            errno(file.write_at(b"later", 100).unwrap_err()),
+            Some(libc_errno::EINVAL)
+        );
+        assert_eq!(
+            errno(std::fs::File::open(dir.join("ordered.txt")).unwrap_err()),
+            Some(libc_errno::EPERM)
+        );
+        // Nor is its mode changed while written.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            errno(
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .unwrap_err()
+            ),
+            Some(libc_errno::EPERM)
+        );
+        file.sync_all().unwrap();
+        assert_eq!(read("ordered.txt").unwrap(), b"first");
+        assert!(file.write_all(b"more").is_err());
+    }
+    // Closed by another thread of the process than the one that opened it:
+    // in the bucket once the close returns.
+    {
+        use std::io::Write;
+        let path = dir.join("threads.txt");
+        let file = std::thread::spawn(move || {
+            let mut file = std::fs::File::create(path).unwrap();
+            file.write_all(b"threads").unwrap();
+            file
+        })
+        .join()
+        .unwrap();
+        drop(file);
+        assert_eq!(read("threads.txt").unwrap(), b"threads");
+    }
+    // A shell's `>`, `dd` and `touch`: written through a duplicate of the
+    // descriptor (the first closed before anything is written), or closed
+    // then given times by path.
+    let local = server.dir.join("ten.bin");
+    std::fs::write(&local, &big[..10 * 1024 * 1024]).unwrap();
+    let shell = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "echo hi > shell.txt && dd if={} of=dd.bin bs=1M status=none && touch touched",
+            local.display()
+        ))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    assert_eq!(read("shell.txt").unwrap(), b"hi\n");
+    assert!(read("dd.bin").unwrap() == big[..10 * 1024 * 1024]);
+    assert_eq!(read("touched").unwrap(), b"");
+    // Not replaced, nor deleted, unless allowed; not renamed; no chmod.
+    assert_eq!(
+        errno(std::fs::write(dir.join("old.txt"), b"x").unwrap_err()),
+        Some(libc_errno::EPERM)
+    );
+    assert_eq!(
+        errno(std::fs::remove_file(dir.join("old.txt")).unwrap_err()),
+        Some(libc_errno::EPERM)
+    );
+    assert_eq!(
+        errno(std::fs::rename(dir.join("old.txt"), dir.join("moved.txt")).unwrap_err()),
+        Some(libc_errno::ENOTSUP)
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        errno(
+            std::fs::set_permissions(dir.join("old.txt"), std::fs::Permissions::from_mode(0o600))
+                .unwrap_err()
+        ),
+        Some(libc_errno::EPERM)
+    );
+    assert_eq!(read("old.txt").unwrap(), b"old\n");
+    // A directory made: here only, until a file is written in it.
+    std::fs::create_dir(dir.join("made")).unwrap();
+    assert!(dir.join("made").is_dir());
+    std::fs::remove_dir(dir.join("made")).unwrap();
+    assert!(!dir.join("made").exists());
+    std::fs::create_dir(dir.join("kept")).unwrap();
+    std::fs::write(dir.join("kept/inside.txt"), b"in\n").unwrap();
+    assert_eq!(read("kept/inside.txt").unwrap(), b"in\n");
+    assert_eq!(
+        errno(std::fs::remove_dir(dir.join("kept")).unwrap_err()),
+        Some(libc_errno::ENOTEMPTY)
+    );
+    // A directory of the bucket's (not made here) is not removed.
+    assert_eq!(
+        errno(std::fs::remove_dir(dir.join("remote")).unwrap_err()),
+        Some(libc_errno::EPERM)
+    );
+    drop(session);
+    // Allowed: replaced (truncated), and deleted.
+    let session = truthdb_mount::spawn(
+        new_client(),
+        truthdb_mount::Options {
+            allow_delete: true,
+            allow_overwrite: true,
+            ..options.clone()
+        },
+        &dir,
+    )
+    .expect("mount");
+    std::fs::write(dir.join("old.txt"), b"replaced\n").unwrap();
+    assert_eq!(read("old.txt").unwrap(), b"replaced\n");
+    // An empty file just closed (its upload ended by its release, later):
+    // opened again at once, read, replaced or deleted.
+    let shell = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "for n in 1 2 3 4 5 6 7 8 9 10; do \
+               touch t$n && cat t$n && : > e$n && cat e$n && \
+               touch w$n && echo hi > w$n && touch r$n && rm r$n || exit 1; \
+             done",
+        )
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    for n in 1..=10 {
+        assert_eq!(read(&format!("t{n}")).unwrap(), b"");
+        assert_eq!(read(&format!("w{n}")).unwrap(), b"hi\n");
+        assert!(read(&format!("r{n}")).is_err());
+    }
+    // Replaced and deleted at once: one or the other, never both.
+    for round in 0..50 {
+        let name = format!("raced-{round}");
+        std::fs::write(dir.join(&name), b"before").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (writing, deleting) = (dir.join(&name), dir.join(&name));
+        let wrote = {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&writing)
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, b"after"))
+                    .map_err(|err| err.raw_os_error())
+            })
+        };
+        let deleted = std::thread::spawn(move || {
+            barrier.wait();
+            std::fs::remove_file(&deleting).map_err(|err| err.raw_os_error())
+        });
+        let (wrote, deleted) = (wrote.join().unwrap(), deleted.join().unwrap());
+        assert!(!(wrote.is_ok() && deleted.is_ok()), "{wrote:?} {deleted:?}");
+        let stored = read(&name).ok();
+        match (&wrote, &deleted) {
+            (Ok(()), _) => assert_eq!(stored.as_deref(), Some(&b"after"[..])),
+            (_, Ok(())) => assert_eq!(stored, None),
+            _ => panic!("neither: {wrote:?} {deleted:?}"),
+        }
+    }
+    // Two opens to replace it at once: one has it, the other is refused.
+    for _ in 0..50 {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let opens: Vec<_> = (0..2)
+            .map(|_| {
+                let (barrier, path) = (barrier.clone(), dir.join("old.txt"));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let opened = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(&path);
+                    // Held until both have tried; written, so that its close
+                    // ends it (one of nothing ends at its release, later).
+                    std::thread::sleep(Duration::from_millis(20));
+                    opened
+                        .and_then(|mut file| std::io::Write::write_all(&mut file, b"x"))
+                        .map_err(|err| err.raw_os_error())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|open| open.join().unwrap())
+            .collect();
+        let refused = opens
+            .iter()
+            .filter(|open| **open == Err(Some(libc_errno::EPERM)))
+            .count();
+        assert!(
+            refused == 1 && opens.iter().filter(|open| open.is_ok()).count() == 1,
+            "{opens:?}"
+        );
+    }
+    std::fs::remove_file(dir.join("new.txt")).unwrap();
+    assert!(read("new.txt").is_err());
+    assert!(!dir.join("new.txt").exists());
+    drop(session);
+}
+
+/// The errno values the write test expects (Linux).
+mod libc_errno {
+    pub const EPERM: i32 = 1;
+    pub const EINVAL: i32 = 22;
+    pub const ENOTEMPTY: i32 = 39;
+    pub const ENOTSUP: i32 = 95;
 }

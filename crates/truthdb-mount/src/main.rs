@@ -1,5 +1,5 @@
 //! `truthdb-mount <bucket> <directory>`: mounts the bucket (or a prefix of
-//! it) at the directory, read-only, until it is unmounted (`fusermount3 -u
+//! it) at the directory, until it is unmounted (`fusermount3 -u
 //! <directory>`: this then ends) or this is stopped (Ctrl-C, SIGTERM: it
 //! unmounts). It runs in the foreground. The endpoint and keys are found as `truthdb-cli s3` finds
 //! them.
@@ -11,10 +11,7 @@ use clap::Parser;
 use truthdb_s3client::{Client, Config};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "truthdb-mount",
-    about = "Mount an S3 bucket as a file system (read-only)"
-)]
+#[command(name = "truthdb-mount", about = "Mount an S3 bucket as a file system")]
 struct Args {
     /// The bucket.
     bucket: String,
@@ -62,9 +59,15 @@ struct Args {
     /// Let other users than the mounting one use the mount.
     #[arg(long)]
     allow_other: bool,
-    /// Mount read-only (the mount always is, for now).
+    /// Mount read-only: nothing is written.
     #[arg(long)]
     read_only: bool,
+    /// Let files be deleted.
+    #[arg(long)]
+    allow_delete: bool,
+    /// Let existing files be replaced (opened to be truncated).
+    #[arg(long)]
+    allow_overwrite: bool,
 }
 
 fn mode(text: &str) -> Result<u16> {
@@ -123,6 +126,9 @@ fn main() -> Result<()> {
         file_mode: mode(&args.file_mode)?,
         dir_mode: mode(&args.dir_mode)?,
         allow_other: args.allow_other,
+        read_only: args.read_only,
+        allow_delete: args.allow_delete,
+        allow_overwrite: args.allow_overwrite,
     };
     // The signals are taken before the mount is made: one arriving at once
     // still unmounts it.
