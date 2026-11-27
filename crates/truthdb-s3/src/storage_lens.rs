@@ -119,8 +119,12 @@ fn boolean(text: &str) -> Result<bool, S3Error> {
     }
 }
 
-/// A bucket ARN's bucket, if `arn` is one (`arn:aws:s3:::<bucket>`).
+/// A bucket ARN's bucket, if `arn` is one (`arn:aws:s3:::<bucket>`, at
+/// most 128 characters).
 pub(crate) fn bucket_of_arn(arn: &str) -> Option<&str> {
+    if arn.len() > 128 {
+        return None;
+    }
     arn.strip_prefix("arn:aws:s3:::")
         .filter(|bucket| !bucket.is_empty() && !bucket.contains('/'))
 }
@@ -156,6 +160,7 @@ fn parse(
     let mut given_arn = None;
     let mut prefix_delimiter = None;
     let (mut has_account_level, mut has_bucket_level) = (false, false);
+    let mut seen = std::collections::HashSet::new();
     let mut tags: Vec<(String, String)> = Vec::new();
     let mut tag: Option<(Option<String>, Option<String>)> = None;
     let not_built = |what: &str| Err(S3Error::not_implemented(what.to_string()));
@@ -195,6 +200,11 @@ fn parse(
         }
         if !under.is_empty() && path.as_str() == format!("{root}/{under}") {
             continue;
+        }
+        // Each element once, but a list's members.
+        let member = path.ends_with("/Buckets/Arn") || path.ends_with("/Regions/Region");
+        if !(member || seen.insert(path.as_str())) {
+            return Err(malformed());
         }
         let Some(field) = path.strip_prefix(base.as_str()) else {
             return Err(malformed());
@@ -466,8 +476,9 @@ fn finish_tag((key, value): (Option<String>, Option<String>)) -> Result<(String,
     };
     // Letters, spaces, digits and `_.:/=+-@`.
     let allowed = |text: &str| {
-        text.chars()
-            .all(|c| c.is_alphanumeric() || c.is_whitespace() || "_.:/=+-@".contains(c))
+        text.chars().all(|c| {
+            !c.is_control() && (c.is_alphanumeric() || c.is_whitespace() || "_.:/=+-@".contains(c))
+        })
     };
     if !(1..=128).contains(&key.chars().count())
         || value.chars().count() > 256
@@ -554,8 +565,9 @@ fn render_scope(name: &str, buckets: &[String], regions: &[String]) -> String {
 }
 
 impl LensConfig {
-    /// Its elements (inside `<StorageLensConfiguration>`), with its ARN.
-    fn render(&self, arn: &str) -> String {
+    /// Its elements (inside `<StorageLensConfiguration>`), without its ARN:
+    /// that is the server's Region's when it is answered.
+    fn render(&self) -> String {
         let prefix = self
             .prefix_level
             .as_ref()
@@ -614,12 +626,11 @@ impl LensConfig {
             .map(|delimiter| format!("<PrefixDelimiter>{}</PrefixDelimiter>", escape(delimiter)))
             .unwrap_or_default();
         format!(
-            "<Id>{}</Id><AccountLevel>{}<BucketLevel>{}{prefix}</BucketLevel></AccountLevel>{scope}{export}<IsEnabled>{}</IsEnabled><StorageLensArn>{}</StorageLensArn>{delimiter}",
+            "<Id>{}</Id><AccountLevel>{}<BucketLevel>{}{prefix}</BucketLevel></AccountLevel>{scope}{export}<IsEnabled>{}</IsEnabled>{delimiter}",
             escape(&self.id),
             render_level(&self.account_level),
             render_level(&self.bucket_level),
             self.enabled,
-            escape(arn)
         )
     }
 }
@@ -785,8 +796,9 @@ pub async fn handle(
                 let document = stored(state, &account, &id)
                     .await?
                     .ok_or_else(no_such_configuration)?;
+                let arn = escape(&arn(&state.region, &account, &id));
                 Ok(xml(format!(
-                    "<StorageLensConfiguration xmlns=\"{XMLNS}\">{document}</StorageLensConfiguration>"
+                    "<StorageLensConfiguration xmlns=\"{XMLNS}\">{document}<StorageLensArn>{arn}</StorageLensArn></StorageLensConfiguration>"
                 )))
             }
             (Some(id), false, _) => {
@@ -829,7 +841,7 @@ async fn put(
     if config.id != id {
         return Err(invalid("The configuration's Id is the one its path names."));
     }
-    let document = config.render(&arn(&state.region, account, id));
+    let document = config.render();
     let (of, name) = (account.to_string(), key(account, id));
     let made = crate::scope::object(state, move |file| {
         let existing = file.bucket_config("", STORAGE_LENS, &name)?.is_some();
@@ -882,49 +894,49 @@ async fn tagging_call(
     id: &str,
     method: Method,
 ) -> Result<Response<Body>, S3Error> {
-    if stored(state, account, id).await?.is_none() {
-        return Err(no_such_configuration());
-    }
     let name = key(account, id);
-    match method {
+    // Its tags: `None` for none to put (a read or a delete).
+    let tags = match method {
         Method::PUT => {
             let body = read_body(request, auth, MAX_BODY).await?;
-            let tags = parse_tags(&body, "PutStorageLensConfigurationTaggingRequest")?;
-            crate::scope::object(state, move |file| {
-                file.transaction(|tx| {
-                    tx.put_bucket_config(
-                        "",
-                        STORAGE_LENS_TAGS,
-                        &name,
-                        render_tags(&tags).as_bytes(),
-                    )
-                })
-            })
-            .await?;
-            Ok(empty())
+            Some(parse_tags(
+                &body,
+                "PutStorageLensConfigurationTaggingRequest",
+            )?)
         }
-        Method::GET => {
-            let tags = crate::scope::object(state, move |file| {
-                file.bucket_config("", STORAGE_LENS_TAGS, &name)
-            })
-            .await?
-            .map(|document| String::from_utf8_lossy(&document).into_owned())
-            .unwrap_or_default();
-            Ok(xml(format!(
-                "<GetStorageLensConfigurationTaggingResult xmlns=\"{XMLNS}\"><Tags>{tags}</Tags></GetStorageLensConfigurationTaggingResult>"
-            )))
+        _ => None,
+    };
+    let read = method == Method::GET;
+    // The configuration is looked for in the same hold as its tags are
+    // read or changed, so a delete between them leaves no tags behind.
+    let found = crate::scope::object(state, move |file| {
+        if file.bucket_config("", STORAGE_LENS, &name)?.is_none() {
+            return Ok(None);
         }
-        _ => {
-            crate::scope::object(state, move |file| {
-                file.transaction(|tx| {
-                    tx.delete_bucket_config("", STORAGE_LENS_TAGS, &name)
-                        .map(|_| ())
-                })
-            })
-            .await?;
-            Ok(empty())
+        if read {
+            return file.bucket_config("", STORAGE_LENS_TAGS, &name).map(Some);
         }
+        file.transaction(|tx| match &tags {
+            Some(tags) => {
+                tx.put_bucket_config("", STORAGE_LENS_TAGS, &name, render_tags(tags).as_bytes())
+            }
+            None => tx
+                .delete_bucket_config("", STORAGE_LENS_TAGS, &name)
+                .map(|_| ()),
+        })?;
+        Ok(Some(None))
+    })
+    .await?
+    .ok_or_else(no_such_configuration)?;
+    if !read {
+        return Ok(empty());
     }
+    let tags = found
+        .map(|document| String::from_utf8_lossy(&document).into_owned())
+        .unwrap_or_default();
+    Ok(xml(format!(
+        "<GetStorageLensConfigurationTaggingResult xmlns=\"{XMLNS}\"><Tags>{tags}</Tags></GetStorageLensConfigurationTaggingResult>"
+    )))
 }
 
 #[cfg(test)]
@@ -971,9 +983,15 @@ mod tests {
                 .is_some_and(|export| export.sse_s3 && export.format == "CSV")
         );
         assert!(config.cloudwatch);
-        let rendered = config.render(&arn("us-east-1", "111111111111", "lens.1"));
+        let rendered = config.render();
         assert_eq!(
             read(&rendered, "us-east-1", "111111111111").unwrap(),
+            config
+        );
+        // Its ARN is not kept: it reads back in another Region.
+        assert!(!rendered.contains("StorageLensArn"));
+        assert_eq!(
+            read(&rendered, "eu-west-1", "111111111111").unwrap(),
             config
         );
     }
@@ -998,6 +1016,9 @@ mod tests {
             ("<Id>a</Id><AccountLevel><ActivityMetrics><IsEnabled>true</IsEnabled></ActivityMetrics><BucketLevel/></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "levels not consistent"),
             (format!("<Id>a</Id>{levels}<DataExport><CloudWatchMetrics/></DataExport><IsEnabled>true</IsEnabled>"), "CloudWatch without IsEnabled"),
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>//</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a long delimiter"),
+            ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><MaxDepth>3</MaxDepth><MaxDepth>7</MaxDepth></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "MaxDepth twice"),
+            ("<Id>a</Id><AccountLevel><BucketLevel><ActivityMetrics><IsEnabled>true</IsEnabled></ActivityMetrics><ActivityMetrics><IsEnabled>false</IsEnabled></ActivityMetrics></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a level's metrics twice"),
+            (format!("<Id>a</Id>{levels}<Include><Buckets><Arn>arn:aws:s3:::{}</Arn></Buckets></Include><IsEnabled>true</IsEnabled>", "x".repeat(116)), "a bucket ARN too long"),
         ] {
             let err = parsed(&inner).expect_err(why);
             assert!(err.status == 400, "{why}: {}", err.code);
@@ -1052,6 +1073,8 @@ mod tests {
             body("<Tag><Value>1</Value></Tag>"),
             body(&"<Tag><Key>k</Key><Value>v</Value></Tag>".replace("k", &"k".repeat(129))),
             body("<Tag><Key>a*</Key><Value>1</Value></Tag>"),
+            body("<Tag><Key>a\nb</Key><Value>1</Value></Tag>"),
+            body("<Tag><Key>a</Key><Value>x\ty</Value></Tag>"),
         ] {
             assert!(
                 parse_tags(bad.as_bytes(), "PutStorageLensConfigurationTaggingRequest").is_err(),
