@@ -30,6 +30,9 @@ const FILE_RECORDS: usize = 100_000;
 /// How long a body is kept unreferenced before it is taken for abandoned
 /// is an hour: one waiting longer is marked touched.
 const TOUCH_MS: u64 = 5 * 60 * 1000;
+/// The files one delivery transaction puts at most (an export of more is
+/// delivered in parts, the day recorded as exported with the last).
+const DELIVERY_FILES: usize = 100;
 /// How long a body replaced is kept for readers still on it.
 const DROP_GRACE_MS: u64 = 60_000;
 
@@ -255,14 +258,17 @@ impl Files {
                 writer.touch(storage, now).map_err(|err| err.to_string())?;
             }
             // The files written whole wait for the delivery as they are.
-            ObjFile::new(&mut storage.lock())
-                .transaction(|tx| {
-                    for (body, _, _) in &self.done {
+            let mut guard = storage.lock();
+            let mut file = ObjFile::new(&mut guard);
+            for part in self.done.chunks(DELIVERY_FILES) {
+                file.transaction(|tx| {
+                    for (body, _, _) in part {
                         tx.touch_body(body.body, now)?;
                     }
                     Ok(())
                 })
                 .map_err(|err| err.to_string())?;
+            }
             self.touched_ms = now;
         }
         Ok(())
@@ -468,48 +474,94 @@ async fn deliver(
         due.generation,
         due.day,
     );
-    let refused = object(state, move |file| {
-        deliver_in(
-            file,
-            &key,
-            &account,
-            &document,
-            generation,
-            day,
-            &destination,
-            &files,
-        )
-    })
-    .await?;
-    if let Some(problem) = refused {
-        eprintln!(
-            "storage lens: the export of {} of {date}: {problem}",
-            due.key
+    // In parts, each its own call, so that the log is checkpointed between.
+    let files = Arc::new(files);
+    let parts = files.len().div_ceil(DELIVERY_FILES);
+    for part in 0..parts {
+        let (key, account, document, destination, files) = (
+            key.clone(),
+            account.clone(),
+            document.clone(),
+            destination.clone(),
+            Arc::clone(&files),
         );
+        let range = part * DELIVERY_FILES..((part + 1) * DELIVERY_FILES).min(files.len());
+        let last = part + 1 == parts;
+        let delivered = object(state, move |file| {
+            deliver_in(
+                file,
+                &Delivery {
+                    key: &key,
+                    account: &account,
+                    document: &document,
+                    generation,
+                    day,
+                    destination: &destination,
+                },
+                &files[range],
+                last,
+            )
+        })
+        .await?;
+        match delivered {
+            Delivered::Part => {}
+            Delivered::Abandoned => return Ok(()),
+            Delivered::Refused(problem) => {
+                eprintln!(
+                    "storage lens: the export of {} of {date}: {problem}",
+                    due.key
+                );
+                return Ok(());
+            }
+        }
     }
     Ok(())
 }
 
-/// Puts the files in one transaction with the day recorded as exported; a
-/// destination refused records it alone. Nothing when the configuration
-/// is no longer as the export began.
-#[allow(clippy::too_many_arguments)]
-fn deliver_in(
-    file: &mut ObjFile<'_>,
-    key: &str,
-    account: &str,
-    document: &[u8],
+/// What a delivery is of.
+struct Delivery<'a> {
+    key: &'a str,
+    account: &'a str,
+    document: &'a [u8],
     generation: u64,
     day: u32,
-    destination: &str,
+    destination: &'a str,
+}
+
+/// How a part of a delivery went.
+#[derive(Debug, PartialEq)]
+enum Delivered {
+    /// Put (the last: with the day recorded as exported).
+    Part,
+    /// The configuration is no longer as the export began: nothing put.
+    Abandoned,
+    /// Its destination refused (or its files could not be written): the
+    /// day is recorded as exported without them.
+    Refused(String),
+}
+
+/// Puts a part of an export's files in one transaction (the last part
+/// holds the manifest, and records the day as exported).
+fn deliver_in(
+    file: &mut ObjFile<'_>,
+    delivery: &Delivery<'_>,
     files: &[(String, SealedBody, &'static str)],
-) -> Result<Option<String>, StorageError> {
+    last: bool,
+) -> Result<Delivered, StorageError> {
+    let Delivery {
+        key,
+        account,
+        document,
+        generation,
+        day,
+        destination,
+    } = *delivery;
     if file.bucket_config("", STORAGE_LENS, key)?.as_deref() != Some(document)
         || file.lens_state(key)?.is_none_or(|lens| {
             lens.generation != generation || lens.exported.is_some_and(|last| last >= day)
         })
     {
-        return Ok(None);
+        return Ok(Delivered::Abandoned);
     }
     let refused = match file.bucket(destination)? {
         None => Some("its destination bucket does not exist"),
@@ -554,12 +606,16 @@ fn deliver_in(
                             tx.set_lock(destination, name, info.version, lock)?;
                         }
                     }
+                    // A part's files are written all or none.
                     Err(_) => return Err(StorageError::InvalidConfig(UNWRITTEN.to_string())),
                 }
             }
-            tx.lens_exported(key, generation, day)
+            if last {
+                tx.lens_exported(key, generation, day)?;
+            }
+            Ok(())
         }) {
-            Ok(_) => return Ok(None),
+            Ok(()) => return Ok(Delivered::Part),
             Err(StorageError::InvalidConfig(message)) if message == UNWRITTEN => {
                 "its files could not be written"
             }
@@ -567,12 +623,102 @@ fn deliver_in(
         },
     };
     file.transaction(|tx| tx.lens_exported(key, generation, day))?;
-    Ok(Some(problem.to_string()))
+    Ok(Delivered::Refused(problem.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use truthdb_core::storage::StorageOptions;
+
+    fn create(path: &std::path::Path) -> Storage {
+        const RING: u64 = 8 * 1024 * 1024;
+        Storage::create_with_wal_bounds(
+            path.to_path_buf(),
+            StorageOptions {
+                size_bytes: 64 << 20,
+                wal_ratio: 0.05,
+                metadata_ratio: 0.08,
+                snapshot_ratio: 0.02,
+                allocator_ratio: 0.02,
+                reserved_ratio: 0.17,
+                default_collation: None,
+            },
+            RING,
+            RING,
+            truthdb_engine::database_engines,
+        )
+        .expect("create")
+    }
+
+    #[test]
+    fn an_export_of_many_files_is_delivered_within_the_log() {
+        // Two thousand files: in one transaction (or one lock hold, with no
+        // checkpoint), these tests' log overran.
+        let path = std::env::temp_dir().join(format!(
+            "truthdb-s3-lens-export-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let storage = create(&path);
+        let (account, key) = ("111111111111", "111111111111/lens");
+        let document = b"<Id>lens</Id>".to_vec();
+        {
+            let mut lock = storage.lock();
+            let mut file = ObjFile::new(&mut lock);
+            file.transaction(|tx| {
+                tx.create_bucket("reports", account, 5)?.unwrap();
+                tx.put_bucket_config("", STORAGE_LENS, key, &document)?;
+                tx.track_lens(key, 1)?;
+                tx.lens_reported(key, 1, 10).map(|_| ())
+            })
+            .unwrap();
+        }
+        let files: Vec<(String, SealedBody, &'static str)> = (0..2000)
+            .map(|index| {
+                let mut writer = BodyWriter::begin(&storage, 1).unwrap();
+                writer.write(&storage, b"x", 1).unwrap();
+                (
+                    format!("lens/{index:04}.csv"),
+                    writer.finish(&storage, 1).unwrap(),
+                    "text/csv",
+                )
+            })
+            .collect();
+        let delivery = Delivery {
+            key,
+            account,
+            document: &document,
+            generation: 1,
+            day: 10,
+            destination: "reports",
+        };
+        let parts: Vec<_> = files.chunks(DELIVERY_FILES).collect();
+        for (index, part) in parts.iter().enumerate() {
+            let last = index + 1 == parts.len();
+            let delivered = deliver_in(
+                &mut ObjFile::new(&mut storage.lock()),
+                &delivery,
+                part,
+                last,
+            )
+            .unwrap();
+            assert_eq!(delivered, Delivered::Part);
+            let exported = ObjFile::new(&mut storage.lock())
+                .lens_state(key)
+                .unwrap()
+                .unwrap()
+                .exported;
+            assert_eq!(exported, last.then_some(10));
+            // As the engine does between its calls.
+            storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        }
+        drop(storage);
+        let storage = Storage::open(path.clone(), truthdb_engine::database_engines).expect("open");
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn a_day_is_its_date_and_values_are_quoted() {
