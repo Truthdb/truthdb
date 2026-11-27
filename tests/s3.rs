@@ -22028,6 +22028,9 @@ assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigI
 control.put_storage_lens_configuration(AccountId=account, ConfigId="quiet", StorageLensConfiguration={
     "Id": "quiet", "IsEnabled": False, "AccountLevel": {"BucketLevel": {}},
     "Exclude": {"Regions": ["us-west-2"]}})
+# A scope of Regions only reads back as Put, with no Buckets.
+assert control.get_storage_lens_configuration(AccountId=account, ConfigId="quiet")["StorageLensConfiguration"][
+    "Exclude"] == {"Regions": ["us-west-2"]}
 listed = control.list_storage_lens_configurations(AccountId=account)["StorageLensConfigurationList"]
 assert listed == [
     {"Id": "main", "StorageLensArn": lens_arn, "HomeRegion": "us-east-1", "IsEnabled": True},

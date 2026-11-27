@@ -120,15 +120,29 @@ fn boolean(text: &str) -> Result<bool, S3Error> {
 }
 
 /// A bucket ARN's bucket, if `arn` is one (`arn:aws:s3:::<bucket>`, at
-/// most 128 characters, of a name a bucket may have).
+/// most 128 characters). The bucket's name is of the characters any bucket's
+/// may be (letters, digits, periods, hyphens and underscores, as legacy
+/// names are), not held to the rules a new bucket's name is: the bucket may
+/// be older than they are.
 pub(crate) fn bucket_of_arn(arn: &str) -> Option<&str> {
     if arn.len() > 128 {
         return None;
     }
     arn.strip_prefix("arn:aws:s3:::").filter(|bucket| {
-        truthdb_object::validate_bucket_name(bucket).is_ok()
-            || truthdb_object::validate_directory_bucket_name(bucket).is_ok()
+        !bucket.is_empty()
+            && bucket
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
     })
+}
+
+/// Whether `delimiter` is a prefix delimiter: at most one character, one
+/// XML can carry (no control character, nor U+FFFE or U+FFFF).
+fn valid_delimiter(delimiter: &str) -> bool {
+    delimiter.chars().count() <= 1
+        && delimiter
+            .chars()
+            .all(|c| !c.is_control() && !matches!(c, '\u{fffe}' | '\u{ffff}'))
 }
 
 /// The configuration in a document of root `root`, `under` it (empty: the
@@ -256,7 +270,7 @@ fn parse(
             }
             "StorageLensArn" => once(&mut given_arn, trimmed)?,
             "PrefixDelimiter" => {
-                if text.chars().count() > 1 || text.chars().any(char::is_control) {
+                if !valid_delimiter(text) {
                     return Err(invalid(
                         "A prefix delimiter is one character, not a control character.",
                     ));
@@ -280,7 +294,7 @@ fn parse(
             "AccountLevel/BucketLevel/PrefixLevel/StorageMetrics/SelectionCriteria" => {}
             "AccountLevel/BucketLevel/PrefixLevel/StorageMetrics/SelectionCriteria/Delimiter" => {
                 let prefix = prefix_level.as_mut().ok_or_else(malformed)?;
-                if text.chars().count() > 1 || text.chars().any(char::is_control) {
+                if !valid_delimiter(text) {
                     return Err(invalid(
                         "A prefix delimiter is one character, not a control character.",
                     ));
@@ -574,15 +588,22 @@ fn render_level(level: &Level) -> String {
 }
 
 fn render_scope(name: &str, buckets: &[String], regions: &[String]) -> String {
-    let buckets: String = buckets
-        .iter()
-        .map(|arn| format!("<Arn>{}</Arn>", escape(arn)))
-        .collect();
-    let regions: String = regions
-        .iter()
-        .map(|region| format!("<Region>{}</Region>", escape(region)))
-        .collect();
-    format!("<{name}><Buckets>{buckets}</Buckets><Regions>{regions}</Regions></{name}>")
+    let mut inner = String::new();
+    if !buckets.is_empty() {
+        let arns: String = buckets
+            .iter()
+            .map(|arn| format!("<Arn>{}</Arn>", escape(arn)))
+            .collect();
+        inner.push_str(&format!("<Buckets>{arns}</Buckets>"));
+    }
+    if !regions.is_empty() {
+        let names: String = regions
+            .iter()
+            .map(|region| format!("<Region>{}</Region>", escape(region)))
+            .collect();
+        inner.push_str(&format!("<Regions>{names}</Regions>"));
+    }
+    format!("<{name}>{inner}</{name}>")
 }
 
 impl LensConfig {
@@ -1047,6 +1068,8 @@ mod tests {
             (format!("<Id>a</Id>{levels}<DataExport><CloudWatchMetrics/></DataExport><IsEnabled>true</IsEnabled>"), "CloudWatch without IsEnabled"),
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>//</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a long delimiter"),
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>&#1;</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a control character delimiter"),
+            (format!("<Id>a</Id>{levels}<PrefixDelimiter>&#xFFFE;</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a delimiter XML has not"),
+            ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><Delimiter>&#xFFFF;</Delimiter></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a prefix delimiter XML has not"),
             ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><Delimiter>&#1;</Delimiter></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a control character prefix delimiter"),
             (format!("<Id>a</Id>{levels}<Include><Buckets><Arn>arn:aws:s3:::a&#1;b</Arn></Buckets></Include><IsEnabled>true</IsEnabled>"), "a bucket ARN of no bucket name"),
             (format!("<Id>a</Id>{levels}<Include><Buckets><Arn>arn:aws:s3:::A b</Arn></Buckets></Include><IsEnabled>true</IsEnabled>"), "a bucket ARN with a space"),
@@ -1081,6 +1104,17 @@ mod tests {
             ),
         ] {
             assert_eq!(parsed(inner).expect_err(why).status, 501, "{why}");
+        }
+        // A bucket older than today's naming rules is named in a scope.
+        for bucket in [
+            "logs.s3-accelerate",
+            "My_Legacy_Bucket",
+            "fast--use1-az4--x-s3",
+        ] {
+            let scoped = parsed(&format!(
+                "<Id>a</Id><AccountLevel><BucketLevel/></AccountLevel><Include><Buckets><Arn>arn:aws:s3:::{bucket}</Arn></Buckets></Include><IsEnabled>true</IsEnabled>"
+            ));
+            assert!(scoped.is_ok(), "{bucket}");
         }
         // Turned off, they are taken.
         assert!(parsed("<Id>a</Id><AccountLevel><DetailedStatusCodesMetrics><IsEnabled>false</IsEnabled></DetailedStatusCodesMetrics><BucketLevel/></AccountLevel><IsEnabled>true</IsEnabled>").is_ok());
