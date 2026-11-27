@@ -259,12 +259,6 @@ pub(crate) async fn serve(
     auth: &Authenticated,
     via: ViaLambda,
 ) -> Result<Option<Response<Body>>, S3Error> {
-    if auth.session.is_some() {
-        return Err(session_refused());
-    }
-    let Some(principal) = auth.principal.clone() else {
-        return Err(S3Error::access_denied("Access Denied"));
-    };
     let held = &*request;
     let action = action_of(held)?;
     let transformation = action.and_then(|action| {
@@ -288,6 +282,12 @@ pub(crate) async fn serve(
             _ => via.configuration.supporting.clone(),
         });
     counted_as(held, point, &source, crate::metering::LambdaRole::Unserved);
+    if auth.session.is_some() {
+        return Err(session_refused());
+    }
+    let Some(principal) = auth.principal.clone() else {
+        return Err(S3Error::access_denied("Access Denied"));
+    };
     let query = held.uri().query().unwrap_or("").to_string();
     let authz = Authz::load(
         state,

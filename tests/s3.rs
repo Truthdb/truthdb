@@ -21132,6 +21132,14 @@ assert account not in json.dumps(seen_by_outsider["resources"]) and "s3-object-l
     seen_by_outsider
 wait_for(lambda: total("4xxErrors", "counted", function_arn) == 1)
 assert (total("AllRequests", "counted", function_arn), total("InvokedLambda", "counted", function_arn)) == (3, 2)
+# Anonymously too: refused, and counted as such.
+try:
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/{counted}/doc")
+    raise SystemExit("served anonymously")
+except urllib.error.HTTPError as error:
+    assert error.code == 403, error
+wait_for(lambda: total("4xxErrors", "counted", function_arn) == 2)
+assert total("AllRequests", "counted", function_arn) == 4
 # The passed-on HEAD, and the function's own read: the supporting access
 # point's, on its bucket.
 headed_event = headed_events()[0]
