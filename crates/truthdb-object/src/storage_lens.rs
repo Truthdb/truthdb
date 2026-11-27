@@ -26,6 +26,49 @@ pub const LENS_KEEP_DAYS: u32 = 455;
 /// its rollback) fits the log.
 pub const LENS_BATCH: usize = 1000;
 
+/// The bytes of keys one transaction here writes or drops at most (a
+/// prefix's record holds up to a key's 1024 bytes).
+pub const LENS_BATCH_BYTES: usize = 64 * 1024;
+
+/// The ends of `records`' batches: each at most [`LENS_BATCH`] records of
+/// at most [`LENS_BATCH_BYTES`] (one record at least).
+pub fn lens_batches(records: &[LensRecord]) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let (mut count, mut bytes) = (0, 0);
+    for (at, record) in records.iter().enumerate() {
+        let size = 32
+            + record.bucket.len()
+            + record.record_value.len()
+            + record.storage_class.len()
+            + record.metric.len();
+        if count > 0 && (count == LENS_BATCH || bytes + size > LENS_BATCH_BYTES) {
+            ends.push(at);
+            (count, bytes) = (0, 0);
+        }
+        count += 1;
+        bytes += size;
+    }
+    if count > 0 {
+        ends.push(records.len());
+    }
+    ends
+}
+
+/// The rows of `rows` a batch drops: at most [`LENS_BATCH`] of at most
+/// [`LENS_BATCH_BYTES`] of keys (one at least); and whether that is fewer
+/// than all.
+fn take_batch<T>(rows: &[(Vec<u8>, T)], count: usize) -> (&[(Vec<u8>, T)], bool) {
+    let (mut taken, mut bytes) = (0, 0);
+    for (key, _) in rows.iter().take(count) {
+        if taken > 0 && bytes + key.len() > LENS_BATCH_BYTES {
+            break;
+        }
+        taken += 1;
+        bytes += key.len();
+    }
+    (&rows[..taken], taken < rows.len())
+}
+
 /// A bucket's requests of one day, in this order: all, GET, PUT, DELETE,
 /// HEAD, POST, LIST, bytes downloaded, bytes uploaded, 4xx and 5xx
 /// answers.
@@ -277,10 +320,11 @@ impl ObjTxn<'_, '_> {
             .into_iter()
             .filter(|(key, _)| key.as_slice() < &upper[..])
             .collect();
-        for (key, _) in old.iter().take(LENS_BATCH) {
+        let (batch, more) = take_batch(&old, LENS_BATCH);
+        for (key, _) in batch {
             tree.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
         }
-        Ok(old.len() > LENS_BATCH)
+        Ok(more)
     }
 
     /// Gives configuration `config` (just put) a state, of `generation`
@@ -327,14 +371,15 @@ impl ObjTxn<'_, '_> {
         let upper = generation_prefix(config, generation + 1);
         let rows = tree.scan_range_limit(self.ctx, Some(&lower), Some(&upper), LENS_BATCH + 1)?;
         let rows: Vec<_> = rows.into_iter().filter(|(key, _)| *key < upper).collect();
-        for (key, _) in rows.iter().take(LENS_BATCH) {
+        let (batch, more) = take_batch(&rows, LENS_BATCH);
+        for (key, _) in batch {
             tree.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
         }
-        Ok(rows.len() > LENS_BATCH)
+        Ok(more)
     }
 
     /// Writes records of `config`'s report of `day` under `generation`
-    /// (at most [`LENS_BATCH`] in one transaction); a record written
+    /// (a batch of [`lens_batches`] in one transaction); a record written
     /// again keeps the last.
     pub fn put_lens_records(
         &mut self,
@@ -386,7 +431,7 @@ impl ObjTxn<'_, '_> {
             self.trees.tree(LENS_REPORTS_TREE),
             self.trees.tree(LENS_STATE_TREE),
         );
-        let mut budget = LENS_BATCH;
+        let (mut budget, mut bytes) = (LENS_BATCH, LENS_BATCH_BYTES);
         let mut lower: Option<Vec<u8>> = None;
         loop {
             // The next generation's first record.
@@ -414,13 +459,19 @@ impl ObjTxn<'_, '_> {
                 budget + 1,
             )?;
             let rows: Vec<_> = rows.into_iter().filter(|(key, _)| *key < upper).collect();
-            for (key, _) in rows.iter().take(budget) {
+            let mut dropped = 0;
+            for (key, _) in &rows {
+                if dropped == budget || (dropped > 0 && key.len() > bytes) {
+                    return Ok(true);
+                }
                 reports.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
+                dropped += 1;
+                bytes = bytes.saturating_sub(key.len());
             }
-            if rows.len() >= budget {
+            budget -= dropped;
+            if budget == 0 || bytes == 0 {
                 return Ok(true);
             }
-            budget -= rows.len();
             lower = Some(next);
         }
     }
@@ -546,5 +597,35 @@ mod tests {
             reported: None,
         };
         assert_eq!(decode_state(&encode_state(&state)).unwrap(), state);
+    }
+
+    #[test]
+    fn batches_hold_a_bounded_count_of_bounded_bytes() {
+        let record = |value_len: usize| LensRecord {
+            record_type: LensRecordType::Prefix,
+            bucket: "data".into(),
+            record_value: "p".repeat(value_len),
+            storage_class: "STANDARD".into(),
+            metric: "StorageBytes".into(),
+            value: 1,
+        };
+        let short = vec![record(1); 2 * LENS_BATCH + 1];
+        assert_eq!(
+            lens_batches(&short),
+            [LENS_BATCH, 2 * LENS_BATCH, 2 * LENS_BATCH + 1]
+        );
+        let long = vec![record(1000); 200];
+        let ends = lens_batches(&long);
+        let mut start = 0;
+        for end in &ends {
+            let bytes: usize = long[start..*end]
+                .iter()
+                .map(|r| 32 + 4 + r.record_value.len() + 8 + 12)
+                .sum();
+            assert!(bytes <= LENS_BATCH_BYTES && *end > start, "{ends:?}");
+            start = *end;
+        }
+        assert_eq!(start, long.len());
+        assert!(lens_batches(&[]).is_empty());
     }
 }

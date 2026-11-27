@@ -11,7 +11,7 @@ use truthdb_core::wal::records::{PageOpUndo, RelRecord};
 use crate::body::SEGMENT_BYTES;
 use crate::{
     BodyLease, BodyWriter, DEFAULT_ACCOUNT, LENS_BATCH, LensRecord, LensRecordType, LensState,
-    ObjEngine, ObjFile,
+    ObjEngine, ObjFile, lens_batches,
 };
 
 const RING: u64 = 8 * 1024 * 1024;
@@ -9233,6 +9233,66 @@ fn storage_lens_reports_of_many_records_are_written_and_dropped_within_the_log()
         steps += 1;
     }
     assert!(steps >= 19, "{steps}");
+    drop(storage);
+    let storage = open(&path);
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .lens_rows(None, 10)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn storage_lens_records_of_long_prefixes_are_written_and_dropped_within_the_log() {
+    // A thousand records of a prefix of a key's 1024 bytes: a batch of
+    // that many overran these tests' log.
+    let path = temp_path("storage-lens-long");
+    let storage = create(&path);
+    let config = "111111111111/long";
+    let records: Vec<LensRecord> = (0..LENS_BATCH)
+        .map(|n| LensRecord {
+            record_type: LensRecordType::Prefix,
+            bucket: "data".into(),
+            record_value: format!("{n:04}{}/", "p".repeat(1000)),
+            storage_class: "STANDARD".into(),
+            metric: "StorageBytes".into(),
+            value: n as u64,
+        })
+        .collect();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.track_lens(config, 1))
+        .unwrap();
+    let mut start = 0;
+    for end in lens_batches(&records) {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_lens_records(config, 1, 100, &records[start..end]))
+            .unwrap();
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        start = end;
+    }
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.lens_reported(config, 1, 100))
+        .unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .lens_report(config, 100)
+            .unwrap()
+            .len(),
+        records.len()
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.forget_lens(config))
+        .unwrap();
+    while ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.lens_maintain(0))
+        .unwrap()
+    {
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+    }
     drop(storage);
     let storage = open(&path);
     assert!(

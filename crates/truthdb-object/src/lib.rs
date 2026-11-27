@@ -106,7 +106,8 @@ pub use replication::{
 };
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use storage_lens::{
-    ActivityCounts, LENS_BATCH, LENS_KEEP_DAYS, LensRecord, LensRecordType, LensRow, LensState,
+    ActivityCounts, LENS_BATCH, LENS_BATCH_BYTES, LENS_KEEP_DAYS, LensRecord, LensRecordType,
+    LensRow, LensState, lens_batches,
 };
 pub use stored::{Backlogs, BodyUse, StoredBody};
 pub use tables::{

@@ -111,10 +111,13 @@ async fn run_once(
         match step(state, &pass.failed, shutdown).await {
             Ok(None) => return Ok(()),
             Ok(Some(_)) => {}
-            Err((key, day, err)) => {
+            // Of one configuration: not tried again that day.
+            Err(Failure::Of(key, day, err)) => {
                 eprintln!("storage lens: the report of {key}: {err}");
                 pass.failed.insert((key, day));
             }
+            // Of none: tried again after the pass's wait.
+            Err(Failure::Pass(err)) => return Err(err),
         }
     }
 }
@@ -199,27 +202,37 @@ async fn count(state: &S3State, pass: &mut Pass) -> Result<(), String> {
         return Ok(());
     };
     let grown = growth(&now, before);
-    if !grown.is_empty() {
-        let day = today();
+    let day = today();
+    // One bucket's counts a row: a transaction of at most a batch. A batch
+    // written is counted as such at once, so that one failing after it does
+    // not have it counted again.
+    for chunk in grown.chunks(LENS_BATCH) {
+        let chunk = chunk.to_vec();
+        let buckets: Vec<String> = chunk.iter().map(|(bucket, _)| bucket.clone()).collect();
         object(state, move |file| {
             let mut existing = Vec::new();
-            for (bucket, add) in grown {
+            for (bucket, add) in chunk {
                 if let Some(info) = file.bucket(&bucket)? {
                     existing.push((bucket, info.created_ms, add));
                 }
             }
-            // One bucket's counts a row: a transaction of at most a batch.
-            for chunk in existing.chunks(LENS_BATCH) {
-                file.transaction(|tx| {
-                    for (bucket, created_ms, add) in chunk {
-                        tx.add_lens_activity(bucket, *created_ms, day, add)?;
-                    }
-                    Ok(())
-                })?;
+            if existing.is_empty() {
+                return Ok(());
             }
-            Ok(())
+            file.transaction(|tx| {
+                for (bucket, created_ms, add) in &existing {
+                    tx.add_lens_activity(bucket, *created_ms, day, add)?;
+                }
+                Ok(())
+            })
         })
         .await?;
+        let counted = pass.counted.get_or_insert_with(HashMap::new);
+        for bucket in buckets {
+            if let Some(counts) = now.get(&bucket) {
+                counted.insert(bucket, counts.clone());
+            }
+        }
     }
     pass.counted = Some(now);
     Ok(())
@@ -236,13 +249,64 @@ struct Due {
     config: LensConfig,
 }
 
+/// Why a step failed.
+enum Failure {
+    /// The report of a configuration, of a day.
+    Of(String, u32, String),
+    /// Finding a report due.
+    Pass(String),
+}
+
+/// Whether configuration `key` has a report of `day` due: its `Due`.
+fn due_of(
+    file: &mut ObjFile<'_>,
+    key: &str,
+    day: u32,
+    region: &str,
+    now: u64,
+) -> Result<Option<Due>, truthdb_core::storage::StorageError> {
+    let lens = file.lens_state(key)?;
+    if lens.is_some_and(|lens| lens.reported.is_some_and(|last| last >= day)) {
+        return Ok(None);
+    }
+    let Some(document) = file.bucket_config("", STORAGE_LENS, key)? else {
+        return Ok(None);
+    };
+    let Some((account, _)) = key.split_once('/') else {
+        return Ok(None);
+    };
+    let text = String::from_utf8_lossy(&document).into_owned();
+    let Ok(config) = crate::storage_lens::read(&text, region, account) else {
+        return Ok(None);
+    };
+    if !config.enabled {
+        return Ok(None);
+    }
+    // A configuration put before its state was kept is given one.
+    let lens = match lens {
+        Some(lens) => lens,
+        None => {
+            file.transaction(|tx| tx.track_lens(key, now))?;
+            file.lens_state(key)?.expect("just tracked")
+        }
+    };
+    Ok(Some(Due {
+        account: account.to_string(),
+        key: key.to_string(),
+        document,
+        generation: lens.generation,
+        reported: lens.reported,
+        config,
+    }))
+}
+
 /// Makes the first due report not in `failed`; the configuration whose
 /// report it was, if there was one.
 async fn step(
     state: &S3State,
     failed: &HashSet<(String, u32)>,
     shutdown: &watch::Receiver<bool>,
-) -> Result<Option<String>, (String, u32, String)> {
+) -> Result<Option<String>, Failure> {
     let day = today() - 1;
     let region = state.region.clone();
     let skip: HashSet<String> = failed
@@ -251,54 +315,28 @@ async fn step(
         .map(|(key, _)| key.clone())
         .collect();
     let now = now_ms();
+    // A configuration whose state cannot be read is failed alone.
     let due = object(state, move |file| {
         for key in file.bucket_config_ids_with("", STORAGE_LENS, "")? {
             if skip.contains(&key) {
                 continue;
             }
-            let lens = file.lens_state(&key)?;
-            if lens.is_some_and(|lens| lens.reported.is_some_and(|last| last >= day)) {
-                continue;
+            match due_of(file, &key, day, &region, now) {
+                Ok(None) => {}
+                Ok(Some(due)) => return Ok(Ok(Some(due))),
+                Err(err) => return Ok(Err((key, err.to_string()))),
             }
-            let Some(document) = file.bucket_config("", STORAGE_LENS, &key)? else {
-                continue;
-            };
-            let Some((account, _)) = key.split_once('/') else {
-                continue;
-            };
-            let text = String::from_utf8_lossy(&document).into_owned();
-            let Ok(config) = crate::storage_lens::read(&text, &region, account) else {
-                continue;
-            };
-            if !config.enabled {
-                continue;
-            }
-            // A configuration put before its state was kept is given one.
-            let lens = match lens {
-                Some(lens) => lens,
-                None => {
-                    file.transaction(|tx| tx.track_lens(&key, now))?;
-                    file.lens_state(&key)?.expect("just tracked")
-                }
-            };
-            return Ok(Some(Due {
-                account: account.to_string(),
-                key,
-                document,
-                generation: lens.generation,
-                reported: lens.reported,
-                config,
-            }));
         }
-        Ok(None)
+        Ok(Ok(None))
     })
     .await
-    .map_err(|err| (String::new(), day, err))?;
+    .map_err(Failure::Pass)?
+    .map_err(|(key, err)| Failure::Of(key, day, err))?;
     let Some(due) = due else {
         return Ok(None);
     };
     let key = due.key.clone();
-    let failure = |err: String| (key.clone(), day, err);
+    let failure = |err: String| Failure::Of(key.clone(), day, err);
     let Some(records) = report(state, &due, day, shutdown).await.map_err(failure)? else {
         return Ok(None);
     };
@@ -344,20 +382,22 @@ async fn write(
             Some(false) => break,
         }
     }
+    let ends = truthdb_object::lens_batches(&records);
     let records = Arc::new(records);
-    for start in (0..records.len()).step_by(LENS_BATCH) {
+    let mut start = 0;
+    for end in ends {
         let (key, document, records) = (key.clone(), Arc::clone(&document), Arc::clone(&records));
         let written = object(state, move |file| {
             if !unchanged(file, &key, &document)? {
                 return Ok(false);
             }
-            let end = (start + LENS_BATCH).min(records.len());
             file.transaction(|tx| {
                 tx.put_lens_records(&key, generation, day, &records[start..end])
             })?;
             Ok(true)
         })
         .await?;
+        start = end;
         if !written {
             return Ok(());
         }
