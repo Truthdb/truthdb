@@ -137,12 +137,19 @@ pub struct LensRow {
     pub record: LensRecord,
 }
 
+/// A page of a report: its records, and where the next resumes (none:
+/// the end).
+pub type LensPage = (Vec<LensRecord>, Option<Vec<u8>>);
+
 /// A configuration's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LensState {
     pub generation: u64,
     /// The day of its last report, if one was made.
     pub reported: Option<u32>,
+    /// The day of its last report exported (or found it could not be), if
+    /// one was.
+    pub exported: Option<u32>,
 }
 
 fn corrupt(what: &str) -> StorageError {
@@ -260,19 +267,30 @@ fn encode_state(state: &LensState) -> Vec<u8> {
     [
         &state.generation.to_be_bytes()[..],
         &state.reported.unwrap_or(u32::MAX).to_be_bytes(),
+        &state.exported.unwrap_or(u32::MAX).to_be_bytes(),
     ]
     .concat()
 }
 
+/// A state: its generation, its last report's day, and (absent from one
+/// written before exports were made) its last export's.
 fn decode_state(row: &[u8]) -> Result<LensState, StorageError> {
-    let (generation, day) = row
+    let (generation, rest) = row
         .split_first_chunk::<8>()
         .ok_or_else(|| corrupt("state"))?;
-    let day: [u8; 4] = day.try_into().map_err(|_| corrupt("state"))?;
-    let day = u32::from_be_bytes(day);
+    let day = |bytes: &[u8]| {
+        let day = u32::from_be_bytes(bytes.try_into().expect("four bytes"));
+        (day != u32::MAX).then_some(day)
+    };
+    let (reported, exported) = match rest.len() {
+        4 => (day(rest), None),
+        8 => (day(&rest[..4]), day(&rest[4..])),
+        _ => return Err(corrupt("state")),
+    };
     Ok(LensState {
         generation: u64::from_be_bytes(*generation),
-        reported: (day != u32::MAX).then_some(day),
+        reported,
+        exported,
     })
 }
 
@@ -343,6 +361,7 @@ impl ObjTxn<'_, '_> {
             let state = LensState {
                 generation,
                 reported: None,
+                exported: None,
             };
             tree.insert_unique(
                 self.ctx,
@@ -418,13 +437,34 @@ impl ObjTxn<'_, '_> {
         let Some(row) = tree.get(self.ctx, config.as_bytes())? else {
             return Ok(false);
         };
-        if decode_state(&row)?.generation != generation {
+        let mut state = decode_state(&row)?;
+        if state.generation != generation {
             return Ok(false);
         }
-        let state = LensState {
-            generation,
-            reported: Some(day),
+        state.reported = Some(day);
+        let mode = &mut OpMode::Txn(self.txn);
+        tree.delete(self.ctx, mode, config.as_bytes())?;
+        tree.insert_unique(self.ctx, mode, config.as_bytes(), &encode_state(&state))?;
+        Ok(true)
+    }
+
+    /// Records `day` as `config`'s last report exported, if it still has
+    /// `generation`.
+    pub fn lens_exported(
+        &mut self,
+        config: &str,
+        generation: u64,
+        day: u32,
+    ) -> Result<bool, StorageError> {
+        let tree = self.trees.tree(LENS_STATE_TREE);
+        let Some(row) = tree.get(self.ctx, config.as_bytes())? else {
+            return Ok(false);
         };
+        let mut state = decode_state(&row)?;
+        if state.generation != generation {
+            return Ok(false);
+        }
+        state.exported = Some(day);
         let mode = &mut OpMode::Txn(self.txn);
         tree.delete(self.ctx, mode, config.as_bytes())?;
         tree.insert_unique(self.ctx, mode, config.as_bytes(), &encode_state(&state))?;
@@ -539,6 +579,48 @@ impl ObjFile<'_> {
             .collect()
     }
 
+    /// Up to `limit` records of `config`'s report of `day` under
+    /// `generation`, after `after` (a key this returned as where to
+    /// resume; none: the end); none when that is not a report read.
+    pub fn lens_report_page(
+        &mut self,
+        config: &str,
+        generation: u64,
+        day: u32,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Option<LensPage>, StorageError> {
+        let state = self.lens_state(config)?;
+        if !visible(state.as_ref(), generation, day) {
+            return Ok(None);
+        }
+        let Some(tree) = self.existing_tree(LENS_REPORTS_TREE)? else {
+            return Ok(Some((Vec::new(), None)));
+        };
+        let lower = match after {
+            Some(key) => [key, &[0]].concat(),
+            None => day_prefix(config, generation, day),
+        };
+        let upper = day_prefix(config, generation, day + 1);
+        let page: Vec<_> = tree
+            .scan_range_limit(
+                &mut self.core.page_ctx(0),
+                Some(&lower),
+                Some(&upper),
+                limit + 1,
+            )?
+            .into_iter()
+            .filter(|(key, _)| *key < upper)
+            .collect();
+        let next = (page.len() > limit).then(|| page[limit - 1].0.clone());
+        let records = page
+            .iter()
+            .take(limit)
+            .map(|(key, value)| decode_row(key, value).map(|row| row.record))
+            .collect::<Result<_, _>>()?;
+        Ok(Some((records, next)))
+    }
+
     /// Reports' records of every configuration (those read: see the
     /// module's doc), in key order, from up to `limit` records after
     /// `after` (a key this returned as where to resume; none: the end).
@@ -602,9 +684,13 @@ mod tests {
         assert!(day_prefix("a/b", 1, 1) < day_prefix("a/b", 1, 2));
         let state = LensState {
             generation: 5,
-            reported: None,
+            reported: Some(3),
+            exported: None,
         };
         assert_eq!(decode_state(&encode_state(&state)).unwrap(), state);
+        // One written before exports were kept.
+        let old = [&5u64.to_be_bytes()[..], &3u32.to_be_bytes()].concat();
+        assert_eq!(decode_state(&old).unwrap(), state);
     }
 
     #[test]

@@ -906,10 +906,19 @@ async fn put(
     if config.id != id {
         return Err(invalid("The configuration's Id is the one its path names."));
     }
-    // Kept by the parser, but nothing exports or publishes metrics yet.
-    if config.export.is_some() {
-        return Err(S3Error::not_implemented("Storage Lens metrics exports"));
+    if let Some(export) = &config.export {
+        // Exported to a bucket of the configuration's account only.
+        if export.account != account {
+            return Err(S3Error::not_implemented(
+                "Storage Lens metrics exported to another account's bucket",
+            ));
+        }
+        // SSE-S3 is the database's encryption at rest, as a PutObject's.
+        if export.sse_s3 {
+            crate::sse::check_write_value(crate::sse::AES256, state.storage.is_encrypted())?;
+        }
     }
+    // Kept by the parser, but nothing publishes metrics to CloudWatch.
     if config.cloudwatch {
         return Err(S3Error::not_implemented(
             "Storage Lens metrics published to CloudWatch",

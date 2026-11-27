@@ -22058,8 +22058,8 @@ for bad in [
     with_(AwsOrg={"Arn": "arn:aws:organizations::111111111111:organization/o-abc"}),
     with_(DataExport={"S3BucketDestination": dict(destination,
         Encryption={"SSEKMS": {"KeyId": "arn:aws:kms:us-east-1:111111111111:key/1"}})}),
-    # Not built yet: exports and CloudWatch publishing.
-    with_(DataExport={"S3BucketDestination": destination}),
+    # Not built: exports to another account's bucket, CloudWatch publishing.
+    with_(DataExport={"S3BucketDestination": dict(destination, AccountId=other)}),
     with_(DataExport={"CloudWatchMetrics": {"IsEnabled": True}}),
 ]:
     refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
@@ -22077,6 +22077,9 @@ for bad in [
 refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
     StorageLensConfiguration=config, Tags=[{"Key": "a", "Value": "1"}, {"Key": "a", "Value": "2"}]),
     "InvalidRequest")
+# SSE-S3 is the database's encryption at rest: this one's is not.
+refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
+    StorageLensConfiguration=with_(DataExport={"S3BucketDestination": destination})), "InvalidArgument")
 refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="a*b",
     StorageLensConfiguration=with_(Id="a*b")), "InvalidRequest")
 # At most 50 an account; a replaced one is not another.
@@ -22389,5 +22392,157 @@ elif phase == "after":
 elif phase == "again":
     control.put_storage_lens_configuration(AccountId=account, ConfigId="daily",
         StorageLensConfiguration=lens("daily", Exclude={"Buckets": ["arn:aws:s3:::skipped"]}))
+print("ok")
+"#;
+
+#[test]
+fn storage_lens_exports_write_a_days_report_once_as_csv_or_parquet_with_a_manifest() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let mut server = start_server();
+    let (account, key, secret) = account_with_key(&server, "lens-exports");
+    let (_, other_key, other_secret) = account_with_key(&server, "lens-exports-elsewhere");
+    let script = server.dir.join("storage_lens_exports.py");
+    std::fs::write(&script, STORAGE_LENS_EXPORTS_SCRIPT).expect("script");
+    let run = |phase: &str, port: u16| {
+        let output = Command::new(&python)
+            .arg("-I")
+            .arg(&script)
+            .args([
+                phase,
+                &port.to_string(),
+                &account,
+                &key,
+                &secret,
+                &other_key,
+                &other_secret,
+            ])
+            .output()
+            .expect("run python");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success() && stdout.contains("ok"),
+            "{phase}\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    let out = run("exports", server.s3_port);
+    // The Parquet file reads back as a table: the report's records.
+    let parquet = out
+        .lines()
+        .find_map(|line| line.strip_prefix("parquet="))
+        .expect("the Parquet file's key");
+    let read = sql_rows(
+        server.native_port,
+        &format!(
+            "SELECT record_type, bucket_name, metric_name, metric_value, version_number \
+             FROM sys.s3_read('reports', '{parquet}', 'parquet') \
+             WHERE metric_name = 'StorageBytes' AND record_type = 'BUCKET'"
+        ),
+    );
+    assert_eq!(read, [["BUCKET", "data", "StorageBytes", "15", "V_1"]]);
+    let records = sql_rows(
+        server.native_port,
+        "SELECT COUNT(*) FROM sys.dm_s3_storage_lens WHERE configuration_id = 'columnar'",
+    );
+    let files = sql_rows(
+        server.native_port,
+        &format!("SELECT COUNT(*) FROM sys.s3_read('reports', '{parquet}', 'parquet')"),
+    );
+    assert_eq!(records, files);
+    // Made once: across a crash, not made again.
+    crash_and_restart(&mut server);
+    run("after", server.s3_port);
+}
+
+const STORAGE_LENS_EXPORTS_SCRIPT: &str = r#"
+import csv, datetime, hashlib, io, json, socket, sys, time
+import boto3, botocore.config
+phase, port, account, key, secret, other_key, other_secret = sys.argv[1:8]
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service, access=key, secret_key=secret):
+    return boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+s3, control = client("s3"), client("s3control")
+yesterday = (datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=1)).isoformat()
+def lens(id, format, bucket="reports", prefix=None):
+    destination = {"Format": format, "OutputSchemaVersion": "V_1", "AccountId": account,
+        "Arn": f"arn:aws:s3:::{bucket}"}
+    if prefix:
+        destination["Prefix"] = prefix
+    return {"Id": id, "IsEnabled": True, "AccountLevel": {"BucketLevel": {}},
+        "Include": {"Buckets": ["arn:aws:s3:::data"]},
+        "DataExport": {"S3BucketDestination": destination}}
+def read(bucket, key):
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+def manifest(id, prefix=""):
+    key = f"{prefix}StorageLens/{account}/{id}/V_1/manifests/dt={yesterday}/manifest.json"
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            return key, json.loads(read("reports", key))
+        except s3.exceptions.NoSuchKey:
+            time.sleep(0.2)
+    raise SystemExit(f"no manifest {key}")
+def versions(prefix):
+    return [(v["Key"], v["VersionId"]) for v in
+        s3.list_object_versions(Bucket="reports", Prefix=prefix).get("Versions", [])]
+if phase == "exports":
+    s3.create_bucket(Bucket="data")
+    s3.create_bucket(Bucket="reports")
+    s3.put_bucket_versioning(Bucket="reports", VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket="data", Key="a", Body=b"x" * 10)
+    s3.put_object(Bucket="data", Key="b/c", Body=b"x" * 5)
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="tabular",
+        StorageLensConfiguration=lens("tabular", "CSV", prefix="lens/"))
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="columnar",
+        StorageLensConfiguration=lens("columnar", "Parquet"))
+    # A destination that is not there: no export, nothing written.
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="nowhere",
+        StorageLensConfiguration=lens("nowhere", "CSV", bucket="missing"))
+    # Nor to another account's bucket.
+    theirs = client("s3", other_key, other_secret)
+    theirs.create_bucket(Bucket="elsewhere")
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="theirs",
+        StorageLensConfiguration=lens("theirs", "CSV", bucket="elsewhere"))
+    key, found = manifest("tabular", "lens/")
+    assert found["sourceAccountId"] == account and found["configId"] == "tabular", found
+    assert found["destinationBucket"] == "arn:aws:s3:::reports", found
+    assert found["reportVersion"] == "V_1" and found["reportDate"] == yesterday, found
+    assert found["reportFormat"] == "CSV" and found["reportSchema"].split(",")[0] == "version_number", found
+    [listed] = found["reportFiles"]
+    data = read("reports", listed["key"])
+    assert listed["size"] == len(data) and listed["md5Checksum"] == hashlib.md5(data).hexdigest(), listed
+    assert listed["key"].startswith(f"lens/StorageLens/{account}/tabular/V_1/reports/dt={yesterday}/"), listed
+    assert listed["key"].endswith(".csv"), listed
+    rows = list(csv.reader(io.StringIO(data.decode())))
+    assert rows[0] == found["reportSchema"].split(","), rows[0]
+    by = {(r[6], r[8], r[9], r[5]): r for r in rows[1:]}
+    row = by[("BUCKET", "data", "StorageBytes", "STANDARD")]
+    assert row[:5] == ["V_1", "tabular", yesterday, account, "us-east-1"] and row[10] == "15", row
+    assert by[("ACCOUNT", "", "StorageBytes", "STANDARD")][10] == "15"
+    _, columnar = manifest("columnar")
+    assert columnar["reportFormat"] == "Parquet" and "required long metric_value" in columnar["reportSchema"], columnar
+    [file] = columnar["reportFiles"]
+    assert file["key"].endswith(".par"), file
+    assert read("reports", file["key"])[:4] == b"PAR1"
+    print("parquet=" + file["key"])
+    # The missing destination's day is done with, and nothing is written.
+    time.sleep(1)
+    assert not any("nowhere" in k for k, _ in versions("")), versions("")
+    assert theirs.list_objects_v2(Bucket="elsewhere").get("KeyCount", 0) == 0
+    print("versions=" + json.dumps(versions("")))
+elif phase == "after":
+    # Made once: each file has one version still.
+    time.sleep(2)
+    found = versions("")
+    keys = [k for k, _ in found]
+    assert len(keys) == len(set(keys)) == 4, found
 print("ok")
 "#;

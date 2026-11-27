@@ -66,6 +66,8 @@ struct Pass {
     /// The configurations whose report of a day failed: not tried again
     /// that day, so that one does not keep the others from theirs.
     failed: HashSet<(String, u32)>,
+    /// Those whose export of a day failed, likewise.
+    export_failed: HashSet<(String, u32)>,
 }
 
 /// Counts requests and makes reports until `shutdown` turns true.
@@ -108,6 +110,7 @@ async fn run_once(
         maintain(state, day).await?;
         pass.maintained = Some(day);
         pass.failed.retain(|(_, failed)| *failed + 1 >= day);
+        pass.export_failed.retain(|(_, failed)| *failed + 1 >= day);
     }
     loop {
         count(state, pass).await?;
@@ -115,7 +118,7 @@ async fn run_once(
             return Ok(());
         }
         match step(state, &pass.failed, shutdown).await {
-            Ok(None) => return Ok(()),
+            Ok(None) => break,
             Ok(Some(_)) => {}
             // Of one configuration: not tried again that day.
             Err(Failure::Of(key, day, err)) => {
@@ -126,6 +129,87 @@ async fn run_once(
             Err(Failure::Pass(err)) => return Err(err),
         }
     }
+    // The reports made, their exports (requests counted between them too).
+    loop {
+        count(state, pass).await?;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        match export_step(state, &pass.export_failed, shutdown).await {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(Failure::Of(key, day, err)) => {
+                eprintln!("storage lens: the export of {key}: {err}");
+                pass.export_failed.insert((key, day));
+            }
+            Err(Failure::Pass(err)) => return Err(err),
+        }
+    }
+}
+
+/// Makes the first due export not in `failed`; whether there was one.
+async fn export_step(
+    state: &S3State,
+    failed: &HashSet<(String, u32)>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<bool, Failure> {
+    let region = state.region.clone();
+    let failed = failed.clone();
+    let yesterday = today() - 1;
+    let due = object(state, move |file| {
+        for key in file.bucket_config_ids_with("", STORAGE_LENS, "")? {
+            if failed.contains(&(key.clone(), yesterday)) {
+                continue;
+            }
+            // A configuration whose state cannot be read is failed alone.
+            let lens = match file.lens_state(&key) {
+                Ok(Some(lens)) => lens,
+                Ok(None) => continue,
+                Err(err) => return Ok(Err((key, yesterday, err.to_string()))),
+            };
+            let Some(day) = lens.reported else {
+                continue;
+            };
+            if lens.exported.is_some_and(|last| last >= day) || failed.contains(&(key.clone(), day))
+            {
+                continue;
+            }
+            let Some(document) = file.bucket_config("", STORAGE_LENS, &key)? else {
+                continue;
+            };
+            let Some((account, id)) = key.split_once('/') else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&document).into_owned();
+            let Ok(config) = crate::storage_lens::read(&text, &region, account) else {
+                continue;
+            };
+            let Some(export) = config.export.filter(|_| config.enabled) else {
+                continue;
+            };
+            return Ok(Ok(Some(crate::storage_lens_export::ExportDue {
+                account: account.to_string(),
+                id: id.to_string(),
+                key: key.clone(),
+                document,
+                generation: lens.generation,
+                day,
+                export,
+            })));
+        }
+        Ok(Ok(None))
+    })
+    .await
+    .map_err(Failure::Pass)?
+    .map_err(|(key, day, err)| Failure::Of(key, day, err))?;
+    let Some(due) = due else {
+        return Ok(false);
+    };
+    let (key, day) = (due.key.clone(), due.day);
+    crate::storage_lens_export::export(state, due, shutdown)
+        .await
+        .map_err(|err| Failure::Of(key, day, err))?;
+    Ok(true)
 }
 
 /// Drops, in batches, request counts and reports past keeping, and the

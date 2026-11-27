@@ -9061,7 +9061,8 @@ fn storage_lens_reports_are_read_once_reported_and_dropped_in_batches() {
         file.lens_state(config).unwrap(),
         Some(LensState {
             generation: 1,
-            reported: None
+            reported: None,
+            exported: None
         })
     );
     // Written but not yet reported: not read.
@@ -9098,6 +9099,33 @@ fn storage_lens_reports_are_read_once_reported_and_dropped_in_batches() {
         file.lens_report(config, 100).unwrap(),
         [record("StorageBytes", 7)]
     );
+    // Read in pages; recorded as exported under its generation only.
+    let (page, next) = file
+        .lens_report_page(config, 1, 100, None, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!((page, next), (vec![record("StorageBytes", 7)], None));
+    assert!(
+        file.lens_report_page(config, 1, 101, None, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        file.lens_report_page(config, 2, 100, None, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !file
+            .transaction(|tx| tx.lens_exported(config, 2, 100))
+            .unwrap()
+    );
+    assert!(
+        file.transaction(|tx| tx.lens_exported(config, 1, 100))
+            .unwrap()
+    );
+    let state = file.lens_state(config).unwrap().unwrap();
+    assert_eq!((state.reported, state.exported), (Some(100), Some(100)));
     // A configuration whose key starts like another's is apart from it.
     let other = "111111111111/lens2";
     file.transaction(|tx| {
