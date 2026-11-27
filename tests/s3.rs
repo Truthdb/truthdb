@@ -22999,6 +22999,28 @@ fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
         drop(file);
         assert_eq!(read("threads.txt").unwrap(), b"threads");
     }
+    // A shell's `>`, `dd` and `touch`: written through a duplicate of the
+    // descriptor (the first closed before anything is written), or closed
+    // then given times by path.
+    let local = server.dir.join("ten.bin");
+    std::fs::write(&local, &big[..10 * 1024 * 1024]).unwrap();
+    let shell = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "echo hi > shell.txt && dd if={} of=dd.bin bs=1M status=none && touch touched",
+            local.display()
+        ))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    assert_eq!(read("shell.txt").unwrap(), b"hi\n");
+    assert!(read("dd.bin").unwrap() == big[..10 * 1024 * 1024]);
+    assert_eq!(read("touched").unwrap(), b"");
     // Not replaced, nor deleted, unless allowed; not renamed; no chmod.
     assert_eq!(
         errno(std::fs::write(dir.join("old.txt"), b"x").unwrap_err()),
@@ -23052,6 +23074,37 @@ fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
     .expect("mount");
     std::fs::write(dir.join("old.txt"), b"replaced\n").unwrap();
     assert_eq!(read("old.txt").unwrap(), b"replaced\n");
+    // Replaced and deleted at once: one or the other, never both.
+    for round in 0..50 {
+        let name = format!("raced-{round}");
+        std::fs::write(dir.join(&name), b"before").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (writing, deleting) = (dir.join(&name), dir.join(&name));
+        let wrote = {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&writing)
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, b"after"))
+                    .map_err(|err| err.raw_os_error())
+            })
+        };
+        let deleted = std::thread::spawn(move || {
+            barrier.wait();
+            std::fs::remove_file(&deleting).map_err(|err| err.raw_os_error())
+        });
+        let (wrote, deleted) = (wrote.join().unwrap(), deleted.join().unwrap());
+        assert!(!(wrote.is_ok() && deleted.is_ok()), "{wrote:?} {deleted:?}");
+        let stored = read(&name).ok();
+        match (&wrote, &deleted) {
+            (Ok(()), _) => assert_eq!(stored.as_deref(), Some(&b"after"[..])),
+            (_, Ok(())) => assert_eq!(stored, None),
+            _ => panic!("neither: {wrote:?} {deleted:?}"),
+        }
+    }
     // Two opens to replace it at once: one has it, the other is refused.
     for _ in 0..50 {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -23064,9 +23117,12 @@ fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
                         .write(true)
                         .truncate(true)
                         .open(&path);
-                    // Held until both have tried.
+                    // Held until both have tried; written, so that its close
+                    // ends it (one of nothing ends at its release, later).
                     std::thread::sleep(Duration::from_millis(20));
-                    opened.map(drop).map_err(|err| err.raw_os_error())
+                    opened
+                        .and_then(|mut file| std::io::Write::write_all(&mut file, b"x"))
+                        .map_err(|err| err.raw_os_error())
                 })
             })
             .collect::<Vec<_>>()

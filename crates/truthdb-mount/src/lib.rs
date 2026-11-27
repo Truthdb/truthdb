@@ -121,6 +121,8 @@ struct State {
     writers: HashMap<u64, Writer>,
     /// Directories made here, not (yet) in the bucket.
     local_directories: HashSet<String>,
+    /// Files being deleted: not opened to be written meanwhile.
+    deleting: HashSet<String>,
     next_fh: u64,
 }
 
@@ -456,7 +458,7 @@ impl Mount {
     /// is the opening thread's.
     fn writer(&self, path: &str, pid: u32) -> Result<u64, Errno> {
         let mut state = self.lock();
-        if state.writing(path).is_some() || state.reading(path) {
+        if state.writing(path).is_some() || state.reading(path) || state.deleting.contains(path) {
             return Err(Errno::EPERM);
         }
         let fh = state.handle();
@@ -712,29 +714,37 @@ impl Filesystem for Mount {
             return reply.error(Errno::ENOENT);
         };
         // "For files not yet committed to S3 ... the client does not
-        // permit `unlink` operations."
-        if self.lock().writing(&path).is_some() {
-            return reply.error(Errno::EPERM);
-        }
-        match self.find(&path) {
-            Ok(Some(Kind::File { .. })) => {}
-            Ok(Some(Kind::Directory)) => return reply.error(Errno::EISDIR),
-            Ok(None) => return reply.error(Errno::ENOENT),
-            Err(err) => return reply.error(errno(&err)),
-        }
-        let key = self.key(&path);
-        match self
-            .runtime
-            .block_on(self.client.delete_object(&self.options.bucket, &key))
+        // permit `unlink` operations." Checked, and the file marked as being
+        // deleted, in one hold of the state: one opened to be written
+        // meanwhile is refused until the delete is done.
         {
+            let mut state = self.lock();
+            if state.writing(&path).is_some() || !state.deleting.insert(path.clone()) {
+                return reply.error(Errno::EPERM);
+            }
+        }
+        let deleted = match self.find(&path) {
+            Ok(Some(Kind::File { .. })) => self
+                .runtime
+                .block_on(
+                    self.client
+                        .delete_object(&self.options.bucket, &self.key(&path)),
+                )
+                .map_err(|err| errno(&err)),
+            Ok(Some(Kind::Directory)) => Err(Errno::EISDIR),
+            Ok(None) => Err(Errno::ENOENT),
+            Err(err) => Err(errno(&err)),
+        };
+        let mut state = self.lock();
+        state.deleting.remove(&path);
+        match deleted {
             Ok(()) => {
-                let mut state = self.lock();
                 if let Some(ino) = state.by_path.remove(&path) {
                     state.nodes.remove(&ino);
                 }
                 reply.ok();
             }
-            Err(err) => reply.error(errno(&err)),
+            Err(err) => reply.error(err),
         }
     }
 
@@ -1031,6 +1041,18 @@ impl Filesystem for Mount {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
+        // Nothing written yet: not ended ("only completing the upload on
+        // flush when some bytes have been written", as Mountpoint does: a
+        // shell's `>` and `dd` duplicate the descriptor and close the first
+        // before writing; `touch` closes, then sets the times by path).
+        if self
+            .lock()
+            .writers
+            .get(&fh.0)
+            .is_some_and(|writer| writer.written == 0)
+        {
+            return reply.ok();
+        }
         // A file written is uploaded whole as it is closed: by its opener
         // (another's close, as a child's of what it inherited, returns at
         // once: "if close is called by a different process than the one
