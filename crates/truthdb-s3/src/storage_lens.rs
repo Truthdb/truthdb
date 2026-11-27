@@ -120,13 +120,15 @@ fn boolean(text: &str) -> Result<bool, S3Error> {
 }
 
 /// A bucket ARN's bucket, if `arn` is one (`arn:aws:s3:::<bucket>`, at
-/// most 128 characters).
+/// most 128 characters, of a name a bucket may have).
 pub(crate) fn bucket_of_arn(arn: &str) -> Option<&str> {
     if arn.len() > 128 {
         return None;
     }
-    arn.strip_prefix("arn:aws:s3:::")
-        .filter(|bucket| !bucket.is_empty() && !bucket.contains('/'))
+    arn.strip_prefix("arn:aws:s3:::").filter(|bucket| {
+        truthdb_object::validate_bucket_name(bucket).is_ok()
+            || truthdb_object::validate_directory_bucket_name(bucket).is_ok()
+    })
 }
 
 /// The configuration in a document of root `root`, `under` it (empty: the
@@ -254,8 +256,10 @@ fn parse(
             }
             "StorageLensArn" => once(&mut given_arn, trimmed)?,
             "PrefixDelimiter" => {
-                if text.chars().count() > 1 {
-                    return Err(invalid("A prefix delimiter is one character."));
+                if text.chars().count() > 1 || text.chars().any(char::is_control) {
+                    return Err(invalid(
+                        "A prefix delimiter is one character, not a control character.",
+                    ));
                 }
                 once(&mut prefix_delimiter, text)?
             }
@@ -276,8 +280,10 @@ fn parse(
             "AccountLevel/BucketLevel/PrefixLevel/StorageMetrics/SelectionCriteria" => {}
             "AccountLevel/BucketLevel/PrefixLevel/StorageMetrics/SelectionCriteria/Delimiter" => {
                 let prefix = prefix_level.as_mut().ok_or_else(malformed)?;
-                if text.chars().count() > 1 {
-                    return Err(invalid("A prefix delimiter is one character."));
+                if text.chars().count() > 1 || text.chars().any(char::is_control) {
+                    return Err(invalid(
+                        "A prefix delimiter is one character, not a control character.",
+                    ));
                 }
                 once(&mut prefix.delimiter, text)?;
             }
@@ -537,6 +543,9 @@ fn parse_tags(body: &[u8], root: &str) -> Result<Vec<(String, String)>, S3Error>
     }
     if let Some(done) = tag.take() {
         tags.push(finish_tag(done)?);
+    }
+    if !has_tags {
+        return Err(malformed());
     }
     checked(tags)
 }
@@ -1037,6 +1046,10 @@ mod tests {
             ("<Id>a</Id><AccountLevel><ActivityMetrics><IsEnabled>true</IsEnabled></ActivityMetrics><BucketLevel/></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "levels not consistent"),
             (format!("<Id>a</Id>{levels}<DataExport><CloudWatchMetrics/></DataExport><IsEnabled>true</IsEnabled>"), "CloudWatch without IsEnabled"),
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>//</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a long delimiter"),
+            (format!("<Id>a</Id>{levels}<PrefixDelimiter>&#1;</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a control character delimiter"),
+            ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><Delimiter>&#1;</Delimiter></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a control character prefix delimiter"),
+            (format!("<Id>a</Id>{levels}<Include><Buckets><Arn>arn:aws:s3:::a&#1;b</Arn></Buckets></Include><IsEnabled>true</IsEnabled>"), "a bucket ARN of no bucket name"),
+            (format!("<Id>a</Id>{levels}<Include><Buckets><Arn>arn:aws:s3:::A b</Arn></Buckets></Include><IsEnabled>true</IsEnabled>"), "a bucket ARN with a space"),
             (format!("<Id>a</Id>{levels}<IsEnabled>true</IsEnabled></StorageLensConfiguration><StorageLensConfiguration><PrefixDelimiter>/</PrefixDelimiter>"), "the configuration twice"),
             ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><MaxDepth>3</MaxDepth><MaxDepth>7</MaxDepth></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "MaxDepth twice"),
             ("<Id>a</Id><AccountLevel><BucketLevel><ActivityMetrics><IsEnabled>true</IsEnabled></ActivityMetrics><ActivityMetrics><IsEnabled>false</IsEnabled></ActivityMetrics></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a level's metrics twice"),
@@ -1111,6 +1124,7 @@ mod tests {
             body(&"<Tag><Key>k</Key><Value>v</Value></Tag>".replace("k", &"k".repeat(129))),
             body("<Tag><Key>a*</Key><Value>1</Value></Tag>"),
             body("</Tags><Tags><Tag><Key>a</Key><Value>1</Value></Tag>"),
+            "<PutStorageLensConfigurationTaggingRequest/>".to_string(),
             body("<Tag><Key>a\nb</Key><Value>1</Value></Tag>"),
             body("<Tag><Key>a</Key><Value>x\ty</Value></Tag>"),
         ] {

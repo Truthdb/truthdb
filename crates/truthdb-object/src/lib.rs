@@ -63,7 +63,10 @@ pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_a
 pub use activity::{ACTIVITY_KEEP_MS, ActivityEvent, MAX_ACTIVITY_RECORD};
 pub use append::{AppendError, MAX_APPEND_PARTS};
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
-pub use buckets::{BucketError, BucketInfo, Versioning, Warehouse, validate_directory_bucket_name};
+pub use buckets::{
+    BucketError, BucketInfo, Versioning, Warehouse, validate_bucket_name,
+    validate_directory_bucket_name,
+};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
 pub use credentials::AccessKey;
 pub use documents::{
