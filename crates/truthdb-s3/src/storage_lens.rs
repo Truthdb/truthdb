@@ -52,6 +52,10 @@ fn valid_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn bad_id() -> S3Error {
+    invalid("A configuration's id is 1 to 64 letters, digits, hyphens, underscores and periods.")
+}
+
 /// The metrics a level (the account's, or its buckets') has on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Level {
@@ -430,9 +434,7 @@ fn parse(
         ));
     }
     if !valid_id(&id) {
-        return Err(invalid(
-            "A configuration's id is 1 to 64 letters, digits, hyphens, underscores and periods.",
-        ));
+        return Err(bad_id());
     }
     if let Some(given) = &given_arn
         && *given != arn(&id)
@@ -806,6 +808,12 @@ pub async fn handle(
                 .map_err(|_| invalid("The configuration's id is not UTF-8."))
         })
         .transpose()?;
+    // The path's id is an id before anything is looked up or authorized by
+    // it: a key holding a NUL would reach another configuration's stored
+    // chunks, and its ARN would not be the one a policy names.
+    if id.as_deref().is_some_and(|id| !valid_id(id)) {
+        return Err(bad_id());
+    }
     let authz = Authz::load(
         state,
         Some(&principal),

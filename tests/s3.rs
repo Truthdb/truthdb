@@ -22088,6 +22088,21 @@ refused(lambda: control.put_storage_lens_configuration(AccountId=account, Config
     "InvalidRequest")
 control.put_storage_lens_configuration(AccountId=account, ConfigId="n0",
     StorageLensConfiguration={"Id": "n0", "IsEnabled": False, "AccountLevel": {"BucketLevel": {}}})
+# A path's id that is no id is refused before it is looked up: a NUL would
+# reach the stored chunks of a configuration longer than one chunk.
+control.delete_storage_lens_configuration(AccountId=account, ConfigId="n1")
+control.put_storage_lens_configuration(AccountId=account, ConfigId="big", StorageLensConfiguration={
+    "Id": "big", "IsEnabled": True, "AccountLevel": {"BucketLevel": {}},
+    "Include": {"Buckets": [f"arn:aws:s3:::bucket-{n:03}" for n in range(60)]}})
+for call in [control.get_storage_lens_configuration, control.delete_storage_lens_configuration,
+        control.get_storage_lens_configuration_tagging, control.delete_storage_lens_configuration_tagging]:
+    refused(lambda: call(AccountId=account, ConfigId="big\x00"), "InvalidRequest")
+refused(lambda: control.put_storage_lens_configuration_tagging(AccountId=account, ConfigId="big\x00",
+    Tags=[{"Key": "a", "Value": "1"}]), "InvalidRequest")
+refused(lambda: control.get_storage_lens_configuration(AccountId=account, ConfigId="a*b"), "InvalidRequest")
+assert len(control.get_storage_lens_configuration(AccountId=account, ConfigId="big")[
+    "StorageLensConfiguration"]["Include"]["Buckets"]) == 60
+assert len(control.list_storage_lens_configurations(AccountId=account)["StorageLensConfigurationList"]) == 50
 # Its account's own; a user's permissions name the configuration's ARN.
 refused(lambda: control.get_storage_lens_configuration(AccountId=other, ConfigId="main"), "AccessDenied")
 reader = client("s3control", reader_key, reader_secret)
