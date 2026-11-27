@@ -230,10 +230,13 @@ pub(crate) fn object_lambda_answered(
         role => {
             let mut point = answered(kind, uploaded, status, first_byte);
             let code = match role {
-                LambdaRole::Invoked => INVOKED_LAMBDA,
-                _ => PROXIED_REQUESTS,
+                LambdaRole::Invoked => Some(INVOKED_LAMBDA),
+                LambdaRole::Proxied => Some(PROXIED_REQUESTS),
+                _ => None,
             };
-            point.insert(code, Stats::of(1.0));
+            if let Some(code) = code {
+                point.insert(code, Stats::of(1.0));
+            }
             point
         }
     };

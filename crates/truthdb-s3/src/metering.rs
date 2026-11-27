@@ -61,6 +61,8 @@ pub(crate) struct LambdaSeen {
 /// What a request to an Object Lambda access point was.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LambdaRole {
+    /// Neither answered by its function nor passed on (refused first).
+    Unserved,
     /// Answered by its function.
     Invoked,
     /// Passed on to its supporting access point.

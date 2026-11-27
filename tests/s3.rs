@@ -20608,10 +20608,13 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
     let script = server.dir.join("object_lambda_gets.py");
     std::fs::write(&script, OBJECT_LAMBDA_GETS_SCRIPT).expect("script");
     let mut args = vec![server.s3_port.to_string(), account.clone(), key, secret];
+    let (_, outsider_key, outsider_secret) = account_with_key(&server, "lambda-outsider");
     for (user_key, user_secret) in users {
         args.push(user_key);
         args.push(user_secret);
     }
+    args.push(outsider_key);
+    args.push(outsider_secret);
     let mut child = Command::new(python)
         .arg("-I")
         .arg(&script)
@@ -20664,7 +20667,7 @@ import http.server
 import boto3, botocore.config, botocore.exceptions
 (port, account, key, secret, reader_key, reader_secret, noinvoke_key, noinvoke_secret,
     nogrant_key, nogrant_secret, function_key, function_secret, nopoint_key, nopoint_secret,
-    denied_key, denied_secret, tagless_key, tagless_secret) = sys.argv[1:19]
+    denied_key, denied_secret, tagless_key, tagless_secret, outsider_key, outsider_secret) = sys.argv[1:21]
 # Every *.s3.test name is the local listener.
 resolve = socket.getaddrinfo
 socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1" if host.endswith("s3.test") else host, *rest, **kw)
@@ -21106,6 +21109,29 @@ assert got_event["eventSource"] == "s3-object-lambda.amazonaws.com", got_event
 assert got_event["resources"] == [{"accountId": account, "type": "AWS::S3ObjectLambda::AccessPoint",
     "ARN": counted_arn}], got_event
 assert got_event["requestParameters"]["key"] == "doc", got_event
+# Another account, refused through its alias: in its own event, no access
+# point and no account but its own (it gave the alias, which names none);
+# counted in the access point's requests and errors, not as an invocation.
+outsider_s3 = client("s3", outsider_key, outsider_secret)
+outsider_ct = client("cloudtrail", outsider_key, outsider_secret)
+outsider_s3.create_bucket(Bucket="outsider-trail")
+outsider_ct.create_trail(Name="watching", S3BucketName="outsider-trail")
+outsider_ct.put_event_selectors(TrailName="watching", AdvancedEventSelectors=[{"Name": "data", "FieldSelectors": [
+    {"Field": "eventCategory", "Equals": ["Data"]},
+    {"Field": "resources.type", "Equals": ["AWS::S3ObjectLambda::AccessPoint", "AWS::S3::Object"]}]}])
+outsider_ct.start_logging(Name="watching")
+refused(lambda: outsider_s3.get_object(Bucket=counted, Key="doc"), "AccessDenied")
+def outsider_records():
+    out = []
+    for o in outsider_s3.list_objects_v2(Bucket="outsider-trail").get("Contents", []):
+        out += json.loads(gzip.decompress(outsider_s3.get_object(Bucket="outsider-trail", Key=o["Key"])["Body"].read()))["Records"]
+    return [r for r in out if r["eventName"] == "GetObject"]
+wait_for(lambda: outsider_records())
+seen_by_outsider = outsider_records()[0]
+assert account not in json.dumps(seen_by_outsider["resources"]) and "s3-object-lambda:" not in json.dumps(seen_by_outsider), \
+    seen_by_outsider
+wait_for(lambda: total("4xxErrors", "counted", function_arn) == 1)
+assert (total("AllRequests", "counted", function_arn), total("InvokedLambda", "counted", function_arn)) == (3, 2)
 # The passed-on HEAD, and the function's own read: the supporting access
 # point's, on its bucket.
 headed_event = headed_events()[0]

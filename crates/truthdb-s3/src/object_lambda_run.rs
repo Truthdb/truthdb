@@ -276,22 +276,18 @@ pub(crate) async fn serve(
     let point = &via.point;
     let point_arn = lambda_arn(&state.region, &point.account, &point.name);
     // Counted in its own metrics, if they are on: by where it gets its data
-    // (its function, or its supporting access point).
-    if via.configuration.metrics
-        && let Some(seen) = crate::metering::seen_of(held)
-    {
-        let (source, role) = match (action, transformation) {
-            (Some(_), Some(transformation)) => (
-                canonical_function(&state.region, &point.account, &transformation.function_arn),
-                crate::metering::LambdaRole::Invoked,
-            ),
-            _ => (
-                via.configuration.supporting.clone(),
-                crate::metering::LambdaRole::Proxied,
-            ),
-        };
-        seen.mark_lambda(lambda_seen(point, source, role));
-    }
+    // (its function, or its supporting access point); as served only once
+    // it is (see `counted_as`).
+    let source = via
+        .configuration
+        .metrics
+        .then(|| match (action, transformation) {
+            (Some(_), Some(transformation)) => {
+                canonical_function(&state.region, &point.account, &transformation.function_arn)
+            }
+            _ => via.configuration.supporting.clone(),
+        });
+    counted_as(held, point, &source, crate::metering::LambdaRole::Unserved);
     let query = held.uri().query().unwrap_or("").to_string();
     let authz = Authz::load(
         state,
@@ -333,6 +329,12 @@ pub(crate) async fn serve(
             "NoSuchAccessPoint" => no_supporting_point(),
             _ => err,
         })?;
+        counted_as(
+            request,
+            point,
+            &source,
+            crate::metering::LambdaRole::Proxied,
+        );
         // Every check the operation makes is made here too (see
         // `Authz::through_lambda`).
         request.extensions_mut().insert(crate::authz::LambdaGate {
@@ -532,6 +534,7 @@ pub(crate) async fn serve(
     });
     event[context_key] = context;
     let event = event.to_string();
+    counted_as(held, point, &source, crate::metering::LambdaRole::Invoked);
     let delivery = format!("object-lambda/{request_id}");
     if action != "GetObject" {
         // Answered by what the function returns.
@@ -676,6 +679,19 @@ fn canonical_function(region: &str, account: &str, arn: &str) -> String {
             canonical
         }
         None => arn.to_string(),
+    }
+}
+
+/// Marks `request` (to Object Lambda access point `point`) as its metrics
+/// count it, from `source`, if they are on.
+fn counted_as<B>(
+    request: &Request<B>,
+    point: &ObjectLambdaPoint,
+    source: &Option<String>,
+    role: crate::metering::LambdaRole,
+) {
+    if let (Some(source), Some(seen)) = (source, crate::metering::seen_of(request)) {
+        seen.mark_lambda(lambda_seen(point, source.clone(), role));
     }
 }
 

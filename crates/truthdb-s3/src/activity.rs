@@ -561,6 +561,17 @@ fn record(
         Some(through) if hidden => (through.given.as_ref(), None, None),
         through => (call.bucket.as_ref(), through, owner),
     };
+    // Answered by an Object Lambda access point's function: the access
+    // point (and its account) only in its own account's event, the caller
+    // having given its alias, which names no account.
+    let answered_by = call
+        .answered_by
+        .as_ref()
+        .filter(|(_, point_account)| recipient == point_account);
+    let owner = match (&call.answered_by, answered_by) {
+        (Some(_), None) => None,
+        _ => owner,
+    };
     let (principal, signed) = who;
     let account = &principal.account;
     let identity = match &principal.user {
@@ -636,7 +647,7 @@ fn record(
         "recipientAccountId": recipient,
         "eventCategory": if call.data { "Data" } else { "Management" },
     });
-    if let Some((arn, point_account)) = &call.answered_by {
+    if let Some((arn, point_account)) = answered_by {
         // Object Lambda's: on its access point (no bucket was acted on).
         record["resources"] = json!([{
             "accountId": point_account,
