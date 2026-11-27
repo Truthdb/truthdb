@@ -234,73 +234,21 @@ fn plan(
     steps
 }
 
-/// Seconds since the epoch of an ISO 8601 `YYYY-MM-DDTHH:MM:SS[.fff]Z`.
-fn iso_seconds(text: &str) -> Option<u64> {
-    let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
-    // Howard Hinnant's days-from-civil.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
-}
-
-/// The keys of the credentials file's `profile`.
-fn file_keys(profile: &str) -> Result<Option<(String, String)>> {
-    let path = match std::env::var_os("AWS_SHARED_CREDENTIALS_FILE") {
-        Some(path) => PathBuf::from(path),
-        None => match std::env::var_os("HOME") {
-            Some(home) => Path::new(&home).join(".aws/credentials"),
-            None => return Ok(None),
-        },
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
-    };
-    Ok(profile_keys(&text, profile))
-}
-
-/// `aws_access_key_id` and `aws_secret_access_key` of `[profile]` in an
-/// INI credentials file.
-fn profile_keys(text: &str, profile: &str) -> Option<(String, String)> {
-    let mut section = String::new();
-    let (mut id, mut secret) = (None, None);
-    for line in text.lines().map(str::trim) {
-        if let Some(name) = line
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            section = name.trim().to_string();
-        } else if section == profile
-            && let Some((name, value)) = line.split_once('=')
-        {
-            match name.trim() {
-                "aws_access_key_id" => id = Some(value.trim().to_string()),
-                "aws_secret_access_key" => secret = Some(value.trim().to_string()),
-                _ => {}
-            }
-        }
-    }
-    Some((id?, secret?))
-}
-
 fn client(connection: &Connection) -> Result<Client> {
     let (access_key, secret) = match (&connection.access_key, &connection.secret_key) {
         (Some(id), Some(secret)) => (id.clone(), secret.clone()),
         (Some(_), None) | (None, Some(_)) => {
             bail!("give both an access key and a secret key, or neither")
         }
-        (None, None) => file_keys(&connection.profile)?.ok_or_else(|| {
-            anyhow!(
-                "no keys: give --access-key and --secret-key, set AWS_ACCESS_KEY_ID and \
+        (None, None) => {
+            truthdb_s3client::credentials_file_keys(&connection.profile).ok_or_else(|| {
+                anyhow!(
+                    "no keys: give --access-key and --secret-key, set AWS_ACCESS_KEY_ID and \
                  AWS_SECRET_ACCESS_KEY, or add profile [{}] to ~/.aws/credentials",
-                connection.profile
-            )
-        })?,
+                    connection.profile
+                )
+            })?
+        }
     };
     let region = connection
         .region
@@ -445,7 +393,7 @@ async fn remote_tree(
             .list_objects(bucket, prefix, None, next.as_deref())
             .await?;
         for object in page.objects {
-            let modified = iso_seconds(&object.last_modified)
+            let modified = truthdb_s3client::iso_seconds(&object.last_modified)
                 .ok_or_else(|| anyhow!("{} has no readable date", object.key))?;
             let relative = object
                 .key
@@ -1051,21 +999,6 @@ mod tests {
             }
         );
         assert_eq!(location("./d"), Location::Local(PathBuf::from("./d")));
-        assert_eq!(iso_seconds("1970-01-01T00:00:00.000Z"), Some(0));
-        assert_eq!(iso_seconds("2013-05-24T00:00:01Z"), Some(1_369_353_601));
-        assert_eq!(iso_seconds("2000-03-01T00:00:00Z"), Some(951_868_800));
-        assert_eq!(iso_seconds("nonsense"), None);
-        let file = "[default]\naws_access_key_id = A\naws_secret_access_key=S\n\n[other]\n\
-                    aws_access_key_id=B\naws_secret_access_key = T\n";
-        assert_eq!(
-            profile_keys(file, "other"),
-            Some(("B".to_string(), "T".to_string()))
-        );
-        assert_eq!(
-            profile_keys(file, "default"),
-            Some(("A".to_string(), "S".to_string()))
-        );
-        assert_eq!(profile_keys(file, "missing"), None);
         assert_eq!(folder("a"), "a/");
         assert_eq!(folder(""), "");
     }

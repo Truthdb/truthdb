@@ -1,0 +1,15 @@
+[package]
+name = "truthdb-mount"
+version = "0.1.0"
+edition = "2024"
+description = "Mounts an S3 bucket (of TruthDB or any S3 service) as a local file system, with Mountpoint for Amazon S3's semantics."
+license = "MIT"
+
+[dependencies]
+fuser = "0.19.0"
+truthdb-s3client = { workspace = true }
+tokio = { workspace = true }
+clap = { version = "4.5.53", features = ["derive", "env"] }
+anyhow = "1.0.100"
+bytes = "1"
+libc = { workspace = true }
