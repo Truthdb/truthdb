@@ -384,7 +384,16 @@ pub async fn dispatch(
         }
         None => {}
     }
+    // Through an Object Lambda access point (by its alias): served there.
+    if let Some(via) =
+        crate::object_lambda_run::resolve(state, &request, auth.principal.as_ref()).await?
+    {
+        return crate::object_lambda_run::serve(state, request, auth, via).await;
+    }
     crate::access_points::resolve(state, &mut request, auth.principal.as_ref()).await?;
+    // A request through a URL presigned for an Object Lambda function: its
+    // mark checked, it is one made through Object Lambda.
+    let called_via = crate::object_lambda_run::called_via(&request, &auth)?;
     let target = target(&request)?;
     let via = request
         .extensions()
@@ -459,6 +468,10 @@ pub async fn dispatch(
     let authz = match &auth.session {
         Some(scope) => authz.with_session(scope.clone()),
         None => authz,
+    };
+    let authz = match called_via {
+        true => authz.with_keys(&crate::object_lambda_run::called_via_keys()),
+        false => authz,
     };
     let authz = match via {
         Some(via) => authz.through(state, via, objects).await?,

@@ -711,7 +711,7 @@ pub async fn put_object(
 
 /// A response body fed by a channel: the reader task pushes chunks as it
 /// reads them.
-struct ChannelBody(mpsc::Receiver<Bytes>);
+pub(crate) struct ChannelBody(pub(crate) mpsc::Receiver<Bytes>);
 
 impl http_body::Body for ChannelBody {
     type Data = Bytes;

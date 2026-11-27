@@ -20540,6 +20540,386 @@ print("ok")
 "#;
 
 #[test]
+fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "lambdas");
+    let lambda_arn = |name: &str| format!("arn:aws:lambda:us-east-1:{account}:function:{name}");
+    let point = format!("arn:aws:s3-object-lambda:us-east-1:{account}:accesspoint/shaper");
+    let supporting = format!("arn:aws:s3:us-east-1:{account}:accesspoint/reader");
+    let called_via =
+        r#"{"ForAnyValue:StringEquals": {"aws:CalledVia": ["s3-object-lambda.amazonaws.com"]}}"#;
+    let reader = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+        {{"Effect": "Allow", "Action": "s3-object-lambda:GetObject", "Resource": "{point}"}},
+        {{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": "{}", "Condition": {called_via}}},
+        {{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "{supporting}/object/*", "Condition": {called_via}}}]}}"#,
+        lambda_arn("shape")
+    );
+    let no_invoke = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+        {{"Effect": "Allow", "Action": "s3-object-lambda:GetObject", "Resource": "{point}"}},
+        {{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "{supporting}/object/*"}}]}}"#
+    );
+    let writer = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3-object-lambda:WriteGetObjectResponse", "Resource": "*"}]}"#;
+    let no_point = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+        {{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": "{}"}},
+        {{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "{supporting}/object/*"}}]}}"#,
+        lambda_arn("shape")
+    );
+    let users: Vec<(String, String)> = [
+        ("reader", Some(reader.as_str())),
+        ("noinvoke", Some(no_invoke.as_str())),
+        ("nogrant", None),
+        ("function", Some(writer)),
+        ("nopoint", Some(no_point.as_str())),
+    ]
+    .into_iter()
+    .map(|(name, policy)| user_with_key(&server, &account, name, policy))
+    .collect();
+    let script = server.dir.join("object_lambda_gets.py");
+    std::fs::write(&script, OBJECT_LAMBDA_GETS_SCRIPT).expect("script");
+    let mut args = vec![server.s3_port.to_string(), account.clone(), key, secret];
+    for (user_key, user_secret) in users {
+        args.push(user_key);
+        args.push(user_secret);
+    }
+    let mut child = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run python");
+    // The functions' server, then their topics and webhooks.
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut line).expect("the functions' port");
+    let port: u16 = line
+        .trim()
+        .strip_prefix("PORT ")
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("not a port: {line}"));
+    for function in ["shape", "early"] {
+        native(
+            server.native_port,
+            &format!("stream create topic {function} account {account}"),
+        );
+        native(
+            server.native_port,
+            &format!(
+                "stream create webhook {function} url http://127.0.0.1:{port}/{function} secret s3cret"
+            ),
+        );
+    }
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"go\n")
+        .expect("go");
+    let output = child.wait_with_output().expect("python");
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).expect("stdout");
+    assert!(
+        output.status.success() && rest.contains("ok"),
+        "{rest}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const OBJECT_LAMBDA_GETS_SCRIPT: &str = r#"
+import json, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import http.server
+import boto3, botocore.config, botocore.exceptions
+(port, account, key, secret, reader_key, reader_secret, noinvoke_key, noinvoke_secret,
+    nogrant_key, nogrant_secret, function_key, function_secret, nopoint_key, nopoint_secret) = sys.argv[1:15]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1" if host.endswith("s3.test") else host, *rest, **kw)
+def client(service, access, secret_key, endpoint="s3.test"):
+    return boto3.client(service, endpoint_url=f"http://{endpoint}:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+        return error.response
+writer = client("s3", function_key, function_secret)
+events, answers = [], []
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
+import http.client
+def signed(method, path, query, credentials, body=b"", headers=None, service="s3", host=None):
+    host = host or f"s3.test:{port}"
+    request = AWSRequest(method=method, url=f"http://{host}{path}" + (f"?{query}" if query else ""),
+        data=body, headers=dict(headers or {}))
+    S3SigV4Auth(Credentials(*credentials), service, "us-east-1").add_auth(request)
+    return request
+def send(request, sized=True):
+    parsed = urllib.parse.urlsplit(request.url)
+    connection = http.client.HTTPConnection("127.0.0.1", int(port))
+    headers = dict(request.headers)
+    headers.setdefault("Host", parsed.netloc)
+    target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    if sized:
+        connection.putrequest(request.method, target, skip_host=True, skip_accept_encoding=True)
+        for name, value in headers.items():
+            connection.putheader(name, value)
+        connection.putheader("Content-Length", str(len(request.body or b"")))
+        connection.endheaders(request.body or b"")
+    else:
+        connection.putrequest(request.method, target, skip_host=True, skip_accept_encoding=True)
+        for name, value in headers.items():
+            connection.putheader(name, value)
+        connection.putheader("Transfer-Encoding", "chunked")
+        connection.endheaders()
+        body = request.body or b""
+        connection.send(b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
+    answer = connection.getresponse()
+    return answer.status, dict(answer.getheaders()), answer.read()
+# A WriteGetObjectResponse sent by hand: headers of its choosing, and with
+# its length or not.
+def raw_answer(context, headers, body, sized):
+    headers = dict(headers, **{"x-amz-request-route": context["outputRoute"],
+        "x-amz-request-token": context["outputToken"], "x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+    request = signed("POST", "/WriteGetObjectResponse", "", (function_key, function_secret), body, headers,
+        service="s3-object-lambda", host=f"{context['outputRoute']}.s3.test:{port}")
+    return send(request, sized)[0]
+# The functions: "shape" answers with the object upper-cased (or its range,
+# or an error, or what reading it gave); "early" returns without answering.
+class Function(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_POST(self):
+        event = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        events.append((self.path, event))
+        context = event["getObjectContext"]
+        if self.path == "/shape":
+            answer = {"RequestRoute": context["outputRoute"], "RequestToken": context["outputToken"]}
+            url = context["inputS3Url"]
+            key = urllib.parse.urlparse(event["userRequest"]["url"]).path.split("/")[-1]
+            try:
+                original = urllib.request.urlopen(url).read()
+            except urllib.error.HTTPError as error:
+                original = f"read: {error.code}".encode()
+            ranged = {k.lower(): v for k, v in event["userRequest"]["headers"].items()}.get("range")
+            if key in ("unsized", "cookie"):
+                headers = {"x-amz-fwd-header-Content-Type": "text/plain", "x-amz-fwd-header-Set-Cookie": "taken=yes"}
+                answers.append(raw_answer(context, headers, original.upper(), sized=key == "cookie"))
+            elif key == "secret":
+                writer.write_get_object_response(StatusCode=403, ErrorCode="NoSecretsHere",
+                    ErrorMessage="not this one", **answer)
+            elif ranged:
+                first, last = ranged.split("=")[1].split("-")
+                writer.write_get_object_response(StatusCode=206, Body=original.upper()[int(first):int(last) + 1],
+                    ContentRange=f"bytes {first}-{last}/{len(original)}", **answer)
+            else:
+                writer.write_get_object_response(Body=original.upper(), ContentType="text/plain",
+                    Metadata={"shaped": "yes"}, **answer)
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+functions = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Function)
+threading.Thread(target=functions.serve_forever, daemon=True).start()
+print(f"PORT {functions.server_address[1]}", flush=True)
+sys.stdin.readline()
+s3, control = client("s3", key, secret), client("s3control", key, secret)
+s3.create_bucket(Bucket="data")
+for name, body in [("doc", b"hello"), ("secret", b"x"), ("unsized", b"u"), ("cookie", b"c"), ("a b+c.txt", b"odd")]:
+    s3.put_object(Bucket="data", Key=name, Body=body)
+supporting = control.create_access_point(AccountId=account, Name="reader", Bucket="data")["Alias"]
+# The bucket delegating to its account's access points.
+s3.put_bucket_policy(Bucket="data", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": "*", "Action": "*", "Resource": ["arn:aws:s3:::data", "arn:aws:s3:::data/*"],
+     "Condition": {"StringEquals": {"s3:DataAccessPointAccount": account}}}]}))
+def configuration(function, features=()):
+    return {"SupportingAccessPoint": f"arn:aws:s3:us-east-1:{account}:accesspoint/reader",
+        "AllowedFeatures": list(features), "TransformationConfigurations": [{"Actions": ["GetObject"],
+        "ContentTransformation": {"AwsLambda": {"FunctionArn": f"arn:aws:lambda:us-east-1:{account}:function:{function}",
+            "FunctionPayload": '{"mode": "upper"}'}}}]}
+made = control.create_access_point_for_object_lambda(AccountId=account, Name="shaper", Configuration=configuration("shape"))
+alias, arn = made["Alias"]["Value"], made["ObjectLambdaAccessPointArn"]
+# By its alias, and by its ARN (the Object Lambda endpoint's host).
+got = s3.get_object(Bucket=alias, Key="doc")
+assert got["Body"].read() == b"HELLO" and got["ContentType"] == "text/plain" and got["Metadata"] == {"shaped": "yes"}, got
+path, event = events[-1]
+assert path == "/shape" and event["xAmzRequestId"] == got["ResponseMetadata"]["RequestId"], event
+assert event["protocolVersion"] == "1.00" and event["getObjectContext"]["outputRoute"] == "io-truthdb", event
+assert event["configuration"] == {"accessPointArn": arn, "supportingAccessPointArn":
+    f"arn:aws:s3:us-east-1:{account}:accesspoint/reader", "payload": '{"mode": "upper"}'}, event
+assert event["userIdentity"]["arn"] == f"arn:aws:iam::{account}:root", event
+assert "authorization" not in {k.lower() for k in event["userRequest"]["headers"]}, event
+assert event["userRequest"]["url"].endswith(f"/{alias}/doc"), event
+lambdas = client("s3", key, secret, "s3-object-lambda.us-east-1.s3.test")
+assert lambdas.get_object(Bucket=arn, Key="doc")["Body"].read() == b"HELLO"
+# A key S3 encodes, signed as S3 signs it (once).
+assert lambdas.get_object(Bucket=arn, Key="a b+c.txt")["Body"].read() == b"ODD"
+# A caller's own presigned URL: the function is not told its signature.
+own = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+presigned = own.generate_presigned_url("get_object", Params={"Bucket": alias, "Key": "doc", "VersionId": "null"})
+assert urllib.request.urlopen(presigned).read() == b"HELLO"
+told = events[-1][1]["userRequest"]["url"]
+assert "versionId=null" in told and "X-Amz-" not in told and "x-amz-" not in told, told
+# A query parameter name encoded: refused, as on any request.
+status, _, answer = send(signed("GET", "/doc", "partN%75mber=2", (key, secret), service="s3-object-lambda",
+    host=f"shaper-{account}.s3-object-lambda.us-east-1.s3.test:{port}"))
+assert status == 400 and b"<Code>InvalidArgument</Code>" in answer, (status, answer)
+# A user its own policies allow: through Object Lambda only (the supporting
+# access point's grant needs aws:CalledVia).
+reader = client("s3", reader_key, reader_secret)
+assert reader.get_object(Bucket=alias, Key="doc")["Body"].read() == b"HELLO"
+assert events[-1][1]["userIdentity"]["arn"] == f"arn:aws:iam::{account}:user/reader"
+refused(lambda: reader.get_object(Bucket=supporting, Key="doc"), "AccessDenied")
+# The URL the function was given, with its mark: good as it is (for its
+# validity), not for another request. Sent signed in a header instead, as a
+# PUT or as a GET, it is no request through Object Lambda.
+given = [e for _, e in events if e["userIdentity"]["arn"].endswith("user/reader")][-1]["getObjectContext"]["inputS3Url"]
+assert urllib.request.urlopen(given).read() == b"hello"
+parsed = urllib.parse.urlsplit(given)
+kept = "&".join(part for part in parsed.query.split("&")
+    if part.split("=")[0] in ("X-Amz-Date", "X-Amz-Expires", "x-truthdb-object-lambda"))
+for method, body in [("PUT", b"overwritten"), ("GET", b"")]:
+    status, _, answer = send(signed(method, parsed.path, kept, (reader_key, reader_secret), body))
+    assert status == 403 and b"<Code>AccessDenied</Code>" in answer, (method, status, answer)
+# Nor with the whole presigned query but its signature, signed in a header.
+whole = "&".join(part for part in parsed.query.split("&") if not part.startswith("X-Amz-Signature="))
+status, _, answer = send(signed("PUT", parsed.path, whole, (reader_key, reader_secret), b"overwritten"))
+assert status == 403 and b"<Code>AccessDenied</Code>" in answer, (status, answer)
+assert s3.get_object(Bucket="data", Key="doc")["Body"].read() == b"hello"
+# The given mark on a URL the reader presigns afresh (a new signing time):
+# refused, the mark being of the URL it was made for.
+mark_param = [part for part in parsed.query.split("&") if part.startswith("x-truthdb-object-lambda=")][0]
+fresh = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=reader_key, aws_secret_access_key=reader_secret,
+    config=botocore.config.Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+fresh.meta.events.register("before-sign.s3.GetObject", lambda request, **_: setattr(request, "url",
+    request.url + ("&" if "?" in request.url else "?") + mark_param))
+time.sleep(1.1)
+again = fresh.generate_presigned_url("get_object", Params={"Bucket": supporting, "Key": "doc"})
+try:
+    urllib.request.urlopen(again)
+    raise SystemExit("a mark was taken on another URL")
+except urllib.error.HTTPError as error:
+    assert error.code == 403 and b"<Code>AccessDenied</Code>" in error.read(), error
+# A URL the reader presigns itself with a mark of its own making: refused.
+presigner = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=reader_key, aws_secret_access_key=reader_secret,
+    config=botocore.config.Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+def forge(request, **kw):
+    request.url += ("&" if "?" in request.url else "?") + "x-truthdb-object-lambda=" + "0" * 64
+presigner.meta.events.register("before-sign.s3.GetObject", forge)
+forged = presigner.generate_presigned_url("get_object", Params={"Bucket": supporting, "Key": "doc"})
+assert "x-truthdb-object-lambda=" in forged, forged
+try:
+    urllib.request.urlopen(forged)
+    raise SystemExit("a forged mark was taken")
+except urllib.error.HTTPError as error:
+    assert error.code == 403 and b"<Code>AccessDenied</Code>" in error.read(), error
+# Not allowed to invoke the function, or to use the access point at all.
+refused(lambda: client("s3", noinvoke_key, noinvoke_secret).get_object(Bucket=alias, Key="doc"), "AccessDenied")
+refused(lambda: client("s3", nogrant_key, nogrant_secret).get_object(Bucket=alias, Key="doc"), "AccessDenied")
+refused(lambda: client("s3", nopoint_key, nopoint_secret).get_object(Bucket=alias, Key="doc"), "AccessDenied")
+def anonymous(path):
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}{path}")
+        raise SystemExit(f"served: {path}")
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
+status, body = anonymous(f"/{alias}/doc")
+assert status == 403 and "<Code>AccessDenied</Code>" in body, (status, body)
+# The function's own headers: only those WriteGetObjectResponse forwards;
+# and its length must be given.
+cookie = s3.get_object(Bucket=alias, Key="cookie")
+assert cookie["Body"].read() == b"C" and cookie["ContentType"] == "text/plain", cookie
+assert "set-cookie" not in cookie["ResponseMetadata"]["HTTPHeaders"], cookie
+def answered(count):
+    deadline = time.time() + 10
+    while len(answers) < count:
+        assert time.time() < deadline, answers
+        time.sleep(0.05)
+    return answers[count - 1]
+assert answered(1) == 200, answers
+refused(lambda: s3.get_object(Bucket=alias, Key="unsized"), "InternalError")
+assert answered(2) == 411, answers
+# A directory bucket's session: not through Object Lambda.
+express = boto3.client("s3", endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret, config=botocore.config.Config(
+    s3={"addressing_style": "path", "disable_s3_express_session_auth": True}))
+express.create_bucket(Bucket="dir--use1-az4--x-s3", CreateBucketConfiguration={
+    "Location": {"Type": "AvailabilityZone", "Name": "use1-az4"},
+    "Bucket": {"Type": "Directory", "DataRedundancy": "SingleAvailabilityZone"}})
+made_session = s3.create_session(Bucket="dir--use1-az4--x-s3")["Credentials"]
+for endpoint, bucket in [("s3.test", alias), ("s3-object-lambda.us-east-1.s3.test", arn)]:
+    session = client("s3", made_session["AccessKeyId"], made_session["SecretAccessKey"], endpoint)
+    session.meta.events.register("before-sign.s3", lambda request, **_:
+        request.headers.__setitem__("x-amz-s3session-token", made_session["SessionToken"]))
+    refused(lambda: session.get_object(Bucket=bucket, Key="doc"), "AccessDenied")
+    # Nor its WriteGetObjectResponse.
+    refused(lambda: session.write_get_object_response(RequestRoute="io-truthdb", RequestToken="nothing",
+        Body=b"x"), "AccessDenied")
+# The function's error is the caller's.
+error = refused(lambda: s3.get_object(Bucket=alias, Key="secret"), "NoSecretsHere")
+assert error["Error"]["Message"] == "not this one" and error["ResponseMetadata"]["HTTPStatusCode"] == 403, error
+# A range only as its features allow; then the function serves it.
+refused(lambda: s3.get_object(Bucket=alias, Key="doc", Range="bytes=0-1"), "NotImplemented")
+control.put_access_point_configuration_for_object_lambda(AccountId=account, Name="shaper",
+    Configuration=configuration("shape", ["GetObject-Range"]))
+ranged = s3.get_object(Bucket=alias, Key="doc", Range="bytes=1-2")
+assert ranged["Body"].read() == b"EL" and ranged["ResponseMetadata"]["HTTPStatusCode"] == 206, ranged
+refused(lambda: s3.get_object(Bucket=alias, Key="doc", PartNumber=1), "NotImplemented")
+# A function that returns without answering: a 500.
+quick = control.create_access_point_for_object_lambda(AccountId=account, Name="quick",
+    Configuration=configuration("early"))["Alias"]["Value"]
+started = time.time()
+error = refused(lambda: s3.get_object(Bucket=quick, Key="doc"), "InternalError")
+assert error["ResponseMetadata"]["HTTPStatusCode"] == 500 and time.time() - started < 10, error
+# A function of no topic: a 500 too.
+control.create_access_point_for_object_lambda(AccountId=account, Name="nowhere",
+    Configuration=configuration("missing"))
+nowhere = control.get_access_point_for_object_lambda(AccountId=account, Name="nowhere")["Alias"]["Value"]
+refused(lambda: s3.get_object(Bucket=nowhere, Key="doc"), "InternalError")
+# Another account's function: not the access point's to invoke.
+theirs = configuration("shape")
+theirs["TransformationConfigurations"][0]["ContentTransformation"]["AwsLambda"]["FunctionArn"] = \
+    "arn:aws:lambda:us-east-1:999999999999:function:shape"
+control.put_access_point_configuration_for_object_lambda(AccountId=account, Name="nowhere", Configuration=theirs)
+refused(lambda: s3.get_object(Bucket=nowhere, Key="doc"), "InternalError")
+# Not yet served through it: other operations.
+refused(lambda: s3.put_object(Bucket=alias, Key="new", Body=b"n"), "NotImplemented")
+refused(lambda: s3.head_object(Bucket=alias, Key="doc"), "501")
+refused(lambda: s3.list_objects_v2(Bucket=alias), "NotImplemented")
+# WriteGetObjectResponse: only with a token waiting, and as allowed.
+refused(lambda: writer.write_get_object_response(RequestRoute="io-truthdb", RequestToken="nothing", Body=b"x"),
+    "InvalidRequest")
+refused(lambda: client("s3", nogrant_key, nogrant_secret).write_get_object_response(RequestRoute="io-truthdb",
+    RequestToken="nothing", Body=b"x"), "AccessDenied")
+# An unknown name through it.
+refused(lambda: s3.get_object(Bucket="nothing-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa--ol-s3", Key="doc"), "NoSuchBucket")
+refused(lambda: lambdas.get_object(Bucket=f"arn:aws:s3-object-lambda:us-east-1:{account}:accesspoint/nothing", Key="doc"),
+    "NoSuchAccessPoint")
+# Its supporting access point deleted: not there to read through.
+control.delete_access_point(AccountId=account, Name="reader")
+refused(lambda: s3.get_object(Bucket=alias, Key="doc"), "NoSuchAccessPoint")
+print("ok")
+"#;
+
+#[test]
 fn requests_through_an_access_point_act_on_its_bucket_as_both_allow() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
