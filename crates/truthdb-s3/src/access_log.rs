@@ -484,6 +484,7 @@ fn target_of(
     if file
         .bucket(&config.target_bucket)?
         .is_none_or(|target| target.owner != owner || target.object_lock)
+        || crate::request_payment::requester_pays(file, &config.target_bucket)?
     {
         return Ok(None);
     }

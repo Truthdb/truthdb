@@ -190,10 +190,44 @@ impl BucketRequests {
     }
 }
 
-/// Every bucket's counters.
+/// What a Requester Pays bucket's requester was charged for: its requests
+/// and their bytes.
+#[derive(Debug, Default)]
+pub struct ChargedRequests {
+    requests: AtomicU64,
+    bytes_downloaded: AtomicU64,
+    bytes_uploaded: AtomicU64,
+}
+
+impl ChargedRequests {
+    /// A request charged, with the bytes it uploaded.
+    pub fn answered(&self, uploaded: u64) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.bytes_uploaded.fetch_add(uploaded, Ordering::Relaxed);
+    }
+
+    /// The bytes its answer's body sent.
+    pub fn finished(&self, downloaded: u64) {
+        self.bytes_downloaded
+            .fetch_add(downloaded, Ordering::Relaxed);
+    }
+
+    /// Its requests, bytes downloaded and bytes uploaded.
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.requests.load(Ordering::Relaxed),
+            self.bytes_downloaded.load(Ordering::Relaxed),
+            self.bytes_uploaded.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Every bucket's counters, and what each Requester Pays bucket's
+/// requesters were charged for, by bucket and account.
 #[derive(Debug, Default)]
 pub struct RequestMetrics {
     buckets: RwLock<HashMap<String, Arc<BucketRequests>>>,
+    charged: RwLock<HashMap<(String, String), Arc<ChargedRequests>>>,
 }
 
 impl RequestMetrics {
@@ -218,6 +252,43 @@ impl RequestMetrics {
             ""
         };
         Arc::clone(buckets.entry(name.to_string()).or_default())
+    }
+
+    /// What `account` was charged for by Requester Pays bucket `bucket`
+    /// (counted under "" and "" once `MAX_BUCKETS` others are).
+    pub fn charged(&self, bucket: &str, account: &str) -> Arc<ChargedRequests> {
+        let key = (bucket.to_string(), account.to_string());
+        if let Some(found) = self
+            .charged
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+        {
+            return Arc::clone(found);
+        }
+        let mut charged = self
+            .charged
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = if charged.len() < MAX_BUCKETS || charged.contains_key(&key) {
+            key
+        } else {
+            (String::new(), String::new())
+        };
+        Arc::clone(charged.entry(key).or_default())
+    }
+
+    /// What each requester was charged for, by bucket and account.
+    pub fn charged_snapshot(&self) -> Vec<((String, String), Arc<ChargedRequests>)> {
+        let mut all: Vec<_> = self
+            .charged
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(key, counters)| (key.clone(), Arc::clone(counters)))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
     }
 
     /// Every bucket's counters, by name.

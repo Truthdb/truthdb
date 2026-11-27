@@ -21154,6 +21154,156 @@ print("ok")
 "#;
 
 #[test]
+fn requester_pays_buckets_ask_other_accounts_to_say_they_pay() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "paying");
+    let (other, other_key, other_secret) = account_with_key(&server, "requesting");
+    let member_policy = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}"#;
+    let (member_key, member_secret) =
+        user_with_key(&server, &account, "member", Some(member_policy));
+    let script = server.dir.join("requester_pays.py");
+    std::fs::write(&script, REQUESTER_PAYS_SCRIPT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other,
+            &other_key,
+            &other_secret,
+            &member_key,
+            &member_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // What the requester was charged for: its successful requests to the
+    // Requester Pays bucket (the source of its copy among them), and their
+    // bytes (the answers' bodies: two reads of the object, the listing's and
+    // the copy's XML); nothing for the owner's account.
+    let rows = sql_rows(
+        server.native_port,
+        "SELECT bucket_name, requester_account, requests, bytes_downloaded, bytes_uploaded FROM sys.dm_s3_requester_charges",
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(
+        (
+            row[0].as_str(),
+            row[1].as_str(),
+            row[2].as_str(),
+            row[4].as_str()
+        ),
+        ("paid", other.as_str(), "6", "3"),
+        "{rows:?}"
+    );
+    assert!(row[3].parse::<u64>().unwrap() > 8, "{rows:?}");
+}
+
+const REQUESTER_PAYS_SCRIPT: &str = r#"
+import json, sys, urllib.error, urllib.request
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other, other_key, other_secret, member_key, member_secret = sys.argv[1:10]
+def client(access, secret_key, **config):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}, **config))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+        return error.response
+s3, theirs, member = client(key, secret), client(other_key, other_secret), client(member_key, member_secret)
+s3.create_bucket(Bucket="paid")
+s3.put_object(Bucket="paid", Key="o", Body=b"data")
+theirs.create_bucket(Bucket="mine")
+# Open to the other account, and to anyone for reads.
+s3.put_public_access_block(Bucket="paid", PublicAccessBlockConfiguration={"BlockPublicAcls": False,
+    "IgnorePublicAcls": False, "BlockPublicPolicy": False, "RestrictPublicBuckets": False})
+s3.put_bucket_policy(Bucket="paid", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{other}:root"}, "Action": "s3:*",
+     "Resource": ["arn:aws:s3:::paid", "arn:aws:s3:::paid/*"]},
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::paid/*"}]}))
+def anonymous(path):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as answer:
+            return answer.status
+    except urllib.error.HTTPError as error:
+        return error.code
+# The owner pays, by default.
+assert s3.get_bucket_request_payment(Bucket="paid")["Payer"] == "BucketOwner"
+assert anonymous("/paid/o") == 200
+# Only its owner sets it, whatever a policy allows.
+refused(lambda: theirs.put_bucket_request_payment(Bucket="paid",
+    RequestPaymentConfiguration={"Payer": "Requester"}), "AccessDenied")
+s3.put_bucket_request_payment(Bucket="paid", RequestPaymentConfiguration={"Payer": "Requester"})
+assert s3.get_bucket_request_payment(Bucket="paid")["Payer"] == "Requester"
+# Another account must say it pays: refused otherwise (a read, a listing, a
+# write, a copy from it), served and told it was charged when it does.
+refused(lambda: theirs.get_object(Bucket="paid", Key="o"), "AccessDenied")
+refused(lambda: theirs.head_object(Bucket="paid", Key="o"), "403")
+refused(lambda: theirs.list_objects_v2(Bucket="paid"), "AccessDenied")
+refused(lambda: theirs.put_object(Bucket="paid", Key="t", Body=b"new"), "AccessDenied")
+refused(lambda: theirs.copy_object(Bucket="mine", Key="c", CopySource={"Bucket": "paid", "Key": "o"}), "AccessDenied")
+got = theirs.get_object(Bucket="paid", Key="o", RequestPayer="requester")
+assert got["Body"].read() == b"data" and got["RequestCharged"] == "requester", got
+assert theirs.head_object(Bucket="paid", Key="o", RequestPayer="requester")["RequestCharged"] == "requester"
+listed = theirs.list_objects_v2(Bucket="paid", RequestPayer="requester")
+assert [o["Key"] for o in listed["Contents"]] == ["o"] and listed["RequestCharged"] == "requester", listed
+assert theirs.put_object(Bucket="paid", Key="t", Body=b"new", RequestPayer="requester")["RequestCharged"] == "requester"
+copied = theirs.copy_object(Bucket="mine", Key="c", CopySource={"Bucket": "paid", "Key": "o"}, RequestPayer="requester")
+assert copied["RequestCharged"] == "requester", copied
+# Presigned, with the parameter in the query.
+presigner = client(other_key, other_secret, signature_version="s3v4")
+presigner.meta.events.register("before-sign.s3.GetObject", lambda request, **_: setattr(request, "url",
+    request.url + ("&" if "?" in request.url else "?") + "x-amz-request-payer=requester"))
+url = presigner.generate_presigned_url("get_object", Params={"Bucket": "paid", "Key": "o"})
+with urllib.request.urlopen(url) as answer:
+    assert answer.read() == b"data" and answer.headers["x-amz-request-charged"] == "requester", dict(answer.headers)
+# Not anonymously, whatever its policy allows, even saying it pays.
+assert anonymous("/paid/o") == 403
+try:
+    urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/paid/o",
+        headers={"x-amz-request-payer": "requester"}))
+    raise SystemExit("served anonymously")
+except urllib.error.HTTPError as error:
+    assert error.code == 403, error
+# Its owner's account, a user's too, need not say it, and is not charged.
+mine = s3.get_object(Bucket="paid", Key="o")
+assert mine["Body"].read() == b"data" and "RequestCharged" not in mine, mine
+assert member.get_object(Bucket="paid", Key="o")["Body"].read() == b"data"
+# No Requester Pays bucket is a logging target.
+s3.create_bucket(Bucket="logged")
+refused(lambda: s3.put_bucket_logging(Bucket="logged", BucketLoggingStatus={"LoggingEnabled": {
+    "TargetBucket": "paid", "TargetPrefix": "l/"}}), "InvalidTargetBucketForLogging")
+# The owner pays again: the header is no longer asked for.
+s3.put_bucket_request_payment(Bucket="paid", RequestPaymentConfiguration={"Payer": "BucketOwner"})
+assert s3.get_bucket_request_payment(Bucket="paid")["Payer"] == "BucketOwner"
+plain = theirs.get_object(Bucket="paid", Key="o")
+assert plain["Body"].read() == b"data" and "RequestCharged" not in plain, plain
+assert anonymous("/paid/o") == 200
+refused(lambda: s3.put_bucket_request_payment(Bucket="paid", RequestPaymentConfiguration={"Payer": "Someone"}),
+    "MalformedXML")
+refused(lambda: s3.get_bucket_request_payment(Bucket="nothing-here"), "NoSuchBucket")
+print("ok")
+"#;
+
+#[test]
 fn requests_through_an_access_point_act_on_its_bucket_as_both_allow() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

@@ -46,6 +46,7 @@ pub mod public_access;
 pub mod rename;
 pub mod replication_config;
 pub mod replication_run;
+pub mod request_payment;
 pub mod restore;
 pub mod scope;
 pub mod selectors;

@@ -46,6 +46,9 @@ struct Seen {
     /// The Object Lambda access point whose function answered the request:
     /// its ARN and account.
     answered_by: Mutex<Option<(String, String)>>,
+    /// The Requester Pays buckets the request's requester is charged by, and
+    /// the requester's account.
+    charged: Mutex<Option<(Vec<String>, String)>>,
 }
 
 /// A request to an Object Lambda access point whose metrics are on (or a
@@ -139,6 +142,25 @@ impl BucketSeen {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|(bucket, _)| bucket.clone())
+    }
+
+    pub(crate) fn mark_charged(&self, buckets: Vec<String>, account: &str) {
+        *self
+            .0
+            .charged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((buckets, account.to_string()));
+    }
+
+    /// The Requester Pays buckets the request's requester is charged by, and
+    /// the requester's account.
+    pub(crate) fn charged(&self) -> Option<(Vec<String>, String)> {
+        self.0
+            .charged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn mark_answered_by(&self, arn: &str, account: &str) {
@@ -298,6 +320,8 @@ pub(crate) struct MeteredBody {
     /// The metric history's series the request counts in, and when it
     /// came (seconds).
     history: Vec<(Arc<MetricRecorder>, Matched, u64)>,
+    /// What its requester is charged for by Requester Pays buckets.
+    charged: Vec<Arc<truthdb_engine::metrics::ChargedRequests>>,
     /// The request's access log line, if its bucket's logging is on.
     log: Option<(
         Arc<crate::access_log::AccessLogger>,
@@ -313,6 +337,7 @@ impl MeteredBody {
         counters: Option<Arc<BucketRequests>>,
         started: Instant,
         history: Vec<(Arc<MetricRecorder>, Matched, u64)>,
+        charged: Vec<Arc<truthdb_engine::metrics::ChargedRequests>>,
         log: Option<(
             Arc<crate::access_log::AccessLogger>,
             crate::access_log::Entry,
@@ -323,6 +348,7 @@ impl MeteredBody {
             counters,
             started,
             history,
+            charged,
             log,
             sent: 0,
             done: false,
@@ -335,6 +361,9 @@ impl MeteredBody {
             let total = self.started.elapsed();
             if let Some(counters) = &self.counters {
                 counters.finished(self.sent, total);
+            }
+            for charged in &self.charged {
+                charged.finished(self.sent);
             }
             for (recorder, series, at) in &self.history {
                 recorder.record(
