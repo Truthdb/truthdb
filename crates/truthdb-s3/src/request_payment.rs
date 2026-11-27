@@ -120,11 +120,23 @@ pub async fn handle(
 /// request does not say its requester pays (an anonymous one always is);
 /// else the Requester Pays buckets its requester is charged by.
 pub(crate) fn check<B>(request: &Request<B>, authz: &Authz) -> Result<Vec<String>, S3Error> {
-    let says = request
-        .headers()
-        .get("x-amz-request-payer")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("requester"));
+    let says = says_requester_pays(
+        request
+            .headers()
+            .get("x-amz-request-payer")
+            .and_then(|value| value.to_str().ok()),
+    );
+    check_saying(says, authz)
+}
+
+/// Whether `value` (an `x-amz-request-payer`) says the requester pays.
+pub(crate) fn says_requester_pays(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("requester"))
+}
+
+/// [`check`] of a request that does (or does not) say its requester pays
+/// (a form upload says it in a field).
+pub(crate) fn check_saying(says: bool, authz: &Authz) -> Result<Vec<String>, S3Error> {
     let caller = authz.identity.account();
     let mut charged = Vec::new();
     for (bucket, owner) in authz.requester_pays() {

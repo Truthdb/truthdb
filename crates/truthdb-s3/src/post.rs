@@ -586,6 +586,23 @@ pub async fn post_object(
             }),
         );
     }
+    // A Requester Pays bucket's: its requester says it pays (in a field,
+    // or the header), or it is refused.
+    let charged = crate::request_payment::check_saying(
+        crate::request_payment::says_requester_pays(field(&fields, "x-amz-request-payer").or_else(
+            || {
+                headers
+                    .get("x-amz-request-payer")
+                    .and_then(|value| value.to_str().ok())
+            },
+        )),
+        &authz,
+    )?;
+    if !charged.is_empty()
+        && let (Some(seen), Some(account)) = (&seen, authz.identity.account())
+    {
+        seen.mark_charged(charged.clone(), account);
+    }
     // AWS lists no PostObject for directory buckets (and a form carries
     // what one does not support: tags, a customer key).
     if authz.zone(&bucket).is_some() {
@@ -714,6 +731,9 @@ pub async fn post_object(
         );
         if let Some(version) = version_header(versioning, info.version, info.null_version) {
             response = response.header("x-amz-version-id", version);
+        }
+        if !charged.is_empty() {
+            response = response.header("x-amz-request-charged", "requester");
         }
         if let Some(redirect) = redirect {
             let encode = |text: &str| {

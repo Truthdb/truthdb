@@ -639,6 +639,16 @@ pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) 
         Ok(authz) => authz,
         Err(err) => return page(&err, Some(&key), &ids, head_only),
     };
+    // A Requester Pays bucket is not served anonymously, as a website's
+    // requests are.
+    if !authz.requester_pays().is_empty() {
+        return page(
+            &S3Error::access_denied("Access Denied"),
+            Some(&key),
+            &ids,
+            head_only,
+        );
+    }
     let scope = crate::scope::Scope {
         key: None,
         buckets: authz.owners(),

@@ -975,9 +975,6 @@ impl ExternalStream for ActivityStream {
     }
 }
 
-/// `sys.dm_s3_requester_charges`: what each Requester Pays bucket's
-/// requesters were charged for since the server started, by bucket and
-/// requester's account: requests and their bytes.
 /// `sys.dm_s3_requests`: each bucket's S3 requests since the server started,
 /// by kind, their bytes and errors; `sys.dm_s3_request_latency`: their
 /// latencies (until the answer starts, until its last byte), as counts per
@@ -991,6 +988,9 @@ fn open_requests(
 ) -> Result<ExternalRowset, SqlError> {
     check_admin(name, caller)?;
     check_arg_count(name, args, 0, 0)?;
+    // `sys.dm_s3_requester_charges`: what each Requester Pays bucket's
+    // requesters were charged for since the server started, by bucket and
+    // requester's account: requests and their bytes.
     if name == "sys.dm_s3_requester_charges" {
         let rows = metrics
             .charged_snapshot()

@@ -482,8 +482,6 @@ impl Authz {
         Ok(())
     }
 
-    /// The owners the request's buckets had when they were loaded (for the
-    /// request's scope).
     /// The Requester Pays buckets the request names, and their owners.
     pub(crate) fn requester_pays(&self) -> Vec<(String, String)> {
         self.buckets
@@ -493,6 +491,8 @@ impl Authz {
             .collect()
     }
 
+    /// The owners the request's buckets had when they were loaded (for the
+    /// request's scope).
     pub fn owners(&self) -> Vec<(String, Option<String>)> {
         self.buckets
             .iter()

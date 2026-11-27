@@ -21191,9 +21191,10 @@ fn requester_pays_buckets_ask_other_accounts_to_say_they_pay() {
         String::from_utf8_lossy(&output.stderr)
     );
     // What the requester was charged for: its successful requests to the
-    // Requester Pays bucket (the source of its copy among them), and their
-    // bytes (the answers' bodies: two reads of the object, the listing's and
-    // the copy's XML); nothing for the owner's account.
+    // Requester Pays bucket (the source of its copy and its form upload
+    // among them), and their bytes (the answers' bodies: two reads of the
+    // object, the listing's and the copy's XML; the put's and the form's
+    // uploads); nothing for the owner's account.
     let rows = sql_rows(
         server.native_port,
         "SELECT bucket_name, requester_account, requests, bytes_downloaded, bytes_uploaded FROM sys.dm_s3_requester_charges",
@@ -21201,16 +21202,12 @@ fn requester_pays_buckets_ask_other_accounts_to_say_they_pay() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     let row = &rows[0];
     assert_eq!(
-        (
-            row[0].as_str(),
-            row[1].as_str(),
-            row[2].as_str(),
-            row[4].as_str()
-        ),
-        ("paid", other.as_str(), "6", "3"),
+        (row[0].as_str(), row[1].as_str(), row[2].as_str()),
+        ("paid", other.as_str(), "7"),
         "{rows:?}"
     );
     assert!(row[3].parse::<u64>().unwrap() > 8, "{rows:?}");
+    assert!(row[4].parse::<u64>().unwrap() > 7, "{rows:?}");
 }
 
 const REQUESTER_PAYS_SCRIPT: &str = r#"
@@ -21238,7 +21235,30 @@ s3.put_public_access_block(Bucket="paid", PublicAccessBlockConfiguration={"Block
 s3.put_bucket_policy(Bucket="paid", Policy=json.dumps({"Version": "2012-10-17", "Statement": [
     {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{other}:root"}, "Action": "s3:*",
      "Resource": ["arn:aws:s3:::paid", "arn:aws:s3:::paid/*"]},
-    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::paid/*"}]}))
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::paid/*"},
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::paid/form/*"}]}))
+s3.put_bucket_website(Bucket="paid", WebsiteConfiguration={"IndexDocument": {"Suffix": "index.html"}})
+def website(key):
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/{key}", headers={"Host": f"paid.s3-website.s3.test:{port}"})
+    try:
+        with urllib.request.urlopen(request) as answer:
+            return answer.status
+    except urllib.error.HTTPError as error:
+        return error.code
+def post_form(url, fields):
+    boundary = "boundary"
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+        for name, value in fields.items()]
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="f"\r\n\r\nform\r\n--{boundary}--\r\n')
+    request = urllib.request.Request(url, data="".join(parts).encode(),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(request) as answer:
+            return answer.status, dict(answer.headers)
+    except urllib.error.HTTPError as error:
+        return error.code, dict(error.headers)
+assert website("o") == 200
+assert post_form(f"http://127.0.0.1:{port}/paid", {"key": "form/anon"})[0] == 204
 def anonymous(path):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as answer:
@@ -21264,7 +21284,7 @@ got = theirs.get_object(Bucket="paid", Key="o", RequestPayer="requester")
 assert got["Body"].read() == b"data" and got["RequestCharged"] == "requester", got
 assert theirs.head_object(Bucket="paid", Key="o", RequestPayer="requester")["RequestCharged"] == "requester"
 listed = theirs.list_objects_v2(Bucket="paid", RequestPayer="requester")
-assert [o["Key"] for o in listed["Contents"]] == ["o"] and listed["RequestCharged"] == "requester", listed
+assert "o" in [o["Key"] for o in listed["Contents"]] and listed["RequestCharged"] == "requester", listed
 assert theirs.put_object(Bucket="paid", Key="t", Body=b"new", RequestPayer="requester")["RequestCharged"] == "requester"
 copied = theirs.copy_object(Bucket="mine", Key="c", CopySource={"Bucket": "paid", "Key": "o"}, RequestPayer="requester")
 assert copied["RequestCharged"] == "requester", copied
@@ -21275,6 +21295,19 @@ presigner.meta.events.register("before-sign.s3.GetObject", lambda request, **_: 
 url = presigner.generate_presigned_url("get_object", Params={"Bucket": "paid", "Key": "o"})
 with urllib.request.urlopen(url) as answer:
     assert answer.read() == b"data" and answer.headers["x-amz-request-charged"] == "requester", dict(answer.headers)
+# Its website endpoint (anonymous): refused.
+assert website("o") == 403
+# Form uploads: anonymous ones refused; another account's refused unless
+# a field says it pays.
+assert post_form(f"http://127.0.0.1:{port}/paid", {"key": "form/anon2"})[0] == 403
+forms = client(other_key, other_secret, signature_version="s3v4")
+unsaid = forms.generate_presigned_post("paid", "form/t")
+assert post_form(unsaid["url"], unsaid["fields"])[0] == 403
+said = forms.generate_presigned_post("paid", "form/t", Fields={"x-amz-request-payer": "requester"},
+    Conditions=[{"x-amz-request-payer": "requester"}])
+status, headers = post_form(said["url"], said["fields"])
+assert status == 204 and headers.get("x-amz-request-charged") == "requester", (status, headers)
+assert s3.get_object(Bucket="paid", Key="form/t")["Body"].read() == b"form"
 # Not anonymously, whatever its policy allows, even saying it pays.
 assert anonymous("/paid/o") == 403
 try:
@@ -21297,6 +21330,8 @@ assert s3.get_bucket_request_payment(Bucket="paid")["Payer"] == "BucketOwner"
 plain = theirs.get_object(Bucket="paid", Key="o")
 assert plain["Body"].read() == b"data" and "RequestCharged" not in plain, plain
 assert anonymous("/paid/o") == 200
+assert website("o") == 200
+assert post_form(f"http://127.0.0.1:{port}/paid", {"key": "form/anon3"})[0] == 204
 refused(lambda: s3.put_bucket_request_payment(Bucket="paid", RequestPaymentConfiguration={"Payer": "Someone"}),
     "MalformedXML")
 refused(lambda: s3.get_bucket_request_payment(Bucket="nothing-here"), "NoSuchBucket")
