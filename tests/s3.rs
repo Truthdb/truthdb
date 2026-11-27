@@ -22661,3 +22661,189 @@ control.put_storage_lens_configuration(AccountId=account, ConfigId="dash", Stora
     "Include": {"Buckets": [f"arn:aws:s3:::{name}" for name in names]}})
 print("ok")
 "#;
+
+#[test]
+fn a_bucket_mounts_as_a_read_only_file_system_with_mountpoints_semantics() {
+    // A FUSE mount: where the kernel module and fusermount3 are (not in a
+    // container without /dev/fuse).
+    let fuse = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse");
+    if fuse.is_err() || !std::path::Path::new("/usr/bin/fusermount3").exists() {
+        eprintln!("skipped: no /dev/fuse or fusermount3");
+        return;
+    }
+    let server = start_server();
+    let (_, key, secret) = account_with_key(&server, "mounted");
+    let new_client = || {
+        truthdb_s3client::Client::new(truthdb_s3client::Config {
+            endpoint: format!("http://127.0.0.1:{}", server.s3_port),
+            region: "us-east-1".into(),
+            access_key: key.clone(),
+            secret: secret.clone(),
+            ca_pem: None,
+        })
+        .expect("client")
+    };
+    let client = new_client();
+    let big: Vec<u8> = (0..3 * 1024 * 1024u32).map(|n| (n % 251) as u8).collect();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        client.create_bucket("files").await.expect("bucket");
+        for (name, body) in [
+            ("top.txt", b"top\n".to_vec()),
+            ("docs/a.txt", b"alpha\n".to_vec()),
+            ("docs/sub/big.bin", big.clone()),
+            // A folder marker: its directory, not a file.
+            ("docs/", Vec::new()),
+            // A file and a directory of one name: the directory.
+            ("clash", b"hidden\n".to_vec()),
+            ("clash/inner.txt", b"inner\n".to_vec()),
+            // Names a file system has not.
+            ("odd/./dot", b"x".to_vec()),
+            ("odd/empty//name", b"x".to_vec()),
+            ("odd/fine", b"fine\n".to_vec()),
+        ] {
+            client
+                .put_object("files", name, &[], body.into())
+                .await
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+        }
+    });
+    let dir = server.dir.join("mnt");
+    std::fs::create_dir_all(&dir).expect("mount point");
+    let (uid, gid) = process_ids();
+    let options = truthdb_mount::Options {
+        bucket: "files".into(),
+        prefix: String::new(),
+        uid,
+        gid,
+        file_mode: 0o644,
+        dir_mode: 0o755,
+        allow_other: false,
+    };
+    let session = truthdb_mount::spawn(new_client(), options.clone(), &dir).expect("mount");
+    let names = |path: &std::path::Path| {
+        let mut names: Vec<String> = std::fs::read_dir(path)
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8")
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&dir), ["clash", "docs", "odd", "top.txt"]);
+    assert_eq!(names(&dir.join("docs")), ["a.txt", "sub"]);
+    assert_eq!(names(&dir.join("clash")), ["inner.txt"]);
+    // odd/./dot is not shown; odd/empty//name is in odd/empty, under a
+    // name of nothing, which is not shown.
+    assert_eq!(names(&dir.join("odd")), ["empty", "fine"]);
+    assert!(names(&dir.join("odd/empty")).is_empty());
+    // Its own "." and "..", once each (the entries of a key's "." are not).
+    let listed = Command::new("ls")
+        .arg("-a")
+        .arg(dir.join("odd"))
+        .output()
+        .expect("ls");
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        ".\n..\nempty\nfine\n"
+    );
+    assert!(dir.join("clash").is_dir() && dir.join("docs/sub").is_dir());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("top.txt")).unwrap(),
+        "top\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("docs/a.txt")).unwrap(),
+        "alpha\n"
+    );
+    let meta = std::fs::metadata(dir.join("docs/sub/big.bin")).unwrap();
+    assert_eq!(meta.len(), big.len() as u64);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    assert_eq!(
+        std::fs::metadata(dir.join("docs"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    // Whole, read ahead: the kernel's reads of 128 KiB or so are answered
+    // from one GET of up to 4 MiB.
+    let gets = || {
+        sql_rows(
+            server.native_port,
+            "SELECT get_requests FROM sys.dm_s3_requests WHERE bucket_name = 'files'",
+        )[0][0]
+            .parse::<u64>()
+            .expect("a count")
+    };
+    let before = gets();
+    assert!(std::fs::read(dir.join("docs/sub/big.bin")).unwrap() == big);
+    let read = gets() - before;
+    assert!((1..=2).contains(&read), "{read} GETs");
+    // And in ranges anywhere (seeking).
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(dir.join("docs/sub/big.bin")).unwrap();
+        for at in [2_999_000u64, 17, 1_048_576 + 5] {
+            file.seek(SeekFrom::Start(at)).unwrap();
+            let mut chunk = vec![0u8; 1000];
+            file.read_exact(&mut chunk).unwrap();
+            assert!(chunk == big[at as usize..at as usize + 1000], "at {at}");
+        }
+    }
+    // Not there, and read-only.
+    assert_eq!(
+        std::fs::read(dir.join("missing")).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    for refused in [
+        std::fs::write(dir.join("new.txt"), b"x").unwrap_err(),
+        std::fs::write(dir.join("top.txt"), b"x").unwrap_err(),
+        std::fs::remove_file(dir.join("top.txt")).unwrap_err(),
+        std::fs::create_dir(dir.join("made")).unwrap_err(),
+    ] {
+        assert_eq!(refused.raw_os_error(), Some(30), "{refused}"); // EROFS
+    }
+    drop(session);
+    // A prefix of the bucket, without it.
+    let session = truthdb_mount::spawn(
+        new_client(),
+        truthdb_mount::Options {
+            prefix: "docs/".into(),
+            ..options
+        },
+        &dir,
+    )
+    .expect("mount a prefix");
+    assert_eq!(names(&dir), ["a.txt", "sub"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "alpha\n"
+    );
+    drop(session);
+    assert!(names(&dir).is_empty());
+}
+
+/// The test process's user and group.
+fn process_ids() -> (u32, u32) {
+    let status = std::fs::read_to_string("/proc/self/status").expect("status");
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|id| id.parse().ok())
+            .expect("an id")
+    };
+    (field("Uid:"), field("Gid:"))
+}

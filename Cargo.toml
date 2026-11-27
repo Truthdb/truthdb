@@ -26,6 +26,7 @@ members = [
     "crates/truthdb-net",
     "crates/truthdb-sql",
     "crates/truthdb-tds",
+    "crates/truthdb-mount",
 ]
 
 [workspace.dependencies]
@@ -87,6 +88,7 @@ truthdb-s3client = { workspace = true }
 http-body-util = "0.1.5"
 ring = "0.17"
 truthdb-cli = { path = "crates/truthdb-cli" }
+truthdb-mount = { path = "crates/truthdb-mount" }
 
 [profile.dev.package."*"]
 opt-level = 3

@@ -777,6 +777,34 @@ impl Client {
         })
     }
 
+    /// Bytes `start` to `end` (inclusive) of the object (fewer at its end).
+    pub async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Bytes, Error> {
+        let response = self
+            .send(
+                Method::GET,
+                &Self::object_path(bucket, key)?,
+                "",
+                &[("range", format!("bytes={start}-{end}"))],
+                Bytes::new(),
+            )
+            .await?;
+        let mut download = Download {
+            head: head_of(response.headers())?,
+            body: response.into_body(),
+        };
+        let mut out = Vec::new();
+        while let Some(chunk) = download.next_chunk().await? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(out))
+    }
+
     /// Stores `body` as the object, with `headers` (content type, metadata,
     /// ...); returns its ETag.
     pub async fn put_object(
@@ -948,9 +976,79 @@ fn head_of(headers: &hyper::HeaderMap) -> Result<Head, Error> {
     })
 }
 
+/// Seconds since the epoch of an ISO 8601 `YYYY-MM-DDTHH:MM:SS[.fff]Z` (as
+/// a listing gives an object's last modification).
+pub fn iso_seconds(text: &str) -> Option<u64> {
+    let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    // Howard Hinnant's days-from-civil.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
+/// The keys of `profile` in the credentials file (`AWS_SHARED_CREDENTIALS_FILE`,
+/// else `~/.aws/credentials`), if it has them.
+pub fn credentials_file_keys(profile: &str) -> Option<(String, String)> {
+    let path = match std::env::var_os("AWS_SHARED_CREDENTIALS_FILE") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::path::Path::new(&std::env::var_os("HOME")?).join(".aws/credentials"),
+    };
+    let text = std::fs::read_to_string(&path).ok()?;
+    profile_keys(&text, profile)
+}
+
+/// `aws_access_key_id` and `aws_secret_access_key` of `[profile]` in an
+/// INI credentials file.
+pub fn profile_keys(text: &str, profile: &str) -> Option<(String, String)> {
+    let mut section = String::new();
+    let (mut id, mut secret) = (None, None);
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = name.trim().to_string();
+        } else if section == profile
+            && let Some((name, value)) = line.split_once('=')
+        {
+            match name.trim() {
+                "aws_access_key_id" => id = Some(value.trim().to_string()),
+                "aws_secret_access_key" => secret = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    Some((id?, secret?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listed_times_and_credentials_files_are_read() {
+        assert_eq!(iso_seconds("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(iso_seconds("2013-05-24T00:00:01Z"), Some(1_369_353_601));
+        assert_eq!(iso_seconds("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(iso_seconds("nonsense"), None);
+        let file = "[default]\naws_access_key_id = A\naws_secret_access_key=S\n\n[other]\n\
+                    aws_access_key_id=B\naws_secret_access_key = T\n";
+        assert_eq!(
+            profile_keys(file, "other"),
+            Some(("B".to_string(), "T".to_string()))
+        );
+        assert_eq!(
+            profile_keys(file, "default"),
+            Some(("A".to_string(), "S".to_string()))
+        );
+        assert_eq!(profile_keys(file, "missing"), None);
+    }
 
     #[test]
     fn dates_are_written_as_sigv4_wants_them() {
