@@ -870,6 +870,8 @@ pub async fn handle(
                     file.transaction(|tx| {
                         let deleted = tx.delete_bucket_config("", STORAGE_LENS, &name)?;
                         tx.delete_bucket_config("", STORAGE_LENS_TAGS, &name)?;
+                        // Its reports go with it.
+                        tx.forget_lens(&name)?;
                         Ok(deleted)
                     })
                 })
@@ -936,6 +938,8 @@ async fn put(
             "An account has at most {MAX_CONFIGURATIONS} Storage Lens configurations."
         )));
     }
+    // Its first report is made at once.
+    crate::storage_lens_run::wake();
     Ok(empty())
 }
 

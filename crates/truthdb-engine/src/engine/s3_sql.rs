@@ -108,6 +108,9 @@ impl ExternalRowsets for S3Rowsets {
                 return Some(open_bucket_usage(&self.core, name, args, caller));
             }
             "sys.dm_s3_storage" => return Some(open_storage(&self.core, name, args, caller)),
+            "sys.dm_s3_storage_lens" => {
+                return Some(open_storage_lens(&self.core, name, args, caller));
+            }
             "sys.dm_s3_api_activity" => {
                 return Some(open_api_activity(&self.core, name, args, caller));
             }
@@ -870,6 +873,83 @@ impl ExternalStream for BucketUsageStream {
                     Datum::BigInt(usage.objects as i64),
                     Datum::BigInt(usage.bytes as i64),
                     Datum::Bit(complete),
+                ]
+            })
+            .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// How many records `sys.dm_s3_storage_lens` reads per storage-lock hold.
+const LENS_SLICE: usize = 1000;
+
+/// `sys.dm_s3_storage_lens`: every Storage Lens configuration's daily
+/// reports, a record a row: its account and configuration, the day it is
+/// of, what it is of (the account, a bucket, or a bucket's prefix), its
+/// storage class (empty: a metric of none), and the metric's name and
+/// value.
+fn open_storage_lens(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            nvarchar("account_id", 12),
+            nvarchar("configuration_id", 64),
+            datetime2("report_date"),
+            nvarchar("record_type", 8),
+            nvarchar("bucket_name", 63),
+            nvarchar("record_value", 1024),
+            nvarchar("storage_class", 32),
+            nvarchar("metric_name", 64),
+            bigint("metric_value"),
+        ],
+        rows: Box::new(StorageLensStream {
+            core: Arc::clone(core),
+            after: None,
+            done: false,
+        }),
+    })
+}
+
+struct StorageLensStream {
+    core: Arc<Storage>,
+    after: Option<Vec<u8>>,
+    done: bool,
+}
+
+impl ExternalStream for StorageLensStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        let (records, next) = {
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            file.lens_rows(self.after.as_deref(), LENS_SLICE)
+                .map_err(storage_error)?
+        };
+        self.done = next.is_none();
+        self.after = next;
+        let rows: Vec<Vec<Datum>> = records
+            .iter()
+            .map(|row| {
+                let (account, id) = row.config.split_once('/').unwrap_or(("", &row.config));
+                let record = &row.record;
+                vec![
+                    text(account),
+                    text(id),
+                    datetime(u64::from(row.day) * 86_400_000),
+                    text(record.record_type.as_str()),
+                    text(&record.bucket),
+                    text(&record.record_value),
+                    text(&record.storage_class),
+                    text(&record.metric),
+                    Datum::BigInt(record.value.min(i64::MAX as u64) as i64),
                 ]
             })
             .collect();

@@ -9,7 +9,9 @@ use truthdb_core::storage::{
 use truthdb_core::wal::records::{PageOpUndo, RelRecord};
 
 use crate::body::SEGMENT_BYTES;
-use crate::{BodyLease, BodyWriter, DEFAULT_ACCOUNT, ObjEngine, ObjFile};
+use crate::{
+    BodyLease, BodyWriter, DEFAULT_ACCOUNT, LensRecord, LensRecordType, ObjEngine, ObjFile,
+};
 
 const RING: u64 = 8 * 1024 * 1024;
 const GRACE: u64 = 1_000;
@@ -9031,6 +9033,110 @@ fn maintenance_records_are_kept_per_table_and_bucket_and_tables_are_listed_acros
         Ok(())
     );
     assert_eq!(read(None, config), None);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn storage_lens_reports_are_kept_by_day_and_request_counts_go_with_their_bucket() {
+    let path = temp_path("storage-lens");
+    let storage = create(&path);
+    let mut lock = storage.lock();
+    let mut file = ObjFile::new(&mut lock);
+    let record = |metric: &str, value: u64| LensRecord {
+        record_type: LensRecordType::Bucket,
+        bucket: "data".into(),
+        record_value: String::new(),
+        storage_class: "STANDARD".into(),
+        metric: metric.into(),
+        value,
+    };
+    let config = "111111111111/lens";
+    assert_eq!(file.lens_reported(config).unwrap(), None);
+    file.transaction(|tx| {
+        tx.put_lens_report(
+            config,
+            100,
+            &[record("StorageBytes", 5), record("ObjectCount", 1)],
+        )
+    })
+    .unwrap();
+    // A configuration whose key starts like another's is apart from it.
+    file.transaction(|tx| {
+        tx.put_lens_report("111111111111/lens2", 100, &[record("ObjectCount", 9)])
+    })
+    .unwrap();
+    assert_eq!(file.lens_reported(config).unwrap(), Some(100));
+    assert_eq!(
+        file.lens_report(config, 100).unwrap(),
+        [record("ObjectCount", 1), record("StorageBytes", 5)]
+    );
+    // Made again, a day's report replaces it whole.
+    file.transaction(|tx| tx.put_lens_report(config, 100, &[record("StorageBytes", 7)]))
+        .unwrap();
+    assert_eq!(
+        file.lens_report(config, 100).unwrap(),
+        [record("StorageBytes", 7)]
+    );
+    // Kept 455 days: the report of day 100 goes with that of day 555.
+    file.transaction(|tx| tx.put_lens_report(config, 554, &[record("StorageBytes", 8)]))
+        .unwrap();
+    assert_eq!(file.lens_report(config, 100).unwrap().len(), 1);
+    file.transaction(|tx| tx.put_lens_report(config, 555, &[record("StorageBytes", 9)]))
+        .unwrap();
+    assert!(file.lens_report(config, 100).unwrap().is_empty());
+    assert_eq!(file.lens_reported(config).unwrap(), Some(555));
+    // Listed in pages, every configuration's.
+    let (first, next) = file.lens_rows(None, 2).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|row| (row.config.as_str(), row.day))
+            .collect::<Vec<_>>(),
+        [(config, 554), (config, 555)]
+    );
+    let (rest, end) = file.lens_rows(next.as_deref(), 2).unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].config, "111111111111/lens2");
+    assert_eq!(end, None);
+    // A deleted configuration's reports go; another's stay.
+    file.transaction(|tx| tx.forget_lens(config)).unwrap();
+    assert_eq!(file.lens_reported(config).unwrap(), None);
+    assert!(file.lens_report(config, 555).unwrap().is_empty());
+    assert_eq!(
+        file.lens_report("111111111111/lens2", 100).unwrap().len(),
+        1
+    );
+    // Request counts add up by day; old days expire; a deleted bucket's go.
+    for bucket in ["data", "data2"] {
+        file.transaction(|tx| tx.create_bucket(bucket, DEFAULT_ACCOUNT, 5))
+            .unwrap()
+            .unwrap();
+    }
+    let mut counts = [0u64; 11];
+    counts[0] = 2;
+    counts[7] = 100;
+    for (bucket, day) in [("data", 10), ("data", 10), ("data", 11), ("data2", 10)] {
+        file.transaction(|tx| tx.add_lens_activity(bucket, day, &counts))
+            .unwrap();
+    }
+    let mut twice = [0u64; 11];
+    twice[0] = 4;
+    twice[7] = 200;
+    assert_eq!(file.lens_activity("data", 10).unwrap(), Some(twice));
+    assert_eq!(file.lens_activity("data", 12).unwrap(), None);
+    file.transaction(|tx| tx.expire_lens_activity(11)).unwrap();
+    assert_eq!(file.lens_activity("data", 10).unwrap(), None);
+    assert_eq!(file.lens_activity("data", 11).unwrap(), Some(counts));
+    file.transaction(|tx| tx.add_lens_activity("data2", 11, &counts))
+        .unwrap();
+    file.transaction(|tx| tx.delete_bucket("data"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.lens_activity("data", 11).unwrap(), None);
+    assert_eq!(file.lens_activity("data2", 11).unwrap(), Some(counts));
+    drop(file);
+    drop(lock);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

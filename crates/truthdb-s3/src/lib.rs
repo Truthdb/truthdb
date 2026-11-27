@@ -58,6 +58,7 @@ pub mod session;
 pub mod sse;
 pub mod ssec;
 pub mod storage_lens;
+mod storage_lens_run;
 pub mod tables;
 pub mod tagging;
 pub mod trails;

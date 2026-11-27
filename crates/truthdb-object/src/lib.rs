@@ -38,6 +38,7 @@ mod pack;
 mod remote_buckets;
 mod replication;
 mod restores;
+mod storage_lens;
 mod stored;
 mod tables;
 pub mod time;
@@ -104,6 +105,7 @@ pub use replication::{
     ReplicationDestination, ReplicationFilter, ReplicationRule, ReplicationStatus, ReplicationWork,
 };
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
+pub use storage_lens::{ActivityCounts, LENS_KEEP_DAYS, LensRecord, LensRecordType, LensRow};
 pub use stored::{Backlogs, BodyUse, StoredBody};
 pub use tables::{
     MaintenanceRecord, NamespaceInfo, TableBucketInfo, TableError, TableInfo, warehouse_bucket,
@@ -257,6 +259,18 @@ const TABLE_MAINTENANCE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 56;
 /// `object_lambda`).
 const ACCESS_POINTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 57;
 
+/// Storage Lens: (bucket, 0, day u32 BE) -> that day's request counts, 11
+/// u64 LE (see `storage_lens`).
+const LENS_ACTIVITY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 58;
+
+/// Storage Lens: (configuration key, 0, day u32 BE, record type, then the
+/// bucket, the record value, the storage class and the metric, each a u16
+/// BE length and its bytes) -> the metric's value, u64 BE.
+const LENS_REPORTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 59;
+
+/// Storage Lens: configuration key -> the day of its last report, u32 BE.
+const LENS_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 60;
+
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
 
@@ -380,7 +394,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 58;
+const TREE_COUNT: usize = 61;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.

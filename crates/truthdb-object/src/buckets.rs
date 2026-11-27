@@ -465,6 +465,7 @@ impl ObjTxn<'_, '_> {
         self.forget_usage(name)?;
         self.forget_metrics(name)?;
         self.forget_inventories(name)?;
+        self.forget_lens_activity(name)?;
         Ok(Ok(()))
     }
 }

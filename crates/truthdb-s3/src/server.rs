@@ -140,6 +140,10 @@ pub async fn serve(
         Arc::clone(&state),
         shutdown.clone(),
     ));
+    tokio::spawn(crate::storage_lens_run::run(
+        Arc::clone(&state),
+        shutdown.clone(),
+    ));
     tokio::spawn(crate::replication_run::run(
         Arc::clone(&state),
         shutdown.clone(),

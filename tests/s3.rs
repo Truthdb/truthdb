@@ -22131,3 +22131,234 @@ assert deleted["requestParameters"]["configId"] == "main", deleted
 assert deleted["requestParameters"]["x-amz-account-id"] == account and deleted["readOnly"] is False, deleted
 print("ok")
 "#;
+
+#[test]
+fn storage_lens_reports_count_each_bucket_and_prefix_once_a_day_across_a_crash() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let mut server = start_server();
+    let (account, key, secret) = account_with_key(&server, "lens-metrics");
+    let (_, other_key, other_secret) = account_with_key(&server, "lens-elsewhere");
+    let script = server.dir.join("storage_lens_metrics.py");
+    std::fs::write(&script, STORAGE_LENS_METRICS_SCRIPT).expect("script");
+    let run = |phase: &str, port: u16| {
+        let output = Command::new(&python)
+            .arg("-I")
+            .arg(&script)
+            .args([
+                phase,
+                &port.to_string(),
+                &account,
+                &key,
+                &secret,
+                &other_key,
+                &other_secret,
+            ])
+            .output()
+            .expect("run python");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success() && stdout.contains("ok"),
+            "{phase}\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    let out = run("setup", server.s3_port);
+    let yesterday = out
+        .lines()
+        .find_map(|line| line.strip_prefix("yesterday="))
+        .expect("yesterday")
+        .to_string();
+    let report = |port: u16, config: &str| {
+        sql_rows(
+            port,
+            &format!(
+                "SELECT CONVERT(nvarchar(10), report_date, 23), record_type, bucket_name, \
+                 record_value, storage_class, metric_name, metric_value \
+                 FROM sys.dm_s3_storage_lens WHERE configuration_id = '{config}' \
+                 ORDER BY record_type, bucket_name, record_value, storage_class, metric_name"
+            ),
+        )
+    };
+    // Well under the pass's idle minute: a report is made as its
+    // configuration is put.
+    let wait = |port: u16, config: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let rows = report(port, config);
+            if !rows.is_empty() {
+                return rows;
+            }
+            assert!(Instant::now() < deadline, "no report of {config}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let rows = wait(server.native_port, "daily");
+    let value = |record_type: &str, bucket: &str, prefix: &str, class: &str, metric: &str| {
+        rows.iter()
+            .find(|row| {
+                row[1] == record_type
+                    && row[2] == bucket
+                    && row[3] == prefix
+                    && row[4] == class
+                    && row[5] == metric
+            })
+            .map(|row| row[6].parse::<u64>().expect("a count"))
+    };
+    // The day before today's: storage as it is, of every bucket in scope.
+    assert!(rows.iter().all(|row| row[0] == yesterday), "{rows:?}");
+    let bucket = |name: &str, metric: &str| value("BUCKET", name, "", "STANDARD", metric);
+    // data: logs/a (10 then 20 bytes), logs/b/c (30), top (5) deleted, and
+    // an upload of a 100-byte part under logs/.
+    assert_eq!(bucket("data", "StorageBytes"), Some(166));
+    assert_eq!(bucket("data", "ObjectCount"), Some(7));
+    assert_eq!(bucket("data", "CurrentVersionStorageBytes"), Some(51));
+    assert_eq!(bucket("data", "CurrentVersionObjectCount"), Some(4));
+    assert_eq!(bucket("data", "NonCurrentVersionStorageBytes"), Some(15));
+    assert_eq!(bucket("data", "NonCurrentVersionObjectCount"), Some(2));
+    assert_eq!(bucket("data", "DeleteMarkerObjectCount"), Some(1));
+    assert_eq!(
+        bucket("data", "IncompleteMultipartUploadStorageBytes"),
+        Some(100)
+    );
+    assert_eq!(
+        bucket("data", "IncompleteMultipartUploadObjectCount"),
+        Some(1)
+    );
+    assert_eq!(
+        bucket("data", "IncompleteMPUObjectCountOlderThan7Days"),
+        Some(0)
+    );
+    assert_eq!(bucket("other", "StorageBytes"), Some(47));
+    let setting =
+        |record_type: &str, name: &str, metric: &str| value(record_type, name, "", "", metric);
+    assert_eq!(
+        setting("BUCKET", "data", "VersioningEnabledBucketCount"),
+        Some(1)
+    );
+    assert_eq!(
+        setting("BUCKET", "other", "VersioningEnabledBucketCount"),
+        Some(0)
+    );
+    assert_eq!(
+        setting("BUCKET", "other", "TransferAccelerationEnabledBucketCount"),
+        Some(1)
+    );
+    assert_eq!(
+        setting(
+            "BUCKET",
+            "data",
+            "ObjectOwnershipBucketOwnerEnforcedBucketCount"
+        ),
+        Some(1)
+    );
+    // Advanced cost optimization is on: data's lifecycle rule is counted.
+    assert_eq!(
+        setting("BUCKET", "data", "ExpirationLifecycleRuleCount"),
+        Some(1)
+    );
+    assert_eq!(
+        setting("BUCKET", "data", "TotalLifecycleRuleCount"),
+        Some(1)
+    );
+    // Activity metrics are off.
+    assert_eq!(setting("BUCKET", "data", "AllRequests"), None);
+    // The account: its buckets' sum; an excluded bucket is not counted.
+    assert_eq!(
+        value("ACCOUNT", "", "", "STANDARD", "StorageBytes"),
+        Some(213)
+    );
+    assert_eq!(
+        setting("ACCOUNT", "", "VersioningEnabledBucketCount"),
+        Some(1)
+    );
+    assert_eq!(setting("ACCOUNT", "", "TotalLifecycleRuleCount"), Some(1));
+    assert!(
+        rows.iter()
+            .all(|row| row[2] != "skipped" && row[2] != "theirs"),
+        "{rows:?}"
+    );
+    // Prefixes to depth 2, of at least 1% of their bucket's bytes.
+    let prefix = |name: &str, metric: &str| value("PREFIX", "data", name, "STANDARD", metric);
+    assert_eq!(prefix("logs/", "StorageBytes"), Some(160));
+    assert_eq!(prefix("logs/", "ObjectCount"), Some(4));
+    assert_eq!(prefix("logs/b/", "StorageBytes"), Some(30));
+    // tiny/ is under 1% of data's bytes.
+    assert_eq!(prefix("tiny/", "StorageBytes"), None);
+    // other's p/q/r/s is counted under p/ and p/q/, not p/q/r/ (depth 3).
+    let other = |name: &str| value("PREFIX", "other", name, "STANDARD", "StorageBytes");
+    assert_eq!(
+        (other("p/"), other("p/q/"), other("p/q/r/")),
+        (Some(40), Some(40), None)
+    );
+    // Made once a day: a crash does not lose it, nor make it again (an
+    // object put since would be in one made again); a configuration put
+    // just before one has its report after it.
+    run("arm", server.s3_port);
+    crash_and_restart(&mut server);
+    let second = wait(server.native_port, "second");
+    assert!(second.iter().all(|row| row[0] == yesterday), "{second:?}");
+    assert_eq!(report(server.native_port, "daily"), rows);
+    // A disabled configuration has none; a deleted one's go with it.
+    run("after", server.s3_port);
+    assert!(report(server.native_port, "daily").is_empty());
+    assert!(report(server.native_port, "quiet").is_empty());
+    assert!(!report(server.native_port, "second").is_empty());
+}
+
+const STORAGE_LENS_METRICS_SCRIPT: &str = r#"
+import datetime, socket, sys, time
+import boto3, botocore.config
+phase, port, account, key, secret, other_key, other_secret = sys.argv[1:8]
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service, access=key, secret_key=secret):
+    return boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+s3, control = client("s3"), client("s3control")
+def lens(id, enabled=True, **extra):
+    levels = {"AdvancedCostOptimizationMetrics": {"IsEnabled": True}}
+    return dict({"Id": id, "IsEnabled": enabled,
+        "AccountLevel": dict(levels, BucketLevel=dict(levels, PrefixLevel={"StorageMetrics": {
+            "IsEnabled": True, "SelectionCriteria": {"MaxDepth": 2, "MinStorageBytesPercentage": 1}}}))},
+        **extra)
+if phase == "setup":
+    for name in ["data", "other", "skipped"]:
+        s3.create_bucket(Bucket=name)
+    s3.put_bucket_versioning(Bucket="data", VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket="data", Key="logs/a", Body=b"x" * 10)
+    s3.put_object(Bucket="data", Key="logs/a", Body=b"x" * 20)
+    s3.put_object(Bucket="data", Key="logs/b/c", Body=b"x" * 30)
+    s3.put_object(Bucket="data", Key="top", Body=b"x" * 5)
+    s3.put_object(Bucket="data", Key="tiny/z", Body=b"x")
+    s3.delete_object(Bucket="data", Key="top")
+    upload = s3.create_multipart_upload(Bucket="data", Key="logs/up")["UploadId"]
+    s3.upload_part(Bucket="data", Key="logs/up", UploadId=upload, PartNumber=1, Body=b"x" * 100)
+    s3.put_bucket_lifecycle_configuration(Bucket="data", LifecycleConfiguration={"Rules": [
+        {"ID": "expire", "Status": "Enabled", "Filter": {}, "Expiration": {"Days": 30}}]})
+    s3.put_object(Bucket="other", Key="x", Body=b"x" * 7)
+    s3.put_object(Bucket="other", Key="p/q/r/s", Body=b"x" * 40)
+    theirs = client("s3", other_key, other_secret)
+    theirs.create_bucket(Bucket="theirs")
+    theirs.put_object(Bucket="theirs", Key="z", Body=b"x" * 3)
+    s3.put_bucket_accelerate_configuration(Bucket="other", AccelerateConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket="skipped", Key="y", Body=b"x" * 9)
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="daily",
+        StorageLensConfiguration=lens("daily", Exclude={"Buckets": ["arn:aws:s3:::skipped"]}))
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="quiet",
+        StorageLensConfiguration=lens("quiet", enabled=False))
+    yesterday = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=1)
+    print(f"yesterday={yesterday.isoformat()}")
+elif phase == "arm":
+    s3.put_object(Bucket="data", Key="late", Body=b"x" * 1000)
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="second",
+        StorageLensConfiguration=lens("second"))
+elif phase == "after":
+    control.delete_storage_lens_configuration(AccountId=account, ConfigId="daily")
+print("ok")
+"#;
