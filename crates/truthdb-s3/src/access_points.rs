@@ -759,6 +759,30 @@ pub(crate) async fn resolve<B>(
             Named::Alias(bucket)
         }
     };
+    through_named(state, request, principal, named).await
+}
+
+/// `request` as one through access point `name` of `account` (the
+/// supporting access point of an Object Lambda access point it was made
+/// through), as [`resolve`] takes one its host names.
+pub(crate) async fn resolve_point<B>(
+    state: &S3State,
+    request: &mut Request<B>,
+    principal: Option<&crate::server::Principal>,
+    account: &str,
+    name: &str,
+) -> Result<(), S3Error> {
+    let named = Named::Host(String::new(), Some((account.to_string(), name.to_string())));
+    through_named(state, request, principal, named).await
+}
+
+/// [`resolve`] of the access point `named` names.
+async fn through_named<B>(
+    state: &S3State,
+    request: &mut Request<B>,
+    principal: Option<&crate::server::Principal>,
+    named: Named,
+) -> Result<(), S3Error> {
     let alias = matches!(named, Named::Alias(_));
     // Read in the request's own scope: its key still valid.
     let scope = crate::scope::Scope {

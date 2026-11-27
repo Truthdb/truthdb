@@ -20555,7 +20555,7 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
         r#"{"ForAnyValue:StringEquals": {"aws:CalledVia": ["s3-object-lambda.amazonaws.com"]}}"#;
     let reader = format!(
         r#"{{"Version": "2012-10-17", "Statement": [
-        {{"Effect": "Allow", "Action": "s3-object-lambda:GetObject", "Resource": "{point}"}},
+        {{"Effect": "Allow", "Action": ["s3-object-lambda:GetObject", "s3-object-lambda:HeadObject"], "Resource": "{point}"}},
         {{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": "{}", "Condition": {called_via}}},
         {{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "{supporting}/object/*", "Condition": {called_via}}}]}}"#,
         lambda_arn("shape")
@@ -20637,7 +20637,7 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
 }
 
 const OBJECT_LAMBDA_GETS_SCRIPT: &str = r#"
-import json, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import json, re, socket, sys, threading, time, urllib.error, urllib.parse, urllib.request
 import http.server
 import boto3, botocore.config, botocore.exceptions
 (port, account, key, secret, reader_key, reader_secret, noinvoke_key, noinvoke_secret,
@@ -20706,8 +20706,14 @@ class Function(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         event = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         events.append((self.path, event))
-        context = event["getObjectContext"]
-        if self.path == "/shape":
+        reply = {}
+        key = urllib.parse.urlparse(event["userRequest"]["url"]).path.split("/")[-1]
+        if "headObjectContext" in event:
+            reply = headed(event["headObjectContext"]["inputS3Url"], key)
+        elif "listObjectsV2Context" in event or "listObjectsContext" in event:
+            reply = listed(event, key)
+        elif self.path == "/shape":
+            context = event["getObjectContext"]
             answer = {"RequestRoute": context["outputRoute"], "RequestToken": context["outputToken"]}
             url = context["inputS3Url"]
             key = urllib.parse.urlparse(event["userRequest"]["url"]).path.split("/")[-1]
@@ -20729,10 +20735,35 @@ class Function(http.server.BaseHTTPRequestHandler):
             else:
                 writer.write_get_object_response(Body=original.upper(), ContentType="text/plain",
                     Metadata={"shaped": "yes"}, **answer)
+        body = json.dumps(reply).encode()
         self.send_response(200)
-        self.send_header("Content-Length", "2")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.wfile.write(body)
+# A HeadObject's function: the object's length, its own headers; or what
+# is no answer, or an error.
+def headed(url, key):
+    if key == "badhead":
+        return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}}
+    if key == "gone":
+        return {"statusCode": 404, "errorCode": "NoSuchKey", "errorMessage": "not here"}
+    with urllib.request.urlopen(urllib.request.Request(url, method="HEAD")) as answer:
+        length = answer.headers["Content-Length"]
+    return {"statusCode": 200, "headers": {"Content-Length": length, "Content-Type": "text/shaped",
+        "x-amz-meta-headed": "yes", "Set-Cookie": "taken=yes"}}
+# A listing's function: the keys upper-cased, as a listBucketResult
+# (ListObjectsV2) or as the listing's own XML (ListObjects).
+def listed(event, key):
+    context = event.get("listObjectsV2Context") or event["listObjectsContext"]
+    xml = urllib.request.urlopen(context["inputS3Url"]).read().decode()
+    keys = re.findall(r"<Key>([^<]*)</Key>", xml)
+    if "listObjectsContext" in event:
+        return {"statusCode": 200, "listResultXml": re.sub(r"<Key>([^<]*)</Key>",
+            lambda match: f"<Key>{match.group(1).upper()}</Key>", xml)}
+    if "broken" in event["userRequest"]["url"]:
+        return {"statusCode": 200, "listBucketResult": {"name": "data", "maxKeys": 1000, "isTruncated": False}}
+    return {"statusCode": 200, "listBucketResult": {"name": "data", "keyCount": len(keys), "maxKeys": 1000,
+        "isTruncated": False, "prefix": "d", "contents": [{"key": k.upper(), "size": 1} for k in keys]}}
 functions = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Function)
 threading.Thread(target=functions.serve_forever, daemon=True).start()
 print(f"PORT {functions.server_address[1]}", flush=True)
@@ -20900,10 +20931,46 @@ theirs["TransformationConfigurations"][0]["ContentTransformation"]["AwsLambda"][
     "arn:aws:lambda:us-east-1:999999999999:function:shape"
 control.put_access_point_configuration_for_object_lambda(AccountId=account, Name="nowhere", Configuration=theirs)
 refused(lambda: s3.get_object(Bucket=nowhere, Key="doc"), "InternalError")
-# Not yet served through it: other operations.
-refused(lambda: s3.put_object(Bucket=alias, Key="new", Body=b"n"), "NotImplemented")
-refused(lambda: s3.head_object(Bucket=alias, Key="doc"), "501")
-refused(lambda: s3.list_objects_v2(Bucket=alias), "NotImplemented")
+# What it does not transform: passed on through its supporting access point
+# ("processed as normal").
+s3.put_object(Bucket=alias, Key="new", Body=b"n")
+assert s3.get_object(Bucket="data", Key="new")["Body"].read() == b"n"
+assert s3.head_object(Bucket=alias, Key="doc")["ContentLength"] == 5
+assert "new" in [o["Key"] for o in s3.list_objects_v2(Bucket=alias)["Contents"]]
+s3.delete_object(Bucket=alias, Key="new")
+refused(lambda: s3.head_object(Bucket="data", Key="new"), "404")
+# As its own operation on the Object Lambda access point, then through the
+# supporting access point as through Object Lambda (its grant needing
+# aws:CalledVia).
+assert reader.head_object(Bucket=alias, Key="doc")["ContentLength"] == 5
+refused(lambda: reader.head_object(Bucket=supporting, Key="doc"), "403")
+refused(lambda: reader.list_objects_v2(Bucket=alias), "AccessDenied")
+refused(lambda: client("s3", noinvoke_key, noinvoke_secret).head_object(Bucket=alias, Key="doc"), "403")
+# Not the bucket's own operations (they are no data events).
+refused(lambda: s3.put_bucket_versioning(Bucket=alias, VersioningConfiguration={"Status": "Enabled"}),
+    "NotImplemented")
+# HeadObject and listings transformed: answered by what the function returns.
+viewer = control.create_access_point_for_object_lambda(AccountId=account, Name="viewer", Configuration={
+    "SupportingAccessPoint": f"arn:aws:s3:us-east-1:{account}:accesspoint/reader",
+    "TransformationConfigurations": [{"Actions": ["HeadObject", "ListObjects", "ListObjectsV2"],
+        "ContentTransformation": {"AwsLambda": {"FunctionArn": "shape"}}}]})["Alias"]["Value"]
+headed_answer = s3.head_object(Bucket=viewer, Key="doc")
+assert headed_answer["ContentLength"] == 5 and headed_answer["ContentType"] == "text/shaped", headed_answer
+assert headed_answer["Metadata"] == {"headed": "yes"}, headed_answer
+assert "set-cookie" not in headed_answer["ResponseMetadata"]["HTTPHeaders"], headed_answer
+assert "headObjectContext" in events[-1][1] and "outputToken" not in events[-1][1]["headObjectContext"], events[-1]
+s3.put_object(Bucket="data", Key="badhead", Body=b"b")
+refused(lambda: s3.head_object(Bucket=viewer, Key="badhead"), "500")
+refused(lambda: s3.head_object(Bucket=viewer, Key="gone"), "404")
+listing = s3.list_objects_v2(Bucket=viewer, Prefix="d")
+assert [o["Key"] for o in listing["Contents"]] == ["DOC"] and listing["KeyCount"] == 1, listing
+url = events[-1][1]["listObjectsV2Context"]["inputS3Url"]
+assert "list-type=2" in url and "prefix=d" in url, url
+assert [o["Key"] for o in s3.list_objects(Bucket=viewer, Prefix="d")["Contents"]] == ["DOC"]
+assert "listObjectsContext" in events[-1][1], events[-1]
+refused(lambda: s3.list_objects_v2(Bucket=viewer, Prefix="broken"), "LambdaInvalidResponse")
+# Not transformed there: GetObject, passed on.
+assert s3.get_object(Bucket=viewer, Key="doc")["Body"].read() == b"hello"
 # WriteGetObjectResponse: only with a token waiting, and as allowed.
 refused(lambda: writer.write_get_object_response(RequestRoute="io-truthdb", RequestToken="nothing", Body=b"x"),
     "InvalidRequest")

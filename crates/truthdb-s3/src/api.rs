@@ -384,16 +384,25 @@ pub async fn dispatch(
         }
         None => {}
     }
-    // Through an Object Lambda access point (by its alias): served there.
+    // Through an Object Lambda access point: served by its function, or
+    // passed on through its supporting access point (as one made through
+    // Object Lambda).
+    let mut proxied = false;
     if let Some(via) =
         crate::object_lambda_run::resolve(state, &request, auth.principal.as_ref()).await?
     {
-        return crate::object_lambda_run::serve(state, request, auth, via).await;
+        if let Some(response) =
+            crate::object_lambda_run::serve(state, &mut request, &auth, via).await?
+        {
+            return Ok(response);
+        }
+        proxied = true;
+    } else {
+        crate::access_points::resolve(state, &mut request, auth.principal.as_ref()).await?;
     }
-    crate::access_points::resolve(state, &mut request, auth.principal.as_ref()).await?;
     // A request through a URL presigned for an Object Lambda function: its
     // mark checked, it is one made through Object Lambda.
-    let called_via = crate::object_lambda_run::called_via(&request, &auth)?;
+    let called_via = proxied || crate::object_lambda_run::called_via(&request, &auth)?;
     let target = target(&request)?;
     let via = request
         .extensions()
