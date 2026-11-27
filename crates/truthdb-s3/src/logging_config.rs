@@ -187,6 +187,13 @@ pub async fn bucket_logging(
                         }
                         Some(_) => {}
                     }
+                    // "Using a Requester Pays bucket as the target bucket for
+                    // end-user logging" is not supported.
+                    if crate::request_payment::requester_pays(file, &config.target_bucket)? {
+                        return Ok(Some(
+                            "A Requester Pays bucket cannot be a target for logging",
+                        ));
+                    }
                 }
                 file.transaction(|tx| match &config {
                     Some(config) => {

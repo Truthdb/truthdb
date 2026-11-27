@@ -490,8 +490,22 @@ pub(crate) async fn serve(
         _ => (
             "GET",
             format!("/{}", supporting.alias),
-            without_authorization(&query).join("&"),
+            without_authorization(&query)
+                .into_iter()
+                .filter(|pair| !pair.to_ascii_lowercase().starts_with("x-amz-request-payer"))
+                .collect::<Vec<_>>()
+                .join("&"),
         ),
+    };
+    // Its requester saying it pays: the read says so too.
+    let passed = match crate::request_payment::says_requester_pays(
+        held.headers()
+            .get("x-amz-request-payer")
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        true if passed.is_empty() => "x-amz-request-payer=requester".to_string(),
+        true => format!("{passed}&x-amz-request-payer=requester"),
+        false => passed,
     };
     let input_url = presign(
         method,

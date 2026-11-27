@@ -149,7 +149,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "metadataInventoryTable",
     "metadataJournalTable",
     "metadataTable",
-    "requestPayment",
     "select",
     "torrent",
 ];
@@ -176,6 +175,7 @@ const SUBRESOURCES: &[&str] = &[
     "publicAccessBlock",
     "renameObject",
     "replication",
+    "requestPayment",
     "restore",
     "retention",
     "session",
@@ -502,6 +502,15 @@ pub async fn dispatch(
             seen.mark_requester(requester(&authz.identity), auth.signed);
         }
     }
+    // A Requester Pays bucket's (its own, or a copy's source): its
+    // requester says it pays, or it is refused.
+    let charged = crate::request_payment::check(&request, &authz)?;
+    if !charged.is_empty()
+        && let (Some(seen), Some(account)) =
+            (crate::metering::seen_of(&request), authz.identity.account())
+    {
+        seen.mark_charged(charged.clone(), account);
+    }
     let scope = crate::scope::Scope {
         key: principal
             .as_ref()
@@ -522,7 +531,7 @@ pub async fn dispatch(
     crate::scope::within(scope, async move {
         // Refused before the body is read, too.
         crate::scope::object(state, |_| Ok(())).await?;
-        route(
+        let mut response = route(
             state,
             request,
             auth,
@@ -532,7 +541,15 @@ pub async fn dispatch(
             method,
             copying,
         )
-        .await
+        .await?;
+        // "If the request succeeds and the requester is charged".
+        if !charged.is_empty() && response.status().is_success() {
+            response.headers_mut().insert(
+                "x-amz-request-charged",
+                hyper::header::HeaderValue::from_static("requester"),
+            );
+        }
+        Ok(response)
     })
     .await
 }
@@ -760,6 +777,19 @@ async fn route(
             authz.check(action, Bucket(&bucket))?;
             crate::sse::handle(state, request, auth, bucket, method).await
         }
+        (Target::Bucket(bucket), method) if has_param(&request, "requestPayment") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketRequestPayment",
+                Method::PUT => "s3:PutBucketRequestPayment",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?requestPayment"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            let account = authz.identity.account().map(str::to_string);
+            crate::request_payment::handle(state, request, auth, bucket, method, account).await
+        }
+        (Target::Object(..), _) if has_param(&request, "requestPayment") => Err(
+            S3Error::not_implemented("an object has no ?requestPayment configuration"),
+        ),
         (Target::Bucket(bucket), method) if has_param(&request, "cors") => {
             let action = match method {
                 Method::GET => "s3:GetBucketCORS",

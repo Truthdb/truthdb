@@ -49,6 +49,9 @@ pub const BUCKET_METRICS: u8 = 11;
 /// Bucket configuration: its replication configuration (the rendered XML).
 /// While it is set, the bucket's versioning stays enabled.
 pub const BUCKET_REPLICATION: u8 = 13;
+/// Bucket configuration: whether it is a Requester Pays bucket (one byte, 1;
+/// none: the bucket owner pays).
+pub const BUCKET_REQUEST_PAYMENT: u8 = 14;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()

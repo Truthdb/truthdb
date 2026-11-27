@@ -111,7 +111,7 @@ impl ExternalRowsets for S3Rowsets {
             "sys.dm_s3_api_activity" => {
                 return Some(open_api_activity(&self.core, name, args, caller));
             }
-            "sys.dm_s3_requests" | "sys.dm_s3_request_latency" => {
+            "sys.dm_s3_requests" | "sys.dm_s3_request_latency" | "sys.dm_s3_requester_charges" => {
                 return Some(open_requests(&self.request_metrics, name, args, caller));
             }
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
@@ -988,6 +988,36 @@ fn open_requests(
 ) -> Result<ExternalRowset, SqlError> {
     check_admin(name, caller)?;
     check_arg_count(name, args, 0, 0)?;
+    // `sys.dm_s3_requester_charges`: what each Requester Pays bucket's
+    // requesters were charged for since the server started, by bucket and
+    // requester's account: requests and their bytes.
+    if name == "sys.dm_s3_requester_charges" {
+        let rows = metrics
+            .charged_snapshot()
+            .iter()
+            .map(|((bucket, account), counters)| {
+                let (requests, downloaded, uploaded) = counters.counts();
+                vec![
+                    text(bucket),
+                    text(account),
+                    Datum::BigInt(requests as i64),
+                    Datum::BigInt(downloaded as i64),
+                    Datum::BigInt(uploaded as i64),
+                ]
+            })
+            .collect();
+        let columns = vec![
+            nvarchar("bucket_name", 63),
+            nvarchar("requester_account", 12),
+            bigint("requests"),
+            bigint("bytes_downloaded"),
+            bigint("bytes_uploaded"),
+        ];
+        return Ok(ExternalRowset {
+            columns,
+            rows: Box::new(Rows(Some(rows))),
+        });
+    }
     let snapshot = metrics.snapshot();
     let (columns, rows): (Vec<ResultColumn>, Vec<Vec<Datum>>) = if name == "sys.dm_s3_requests" {
         (

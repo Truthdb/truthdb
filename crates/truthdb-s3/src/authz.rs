@@ -37,6 +37,8 @@ pub struct BucketGrant {
     /// An S3 Tables table's storage bucket: its table, and the policies of
     /// its table bucket and table (its own has none).
     pub warehouse: Option<WarehouseGrant>,
+    /// A Requester Pays bucket (see `request_payment`).
+    pub requester_pays: bool,
 }
 
 /// An S3 Tables table's storage bucket, as authorization sees it.
@@ -225,6 +227,8 @@ fn load(
             Some(owner) => crate::public_access::effective(file, bucket, owner)?,
             None => 0,
         };
+        let requester_pays =
+            owner.is_some() && crate::request_payment::requester_pays(file, bucket)?;
         grants.insert(
             bucket.clone(),
             BucketGrant {
@@ -235,6 +239,7 @@ fn load(
                 zone,
                 created_ms,
                 warehouse,
+                requester_pays,
             },
         );
     }
@@ -475,6 +480,15 @@ impl Authz {
             self.check_with("s3:PutObjectTagging", resource, &context)?;
         }
         Ok(())
+    }
+
+    /// The Requester Pays buckets the request names, and their owners.
+    pub(crate) fn requester_pays(&self) -> Vec<(String, String)> {
+        self.buckets
+            .iter()
+            .filter(|(_, grant)| grant.requester_pays)
+            .filter_map(|(name, grant)| Some((name.clone(), grant.owner.clone()?)))
+            .collect()
     }
 
     /// The owners the request's buckets had when they were loaded (for the
