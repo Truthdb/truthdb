@@ -22725,6 +22725,9 @@ fn a_bucket_mounts_as_a_read_only_file_system_with_mountpoints_semantics() {
         file_mode: 0o644,
         dir_mode: 0o755,
         allow_other: false,
+        read_only: true,
+        allow_delete: false,
+        allow_overwrite: false,
     };
     let session = truthdb_mount::spawn(new_client(), options.clone(), &dir).expect("mount");
     let names = |path: &std::path::Path| {
@@ -22872,4 +22875,178 @@ fn process_ids() -> (u32, u32) {
             .expect("an id")
     };
     (field("Uid:"), field("Gid:"))
+}
+
+#[test]
+fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
+    let fuse = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse");
+    let fusermount = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join("fusermount3").exists())
+    });
+    if fuse.is_err() || !fusermount {
+        eprintln!("skipped: no /dev/fuse or fusermount3");
+        return;
+    }
+    let server = start_server();
+    let (_, key, secret) = account_with_key(&server, "writes");
+    let new_client = || {
+        truthdb_s3client::Client::new(truthdb_s3client::Config {
+            endpoint: format!("http://127.0.0.1:{}", server.s3_port),
+            region: "us-east-1".into(),
+            access_key: key.clone(),
+            secret: secret.clone(),
+            ca_pem: None,
+        })
+        .expect("client")
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let client = new_client();
+    runtime.block_on(async {
+        client.create_bucket("written").await.expect("bucket");
+        for (name, body) in [("old.txt", b"old\n".to_vec()), ("remote/x", b"x".to_vec())] {
+            client
+                .put_object("written", name, &[], body.into())
+                .await
+                .expect("put");
+        }
+    });
+    let read = |key: &str| {
+        runtime.block_on(async {
+            let mut download = match client.get_object("written", key).await {
+                Ok(download) => download,
+                Err(err) => return Err(err.to_string()),
+            };
+            let mut out = Vec::new();
+            while let Some(chunk) = download.next_chunk().await.map_err(|err| err.to_string())? {
+                out.extend_from_slice(&chunk);
+            }
+            Ok(out)
+        })
+    };
+    let dir = server.dir.join("mnt");
+    std::fs::create_dir_all(&dir).expect("mount point");
+    let (uid, gid) = process_ids();
+    let options = truthdb_mount::Options {
+        bucket: "written".into(),
+        prefix: String::new(),
+        uid,
+        gid,
+        file_mode: 0o644,
+        dir_mode: 0o755,
+        allow_other: false,
+        read_only: false,
+        allow_delete: false,
+        allow_overwrite: false,
+    };
+    let errno = |err: std::io::Error| err.raw_os_error();
+    let session = truthdb_mount::spawn(new_client(), options.clone(), &dir).expect("mount");
+    // New files: in the bucket once closed; one of several parts too.
+    std::fs::write(dir.join("new.txt"), b"new\n").unwrap();
+    assert_eq!(read("new.txt").unwrap(), b"new\n");
+    let big: Vec<u8> = (0..20 * 1024 * 1024u32).map(|n| (n % 253) as u8).collect();
+    std::fs::write(dir.join("big.bin"), &big).unwrap();
+    assert!(read("big.bin").unwrap() == big);
+    assert_eq!(
+        std::fs::metadata(dir.join("big.bin")).unwrap().len(),
+        big.len() as u64
+    );
+    // Written in order only; not read while written; nothing after a sync.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        let mut file = std::fs::File::create(dir.join("ordered.txt")).unwrap();
+        file.write_all(b"fir").unwrap();
+        // A child closes what it inherited of the file (exec closes it): that
+        // close is not the file's, which is written on.
+        assert!(Command::new("true").status().unwrap().success());
+        file.write_all(b"st").unwrap();
+        assert_eq!(
+            errno(file.write_at(b"later", 100).unwrap_err()),
+            Some(libc_errno::EINVAL)
+        );
+        assert_eq!(
+            errno(std::fs::File::open(dir.join("ordered.txt")).unwrap_err()),
+            Some(libc_errno::EPERM)
+        );
+        // Nor is its mode changed while written.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            errno(
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .unwrap_err()
+            ),
+            Some(libc_errno::EPERM)
+        );
+        file.sync_all().unwrap();
+        assert_eq!(read("ordered.txt").unwrap(), b"first");
+        assert!(file.write_all(b"more").is_err());
+    }
+    // Not replaced, nor deleted, unless allowed; not renamed; no chmod.
+    assert_eq!(
+        errno(std::fs::write(dir.join("old.txt"), b"x").unwrap_err()),
+        Some(libc_errno::EPERM)
+    );
+    assert_eq!(
+        errno(std::fs::remove_file(dir.join("old.txt")).unwrap_err()),
+        Some(libc_errno::EPERM)
+    );
+    assert_eq!(
+        errno(std::fs::rename(dir.join("old.txt"), dir.join("moved.txt")).unwrap_err()),
+        Some(libc_errno::ENOTSUP)
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        errno(
+            std::fs::set_permissions(dir.join("old.txt"), std::fs::Permissions::from_mode(0o600))
+                .unwrap_err()
+        ),
+        Some(libc_errno::EPERM)
+    );
+    assert_eq!(read("old.txt").unwrap(), b"old\n");
+    // A directory made: here only, until a file is written in it.
+    std::fs::create_dir(dir.join("made")).unwrap();
+    assert!(dir.join("made").is_dir());
+    std::fs::remove_dir(dir.join("made")).unwrap();
+    assert!(!dir.join("made").exists());
+    std::fs::create_dir(dir.join("kept")).unwrap();
+    std::fs::write(dir.join("kept/inside.txt"), b"in\n").unwrap();
+    assert_eq!(read("kept/inside.txt").unwrap(), b"in\n");
+    assert_eq!(
+        errno(std::fs::remove_dir(dir.join("kept")).unwrap_err()),
+        Some(libc_errno::ENOTEMPTY)
+    );
+    // A directory of the bucket's (not made here) is not removed.
+    assert_eq!(
+        errno(std::fs::remove_dir(dir.join("remote")).unwrap_err()),
+        Some(libc_errno::EPERM)
+    );
+    drop(session);
+    // Allowed: replaced (truncated), and deleted.
+    let session = truthdb_mount::spawn(
+        new_client(),
+        truthdb_mount::Options {
+            allow_delete: true,
+            allow_overwrite: true,
+            ..options.clone()
+        },
+        &dir,
+    )
+    .expect("mount");
+    std::fs::write(dir.join("old.txt"), b"replaced\n").unwrap();
+    assert_eq!(read("old.txt").unwrap(), b"replaced\n");
+    std::fs::remove_file(dir.join("new.txt")).unwrap();
+    assert!(read("new.txt").is_err());
+    assert!(!dir.join("new.txt").exists());
+    drop(session);
+}
+
+/// The errno values the write test expects (Linux).
+mod libc_errno {
+    pub const EPERM: i32 = 1;
+    pub const EINVAL: i32 = 22;
+    pub const ENOTEMPTY: i32 = 39;
+    pub const ENOTSUP: i32 = 95;
 }
