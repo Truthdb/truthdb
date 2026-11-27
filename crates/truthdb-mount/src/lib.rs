@@ -234,16 +234,19 @@ impl Mount {
                     .list_objects(bucket, &prefix, Some("/"), next.as_deref())
                     .await?;
                 for common in &page.prefixes {
-                    let name = common[prefix.len()..].trim_end_matches('/');
-                    if shown(name)
-                        && common.ends_with('/')
-                        && name.len() + 1 == common.len() - prefix.len()
-                    {
+                    // (A service answering what was not asked for: skipped.)
+                    let Some(rest) = common.strip_prefix(prefix.as_str()) else {
+                        continue;
+                    };
+                    let name = rest.trim_end_matches('/');
+                    if shown(name) && rest.ends_with('/') && name.len() + 1 == rest.len() {
                         directories.push(name.to_string());
                     }
                 }
                 for object in page.objects {
-                    let name = &object.key[prefix.len()..];
+                    let Some(name) = object.key.strip_prefix(prefix.as_str()) else {
+                        continue;
+                    };
                     if shown(name) {
                         files.push((
                             name.to_string(),

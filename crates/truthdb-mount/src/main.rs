@@ -124,6 +124,19 @@ fn main() -> Result<()> {
         dir_mode: mode(&args.dir_mode)?,
         allow_other: args.allow_other,
     };
+    // The signals are taken before the mount is made: one arriving at once
+    // still unmounts it.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (mut term, mut interrupt) = {
+        let _entered = runtime.enter();
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
     let mut session = truthdb_mount::session(client, options, &args.directory)
         .with_context(|| format!("mounting {} at {}", args.bucket, args.directory.display()))?;
     let mut unmounter = session.unmount_callable();
@@ -135,17 +148,13 @@ fn main() -> Result<()> {
         let _ = ended.send(());
         result
     });
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
     let stopped = runtime.block_on(async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        Ok::<_, std::io::Error>(tokio::select! {
-            _ = tokio::signal::ctrl_c() => true,
+        tokio::select! {
+            _ = interrupt.recv() => true,
             _ = term.recv() => true,
             _ = end => false,
-        })
-    })?;
+        }
+    });
     if stopped {
         unmounter.unmount().context("unmounting")?;
     }

@@ -26,7 +26,37 @@ fn mounted(dir: &Path) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some(&*dir))
 }
 
-fn start(dir: &Path) -> Child {
+/// A binary started: killed, and its mount removed, when dropped, however
+/// the test ends.
+struct Started {
+    child: Child,
+    dir: PathBuf,
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if mounted(&self.dir) {
+            let _ = Command::new("fusermount3")
+                .arg("-u")
+                .arg("-z")
+                .arg(&self.dir)
+                .status();
+        }
+    }
+}
+
+/// The mount point, removed when dropped.
+struct MountPoint(PathBuf);
+
+impl Drop for MountPoint {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+fn start(dir: &Path) -> Started {
     let child = Command::new(env!("CARGO_BIN_EXE_truthdb-mount"))
         .args([
             "--endpoint-url",
@@ -40,19 +70,23 @@ fn start(dir: &Path) -> Child {
         .arg(dir)
         .spawn()
         .expect("start truthdb-mount");
+    let started = Started {
+        child,
+        dir: dir.to_path_buf(),
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !mounted(dir) {
         assert!(Instant::now() < deadline, "not mounted");
         std::thread::sleep(Duration::from_millis(50));
     }
-    child
+    started
 }
 
-/// Whether `child` exits within a few seconds.
-fn exits(child: &mut Child) -> bool {
+/// Whether `started` exits within a few seconds.
+fn exits(started: &mut Started) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if child.try_wait().expect("wait").is_some() {
+        if started.child.try_wait().expect("wait").is_some() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -66,35 +100,32 @@ fn it_ends_when_unmounted_and_unmounts_when_stopped() {
         eprintln!("skipped: no /dev/fuse or fusermount3");
         return;
     }
-    let dir: PathBuf =
-        std::env::temp_dir().join(format!("truthdb-mount-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mount point");
+    let point =
+        MountPoint(std::env::temp_dir().join(format!("truthdb-mount-test-{}", std::process::id())));
+    std::fs::create_dir_all(&point.0).expect("mount point");
     // Unmounted from outside: it ends.
-    let mut child = start(&dir);
+    let mut started = start(&point.0);
     let unmounted = Command::new("fusermount3")
         .arg("-u")
-        .arg(&dir)
+        .arg(&point.0)
         .status()
         .expect("fusermount3");
     assert!(unmounted.success());
-    let ended = exits(&mut child);
-    if !ended {
-        let _ = child.kill();
+    assert!(
+        exits(&mut started),
+        "still running after its mount was unmounted"
+    );
+    // Stopped (SIGTERM), even at once: it unmounts, and ends.
+    for _ in 0..5 {
+        let mut started = start(&point.0);
+        let term = Command::new("kill")
+            .args(["-TERM", &started.child.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(term.success());
+        assert!(exits(&mut started), "still running after SIGTERM");
+        let status = started.child.wait().expect("status");
+        assert!(status.success(), "{status}");
+        assert!(!mounted(&point.0), "still mounted after SIGTERM");
     }
-    assert!(ended, "still running after its mount was unmounted");
-    // Stopped (SIGTERM): it unmounts, and ends.
-    let mut child = start(&dir);
-    let term = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill");
-    assert!(term.success());
-    let ended = exits(&mut child);
-    if !ended {
-        let _ = child.kill();
-        let _ = Command::new("fusermount3").arg("-u").arg(&dir).status();
-    }
-    assert!(ended, "still running after SIGTERM");
-    assert!(!mounted(&dir), "still mounted after SIGTERM");
-    std::fs::remove_dir(&dir).ok();
 }
