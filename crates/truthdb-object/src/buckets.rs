@@ -191,15 +191,22 @@ pub fn validate_bucket_name(name: &str) -> Result<(), BucketError> {
             return Err(BucketError::InvalidName("uses a reserved suffix"));
         }
     }
-    // Not AWS's rule: here access point and Object Lambda access point
-    // hosts share the buckets' domains
+    // Not AWS's rule: here access point, Object Lambda access point and
+    // accelerate endpoint hosts share the buckets' domains
     // (`<name>-<account>.s3-accesspoint.<region>.<domain>`, and the same with
     // `s3-object-lambda`), so a bucket's virtual host must not be one (under
     // any of the domains, which may include `<region>.<domain>`).
-    for label in ["s3-accesspoint", "s3-object-lambda"] {
+    // The accelerate endpoint is its own host too (`s3-accelerate.<domain>`,
+    // and `s3-accelerate.dualstack.<domain>`).
+    if name == "s3-accelerate" || name.starts_with("s3-accelerate.") {
+        return Err(BucketError::InvalidName(
+            "must not have an \"s3-accelerate\" label",
+        ));
+    }
+    for label in ["s3-accesspoint", "s3-object-lambda", "s3-accelerate"] {
         if name.contains(&format!(".{label}.")) || name.ends_with(&format!(".{label}")) {
             return Err(BucketError::InvalidName(
-                "must not have an \"s3-accesspoint\" or \"s3-object-lambda\" label",
+                "must not have an \"s3-accesspoint\", \"s3-object-lambda\" or \"s3-accelerate\" label",
             ));
         }
     }
@@ -566,6 +573,9 @@ mod tests {
             "reader-111111111111.s3-accesspoint",
             "shaper-111111111111.s3-object-lambda.us-east-1",
             "shaper-111111111111.s3-object-lambda",
+            "data.s3-accelerate",
+            "s3-accelerate",
+            "s3-accelerate.dualstack",
         ] {
             assert!(validate_bucket_name(bad).is_err(), "{bad}");
         }

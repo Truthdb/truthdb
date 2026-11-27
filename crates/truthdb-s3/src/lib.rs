@@ -1,6 +1,7 @@
 //! TruthDB's S3-compatible HTTP API: path-style REST/XML requests, signed
 //! with AWS Signature Version 4, served over the object engine.
 
+pub mod accelerate;
 pub mod access_log;
 pub mod access_points;
 pub mod activity;
