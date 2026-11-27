@@ -22010,10 +22010,9 @@ config = {"Id": "main", "IsEnabled": True,
     "AccountLevel": dict(levels, BucketLevel=dict(levels, PrefixLevel={"StorageMetrics": {
         "IsEnabled": True, "SelectionCriteria": {"Delimiter": "/", "MaxDepth": 4,
         "MinStorageBytesPercentage": 1.5}}})),
-    "Include": {"Buckets": ["arn:aws:s3:::data", "arn:aws:s3:::logs"], "Regions": ["us-east-1"]},
-    "DataExport": {"S3BucketDestination": {"Format": "Parquet", "OutputSchemaVersion": "V_1",
-        "AccountId": account, "Arn": "arn:aws:s3:::reports", "Prefix": "lens",
-        "Encryption": {"SSES3": {}}}, "CloudWatchMetrics": {"IsEnabled": True}}}
+    "Include": {"Buckets": ["arn:aws:s3:::data", "arn:aws:s3:::logs"], "Regions": ["us-east-1"]}}
+destination = {"Format": "Parquet", "OutputSchemaVersion": "V_1", "AccountId": account,
+    "Arn": "arn:aws:s3:::reports", "Prefix": "lens", "Encryption": {"SSES3": {}}}
 assert control.list_storage_lens_configurations(AccountId=account).get("StorageLensConfigurationList", []) == []
 refused(lambda: control.get_storage_lens_configuration(AccountId=account, ConfigId="main"), "NoSuchConfiguration")
 control.put_storage_lens_configuration(AccountId=account, ConfigId="main", StorageLensConfiguration=config,
@@ -22054,8 +22053,11 @@ for bad in [
     with_(AccountLevel=dict(config["AccountLevel"], DetailedStatusCodesMetrics={"IsEnabled": True})),
     with_(AccountLevel=dict(config["AccountLevel"], StorageLensGroupLevel={})),
     with_(AwsOrg={"Arn": "arn:aws:organizations::111111111111:organization/o-abc"}),
-    with_(DataExport={"S3BucketDestination": dict(config["DataExport"]["S3BucketDestination"],
+    with_(DataExport={"S3BucketDestination": dict(destination,
         Encryption={"SSEKMS": {"KeyId": "arn:aws:kms:us-east-1:111111111111:key/1"}})}),
+    # Not built yet: exports and CloudWatch publishing.
+    with_(DataExport={"S3BucketDestination": destination}),
+    with_(DataExport={"CloudWatchMetrics": {"IsEnabled": True}}),
 ]:
     refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
         StorageLensConfiguration=bad), "NotImplemented")
@@ -22065,8 +22067,7 @@ for bad in [
     with_(Id="other"),
     with_(StorageLensArn=f"arn:aws:s3:us-east-1:{account}:storage-lens/other"),
     with_(AccountLevel={"ActivityMetrics": {"IsEnabled": True}, "BucketLevel": {}}),
-    with_(DataExport={"S3BucketDestination": dict(config["DataExport"]["S3BucketDestination"],
-        AccountId="12")}),
+    with_(DataExport={"S3BucketDestination": dict(destination, AccountId="12")}),
 ]:
     refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
         StorageLensConfiguration=bad), "InvalidRequest")

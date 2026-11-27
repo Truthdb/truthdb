@@ -178,7 +178,11 @@ fn parse(
         // The request's own tags (PutStorageLensConfiguration's).
         if let Some(rest) = path.strip_prefix(&format!("{root}/Tags")) {
             match rest {
-                "" => {}
+                "" => {
+                    if !seen.insert(path.as_str()) {
+                        return Err(malformed());
+                    }
+                }
                 "/Tag" => {
                     if let Some(done) = tag.take() {
                         tags.push(finish_tag(done)?);
@@ -199,6 +203,9 @@ fn parse(
             continue;
         }
         if !under.is_empty() && path.as_str() == format!("{root}/{under}") {
+            if !seen.insert(path.as_str()) {
+                return Err(malformed());
+            }
             continue;
         }
         // Each element once, but a list's members.
@@ -500,9 +507,14 @@ fn parse_tags(body: &[u8], root: &str) -> Result<Vec<(String, String)>, S3Error>
     }
     let mut tags = Vec::new();
     let mut tag: Option<(Option<String>, Option<String>)> = None;
+    let mut has_tags = false;
     for (path, text) in &elements[1..] {
         match path.strip_prefix(root).unwrap_or("") {
-            "/Tags" => {}
+            "/Tags" => {
+                if std::mem::replace(&mut has_tags, true) {
+                    return Err(malformed());
+                }
+            }
             "/Tags/Tag" => {
                 if let Some(done) = tag.take() {
                     tags.push(finish_tag(done)?);
@@ -841,6 +853,15 @@ async fn put(
     if config.id != id {
         return Err(invalid("The configuration's Id is the one its path names."));
     }
+    // Kept by the parser, but nothing exports or publishes metrics yet.
+    if config.export.is_some() {
+        return Err(S3Error::not_implemented("Storage Lens metrics exports"));
+    }
+    if config.cloudwatch {
+        return Err(S3Error::not_implemented(
+            "Storage Lens metrics published to CloudWatch",
+        ));
+    }
     let document = config.render();
     let (of, name) = (account.to_string(), key(account, id));
     let made = crate::scope::object(state, move |file| {
@@ -1016,6 +1037,7 @@ mod tests {
             ("<Id>a</Id><AccountLevel><ActivityMetrics><IsEnabled>true</IsEnabled></ActivityMetrics><BucketLevel/></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "levels not consistent"),
             (format!("<Id>a</Id>{levels}<DataExport><CloudWatchMetrics/></DataExport><IsEnabled>true</IsEnabled>"), "CloudWatch without IsEnabled"),
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>//</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a long delimiter"),
+            (format!("<Id>a</Id>{levels}<IsEnabled>true</IsEnabled></StorageLensConfiguration><StorageLensConfiguration><PrefixDelimiter>/</PrefixDelimiter>"), "the configuration twice"),
             ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><MaxDepth>3</MaxDepth><MaxDepth>7</MaxDepth></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "MaxDepth twice"),
             ("<Id>a</Id><AccountLevel><BucketLevel><ActivityMetrics><IsEnabled>true</IsEnabled></ActivityMetrics><ActivityMetrics><IsEnabled>false</IsEnabled></ActivityMetrics></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a level's metrics twice"),
             (format!("<Id>a</Id>{levels}<Include><Buckets><Arn>arn:aws:s3:::{}</Arn></Buckets></Include><IsEnabled>true</IsEnabled>", "x".repeat(116)), "a bucket ARN too long"),
@@ -1053,6 +1075,21 @@ mod tests {
 
     #[test]
     fn tags_are_read_once_each() {
+        // A Put's tags: in one <Tags>.
+        let put = |tags: &str| {
+            parse(
+                format!("<PutStorageLensConfigurationRequest><StorageLensConfiguration><Id>a</Id><AccountLevel><BucketLevel/></AccountLevel><IsEnabled>true</IsEnabled></StorageLensConfiguration>{tags}</PutStorageLensConfigurationRequest>").as_bytes(),
+                "PutStorageLensConfigurationRequest",
+                "StorageLensConfiguration",
+                &|id| arn("us-east-1", "111111111111", id),
+            )
+            .map(|(_, tags)| tags)
+        };
+        assert_eq!(
+            put("<Tags><Tag><Key>a</Key><Value>1</Value></Tag></Tags>").unwrap(),
+            vec![("a".into(), "1".into())]
+        );
+        assert!(put("<Tags><Tag><Key>a</Key><Value>1</Value></Tag></Tags><Tags><Tag><Key>b</Key><Value>2</Value></Tag></Tags>").is_err());
         let body = |tags: &str| {
             format!(
                 "<PutStorageLensConfigurationTaggingRequest><Tags>{tags}</Tags></PutStorageLensConfigurationTaggingRequest>"
@@ -1073,6 +1110,7 @@ mod tests {
             body("<Tag><Value>1</Value></Tag>"),
             body(&"<Tag><Key>k</Key><Value>v</Value></Tag>".replace("k", &"k".repeat(129))),
             body("<Tag><Key>a*</Key><Value>1</Value></Tag>"),
+            body("</Tags><Tags><Tag><Key>a</Key><Value>1</Value></Tag>"),
             body("<Tag><Key>a\nb</Key><Value>1</Value></Tag>"),
             body("<Tag><Key>a</Key><Value>x\ty</Value></Tag>"),
         ] {
