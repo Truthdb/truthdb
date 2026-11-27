@@ -23,9 +23,13 @@
 //! `aws:CalledVia` hold, so a supporting access point's policy may grant to
 //! requests through Object Lambda alone.
 //!
-//! What else Object Lambda serves (HeadObject, ListObjects and
-//! ListObjectsV2 transformed by their function's return value, and
-//! requests no transformation names) is not built yet: 501.
+//! A HeadObject, ListObjects or ListObjectsV2 the access point transforms
+//! is answered by what its function returns. A request no transformation
+//! names is passed on to the supporting access point ("All other requests
+//! are processed as normal"), as one made through Object Lambda.
+//!
+//! Each is authorized as AWS's `s3-object-lambda` action for it (see
+//! [`lambda_action`]) on the Object Lambda access point.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -58,8 +62,9 @@ const URL_EXPIRES: u64 = 300;
 /// The route a function answers on (the host prefix of its
 /// WriteGetObjectResponse).
 const ROUTE: &str = "io-truthdb";
-/// A function's answer to its invocation, at most (it is not read).
-const MAX_INVOCATION_ANSWER: usize = 1024 * 1024;
+/// A function's answer to its invocation, at most (a GetObject's is not
+/// read; a listing's may hold a thousand keys of a kilobyte each).
+const MAX_INVOCATION_ANSWER: usize = 16 * 1024 * 1024;
 
 /// The key the marks of presigned URLs are made with: this process's own
 /// (a URL outlives no restart).
@@ -209,80 +214,139 @@ pub(crate) async fn route(
     if request.method() == Method::POST && request.uri().path() == "/WriteGetObjectResponse" {
         return write_get_object_response(state, request, auth).await;
     }
+    // Served as any request is (see `api::dispatch`), which takes the
+    // Object Lambda access point its host names.
     match resolve(state, &request, auth.principal.as_ref()).await? {
-        Some(via) => serve(state, request, auth, via).await,
+        Some(_) => crate::api::dispatch(state, request, auth).await,
         None => Err(S3Error::invalid_request(
             "A request signed for s3-object-lambda names an Object Lambda access point",
         )),
     }
 }
 
-/// Serves `request` through Object Lambda access point `via`.
+/// The operation a request through an Object Lambda access point is, if a
+/// transformation may name it: an object's GetObject or HeadObject, or a
+/// listing of the bucket (ListObjectsV2 with `list-type=2`).
+fn action_of(request: &Request<Incoming>) -> Result<Option<&'static str>, S3Error> {
+    if crate::api::subresource(request).is_some() {
+        return Ok(None);
+    }
+    Ok(
+        match (crate::api::named_target(request)?, request.method()) {
+            (Target::Object(..), &Method::GET) => Some("GetObject"),
+            (Target::Object(..), &Method::HEAD) => Some("HeadObject"),
+            (Target::Bucket(_), &Method::GET) => Some(
+                match crate::listing::query_params(request.uri().query().unwrap_or(""))
+                    .iter()
+                    .find(|(name, _)| name == "list-type")
+                    .map(|(_, value)| value.as_str())
+                {
+                    Some("2") => "ListObjectsV2",
+                    _ => "ListObjects",
+                },
+            ),
+            _ => None,
+        },
+    )
+}
+
+/// Serves `request` through Object Lambda access point `via`: by its
+/// function, if a transformation names the operation (the response); else
+/// passed on to its supporting access point ("All other requests are
+/// processed as normal"), `request` then being one through it (none).
 pub(crate) async fn serve(
     state: &S3State,
-    request: Request<Incoming>,
-    auth: Authenticated,
+    request: &mut Request<Incoming>,
+    auth: &Authenticated,
     via: ViaLambda,
-) -> Result<Response<Body>, S3Error> {
+) -> Result<Option<Response<Body>>, S3Error> {
     if auth.session.is_some() {
         return Err(session_refused());
     }
     let Some(principal) = auth.principal.clone() else {
         return Err(S3Error::access_denied("Access Denied"));
     };
-    let key = match crate::api::named_target(&request)? {
-        Target::Object(_, key) => key,
-        _ => {
-            return Err(S3Error::not_implemented(
-                "Listings through an Object Lambda access point",
-            ));
-        }
-    };
-    if request.method() != Method::GET || crate::api::subresource(&request).is_some() {
-        return Err(S3Error::not_implemented(
-            "Operations through an Object Lambda access point other than GetObject",
-        ));
-    }
-    let configuration = &via.configuration;
-    let Some(transformation) = configuration.transformations.iter().find(|transformation| {
-        transformation
-            .actions
+    let held = &*request;
+    let action = action_of(held)?;
+    let transformation = action.and_then(|action| {
+        via.configuration
+            .transformations
             .iter()
-            .any(|action| action == "GetObject")
-    }) else {
-        return Err(S3Error::not_implemented(
-            "A GetObject the Object Lambda access point does not transform",
-        ));
-    };
-    // Ranges and parts only as its features allow (the function serves them).
-    let allows = |feature: &str| configuration.features.iter().any(|known| known == feature);
-    if request.headers().contains_key("range") && !allows("GetObject-Range") {
-        return Err(S3Error::not_implemented(
-            "A Range through this Object Lambda access point",
-        ));
-    }
-    if crate::api::has_param(&request, "partNumber") && !allows("GetObject-PartNumber") {
-        return Err(S3Error::not_implemented(
-            "A partNumber through this Object Lambda access point",
-        ));
-    }
+            .find(|transformation| transformation.actions.iter().any(|named| named == action))
+    });
     let point = &via.point;
     let point_arn = lambda_arn(&state.region, &point.account, &point.name);
-    let query = request.uri().query().unwrap_or("").to_string();
+    let query = held.uri().query().unwrap_or("").to_string();
     let authz = Authz::load(
         state,
         Some(&principal),
         auth.signed,
-        request.headers(),
+        held.headers(),
         &query,
-        request.extensions().get::<Connection>().copied(),
+        held.extensions().get::<Connection>().copied(),
         Vec::new(),
         Vec::new(),
     )
     .await?;
     let policies: Vec<&Policy> = via.policy.iter().collect();
+    let (Some(action), Some(transformation)) = (action, transformation) else {
+        // Passed on: as its operation, on the Object Lambda access point,
+        // then through its supporting access point as through Object Lambda.
+        let name = crate::activity::data_event_name(held)
+            .and_then(|name| lambda_action(name, crate::api::has_param(held, "versionId")))
+            .ok_or_else(|| {
+                S3Error::not_implemented("This operation through an Object Lambda access point")
+            })?;
+        authz.check_arn_with(
+            &format!("s3-object-lambda:{name}"),
+            &point_arn,
+            &point.account,
+            &policies,
+        )?;
+        let (account, supporting) = supporting_point(&via.configuration.supporting, &state.region)
+            .ok_or_else(|| S3Error::internal("a stored supporting access point is not one"))?;
+        crate::access_points::resolve_point(
+            state,
+            request,
+            Some(&principal),
+            &account,
+            &supporting,
+        )
+        .await
+        .map_err(|err| match err.code {
+            "NoSuchAccessPoint" => no_supporting_point(),
+            _ => err,
+        })?;
+        // Every check the operation makes is made here too (see
+        // `Authz::through_lambda`).
+        request.extensions_mut().insert(crate::authz::LambdaGate {
+            arn: point_arn,
+            account: point.account.clone(),
+            policy: via.policy.clone(),
+        });
+        return Ok(None);
+    };
+    let configuration = &via.configuration;
+    // Ranges and parts only as its features allow (the function serves them).
+    let allows = |feature: &str| configuration.features.iter().any(|known| known == feature);
+    if matches!(action, "GetObject" | "HeadObject") {
+        if held.headers().contains_key("range") && !allows(&format!("{action}-Range")) {
+            return Err(S3Error::not_implemented(
+                "A Range through this Object Lambda access point",
+            ));
+        }
+        if crate::api::has_param(held, "partNumber") && !allows(&format!("{action}-PartNumber")) {
+            return Err(S3Error::not_implemented(
+                "A partNumber through this Object Lambda access point",
+            ));
+        }
+    }
     authz.check_arn_with(
-        "s3-object-lambda:GetObject",
+        &format!(
+            "s3-object-lambda:{}",
+            lambda_action(action, crate::api::has_param(held, "versionId"))
+                .expect("a transformed operation's action")
+        ),
         &point_arn,
         &point.account,
         &policies,
@@ -329,11 +393,7 @@ pub(crate) async fn serve(
     )
     .await?;
     let (Some(supporting), secret) = found else {
-        return Err(S3Error::new(
-            404,
-            "NoSuchAccessPoint",
-            "The Object Lambda access point's supporting access point does not exist",
-        ));
+        return Err(no_supporting_point());
     };
     // The caller's own key signs the function's read: as AWS's is "signed by
     // using the original caller's identity".
@@ -360,17 +420,17 @@ pub(crate) async fn serve(
         .await
         .map_err(|err| S3Error::internal(err.to_string()))?
         .ok_or_else(function_not_found)?;
-    let request_id = request
+    let request_id = held
         .extensions()
         .get::<RequestIds>()
         .map(|ids| ids.request_id.clone())
         .unwrap_or_default();
-    let tls = request
+    let tls = held
         .extensions()
         .get::<Connection>()
         .is_some_and(|connection| connection.tls);
     let scheme = if tls { "https" } else { "http" };
-    let host = request
+    let host = held
         .headers()
         .get(hyper::header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -386,69 +446,102 @@ pub(crate) async fn serve(
         .first()
         .cloned()
         .unwrap_or_else(|| "localhost".to_string());
+    // The function's read: the object (its version, its part), or the
+    // listing with all the caller's query but its signature.
+    let (method, path, passed) = match crate::api::named_target(held)? {
+        Target::Object(_, key) => (
+            if action == "HeadObject" {
+                "HEAD"
+            } else {
+                "GET"
+            },
+            format!("/{}/{}", supporting.alias, crate::sigv4::encode_key(&key)),
+            query
+                .split('&')
+                .filter(|pair| {
+                    let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+                    matches!(name, "versionId" | "partNumber")
+                })
+                .collect::<Vec<_>>()
+                .join("&"),
+        ),
+        _ => (
+            "GET",
+            format!("/{}", supporting.alias),
+            without_authorization(&query).join("&"),
+        ),
+    };
     let input_url = presign(
+        method,
         &format!("{domain}{port}"),
         scheme,
-        &supporting.alias,
-        &key,
-        &query,
+        &path,
+        &passed,
         &principal.access_key,
         &secret,
         &state.region,
     );
     let token = random_token();
-    let event = serde_json::json!({
-        "xAmzRequestId": request_id,
-        "getObjectContext": {
+    let context = match action {
+        "GetObject" => serde_json::json!({
             "inputS3Url": input_url,
             "outputRoute": ROUTE,
             "outputToken": token,
-        },
+        }),
+        _ => serde_json::json!({ "inputS3Url": input_url }),
+    };
+    let context_key = match action {
+        "GetObject" => "getObjectContext",
+        "HeadObject" => "headObjectContext",
+        "ListObjects" => "listObjectsContext",
+        _ => "listObjectsV2Context",
+    };
+    let mut event = serde_json::json!({
+        "xAmzRequestId": request_id,
         "configuration": {
             "accessPointArn": point_arn,
             "supportingAccessPointArn": configuration.supporting,
             "payload": transformation.payload.clone().unwrap_or_default(),
         },
         "userRequest": {
-            "url": user_url(scheme, &host, &request),
-            "headers": user_headers(&request),
+            "url": user_url(scheme, &host, held),
+            "headers": user_headers(held),
         },
         "userIdentity": identity(&principal),
         "protocolVersion": "1.00",
-    })
-    .to_string();
+    });
+    event[context_key] = context;
+    let event = event.to_string();
+    let delivery = format!("object-lambda/{request_id}");
+    if action != "GetObject" {
+        // Answered by what the function returns.
+        let invocation = invoke(webhook, delivery, event);
+        let returned = tokio::select! {
+            returned = invocation => returned.ok().flatten(),
+            _ = tokio::time::sleep(ANSWER_WITHIN) => None,
+        };
+        let (status, body) = returned.ok_or_else(|| {
+            S3Error::new(
+                500,
+                "LambdaInvocationFailed",
+                "The Object Lambda access point's function could not be invoked",
+            )
+        })?;
+        if !(200..300).contains(&status) {
+            return Err(S3Error::new(
+                500,
+                "LambdaRuntimeError",
+                format!("The Object Lambda access point's function failed: HTTP {status}"),
+            ));
+        }
+        return returned_response(action, &body, &request_id, held.uri().path()).map(Some);
+    }
     let (answered, answer) = oneshot::channel();
     lock_waiting().insert(token.clone(), answered);
     let _waiting = Waiting(token.clone());
-    let (url, webhook_secret) = webhook;
-    let delivery = format!("object-lambda/{request_id}");
-    let invocation = tokio::spawn(async move {
-        let Some(poster) = POSTER
-            .get_or_init(|| truthdb_s3client::Poster::new(None).ok())
-            .as_ref()
-        else {
-            return;
-        };
-        let secs = crate::objects::now_ms() / 1000;
-        let headers = [
-            ("content-type", "application/json".to_string()),
-            ("x-truthdb-delivery", delivery.clone()),
-            (
-                "x-truthdb-signature",
-                truthdb_s3client::webhook_signature(
-                    &webhook_secret,
-                    secs,
-                    &delivery,
-                    event.as_bytes(),
-                ),
-            ),
-        ];
-        // Its answer is not read: the function answers with
-        // WriteGetObjectResponse.
-        let _ = poster
-            .post_answer(&url, &headers, Bytes::from(event), MAX_INVOCATION_ANSWER)
-            .await;
-    });
+    // Its return is not read: the function answers with
+    // WriteGetObjectResponse.
+    let invocation = invoke(webhook, delivery, event);
     let failed = || {
         S3Error::new(
             500,
@@ -467,7 +560,316 @@ pub(crate) async fn serve(
     let Some(answer) = answer else {
         return Err(failed());
     };
-    Ok(answer_response(answer, &request_id, request.uri().path()))
+    Ok(Some(answer_response(
+        answer,
+        &request_id,
+        held.uri().path(),
+    )))
+}
+
+/// AWS's `s3-object-lambda` actions (the service authorization reference's).
+pub(crate) const LAMBDA_ACTIONS: [&str; 26] = [
+    "AbortMultipartUpload",
+    "DeleteObject",
+    "DeleteObjectTagging",
+    "DeleteObjectVersion",
+    "DeleteObjectVersionTagging",
+    "GetObject",
+    "GetObjectAcl",
+    "GetObjectLegalHold",
+    "GetObjectRetention",
+    "GetObjectTagging",
+    "GetObjectVersion",
+    "GetObjectVersionAcl",
+    "GetObjectVersionTagging",
+    "ListBucket",
+    "ListBucketMultipartUploads",
+    "ListBucketVersions",
+    "ListMultipartUploadParts",
+    "PutObject",
+    "PutObjectAcl",
+    "PutObjectLegalHold",
+    "PutObjectRetention",
+    "PutObjectTagging",
+    "PutObjectVersionAcl",
+    "PutObjectVersionTagging",
+    "RestoreObject",
+    "WriteGetObjectResponse",
+];
+
+/// AWS's `s3-object-lambda` action for the operation of data event `name`
+/// (`versioned`: naming an object's version), as `s3:` actions authorize
+/// them: the reads as GetObject, the listings as ListBucket, the writes of
+/// a body (copies and the multipart upload's) as PutObject. An operation it
+/// has none for is not served through an Object Lambda access point.
+fn lambda_action(name: &str, versioned: bool) -> Option<&'static str> {
+    let of = |plain: &'static str, version: &'static str| match versioned {
+        true => version,
+        false => plain,
+    };
+    Some(match name {
+        "GetObject" | "HeadObject" => of("GetObject", "GetObjectVersion"),
+        "ListObjects" | "ListObjectsV2" => "ListBucket",
+        "ListObjectVersions" => "ListBucketVersions",
+        "PutObject"
+        | "CopyObject"
+        | "CreateMultipartUpload"
+        | "UploadPart"
+        | "UploadPartCopy"
+        | "CompleteMultipartUpload" => "PutObject",
+        "AbortMultipartUpload" => "AbortMultipartUpload",
+        "ListParts" => "ListMultipartUploadParts",
+        "DeleteObject" => of("DeleteObject", "DeleteObjectVersion"),
+        "DeleteObjects" => "DeleteObject",
+        "GetObjectTagging" => of("GetObjectTagging", "GetObjectVersionTagging"),
+        "PutObjectTagging" => of("PutObjectTagging", "PutObjectVersionTagging"),
+        "DeleteObjectTagging" => of("DeleteObjectTagging", "DeleteObjectVersionTagging"),
+        "GetObjectAcl" => of("GetObjectAcl", "GetObjectVersionAcl"),
+        "PutObjectAcl" => of("PutObjectAcl", "PutObjectVersionAcl"),
+        "GetObjectLegalHold" => "GetObjectLegalHold",
+        "PutObjectLegalHold" => "PutObjectLegalHold",
+        "GetObjectRetention" => "GetObjectRetention",
+        "PutObjectLockRetention" => "PutObjectRetention",
+        "RestoreObject" => "RestoreObject",
+        _ => return None,
+    })
+}
+
+fn no_supporting_point() -> S3Error {
+    S3Error::new(
+        404,
+        "NoSuchAccessPoint",
+        "The Object Lambda access point's supporting access point does not exist",
+    )
+}
+
+/// POSTs `event` to the function's webhook (`url` and the `secret` its POSTs
+/// are signed with): its status and what it returned (none: it could not be
+/// reached).
+fn invoke(
+    (url, secret): (String, String),
+    delivery: String,
+    event: String,
+) -> tokio::task::JoinHandle<Option<(u16, Bytes)>> {
+    tokio::spawn(async move {
+        let poster = POSTER
+            .get_or_init(|| truthdb_s3client::Poster::new(None).ok())
+            .as_ref()?;
+        let secs = crate::objects::now_ms() / 1000;
+        let headers = [
+            ("content-type", "application/json".to_string()),
+            ("x-truthdb-delivery", delivery.clone()),
+            (
+                "x-truthdb-signature",
+                truthdb_s3client::webhook_signature(&secret, secs, &delivery, event.as_bytes()),
+            ),
+        ];
+        poster
+            .post_answer(&url, &headers, Bytes::from(event), MAX_INVOCATION_ANSWER)
+            .await
+            .ok()
+    })
+}
+
+/// The pairs of `query` but those authenticating a presigned URL.
+fn without_authorization(query: &str) -> Vec<&str> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            !crate::server::QUERY_AUTH_PARAMS
+                .iter()
+                .any(|auth| name.eq_ignore_ascii_case(auth))
+                && !name.eq_ignore_ascii_case(MARK)
+        })
+        .collect()
+}
+
+/// The caller's answer from what a HeadObject's or a listing's function
+/// returned: `statusCode`, an error (`errorCode`, `errorMessage`), and
+/// HeadObject's `headers` (its `Content-Length` required) or a listing's
+/// `listResultXml` (forwarded as it is) or `listBucketResult` (rendered).
+fn returned_response(
+    action: &str,
+    body: &[u8],
+    request_id: &str,
+    resource: &str,
+) -> Result<Response<Body>, S3Error> {
+    let invalid = |why: &str| {
+        S3Error::new(
+            500,
+            "LambdaInvalidResponse",
+            format!("The Object Lambda access point's function returned {why}"),
+        )
+    };
+    let returned: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| invalid("no JSON"))?;
+    let status = returned["statusCode"]
+        .as_u64()
+        .and_then(|status| u16::try_from(status).ok())
+        .filter(|status| (200..600).contains(status))
+        .ok_or_else(|| invalid("no statusCode"))?;
+    if let Some(code) = returned["errorCode"].as_str() {
+        let message = returned["errorMessage"].as_str().unwrap_or("").to_string();
+        return Ok(answer_response(
+            Answer {
+                status,
+                error: Some((code.to_string(), message)),
+                headers: Vec::new(),
+                body: mpsc::channel(1).1,
+            },
+            request_id,
+            resource,
+        ));
+    }
+    let mut builder = Response::builder().status(status);
+    if action == "HeadObject" {
+        let headers = returned["headers"]
+            .as_object()
+            .ok_or_else(|| invalid("no headers"))?;
+        let text = |value: &serde_json::Value| match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            serde_json::Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        };
+        let mut sized = false;
+        for (name, value) in headers {
+            let name = name.to_ascii_lowercase();
+            let Some(value) = text(value) else {
+                return Err(invalid(&format!("header {name} of no text")));
+            };
+            if name == "content-length" {
+                if sized {
+                    return Err(invalid("Content-Length twice"));
+                }
+                value
+                    .parse::<u64>()
+                    .map_err(|_| invalid("a Content-Length that is no length"))?;
+                sized = true;
+            } else if !FORWARDED.contains(&name.as_str()) && !name.starts_with("x-amz-meta-") {
+                continue;
+            }
+            builder = builder.header(name, value);
+        }
+        if !sized {
+            return Err(invalid("no Content-Length"));
+        }
+        return builder
+            .body(full(Vec::new()))
+            .map_err(|_| invalid("headers that are not valid"));
+    }
+    let xml = match (
+        returned["listResultXml"].as_str(),
+        returned.get("listBucketResult"),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(invalid("both listResultXml and listBucketResult"));
+        }
+        (Some(xml), None) => xml.to_string(),
+        (None, Some(result)) => list_xml(action == "ListObjectsV2", result).map_err(invalid)?,
+        (None, None) => return Err(invalid("no listing")),
+    };
+    Ok(builder
+        .header("content-type", "application/xml")
+        .body(full(xml))
+        .expect("a valid response"))
+}
+
+/// A `listBucketResult` as ListObjects' (or ListObjectsV2's) XML, its
+/// required fields there.
+fn list_xml(v2: bool, result: &serde_json::Value) -> Result<String, &'static str> {
+    let escape = crate::access_points::escape;
+    let text = |name: &str| result[name].as_str().map(escape);
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    let name = text("name").ok_or("a listBucketResult without its name")?;
+    out.push_str(&format!("<Name>{name}</Name>"));
+    let optional: &[(&str, &str)] = if v2 {
+        &[
+            ("prefix", "Prefix"),
+            ("startAfter", "StartAfter"),
+            ("continuationToken", "ContinuationToken"),
+            ("nextContinuationToken", "NextContinuationToken"),
+            ("delimiter", "Delimiter"),
+            ("encodingType", "EncodingType"),
+        ]
+    } else {
+        &[
+            ("prefix", "Prefix"),
+            ("marker", "Marker"),
+            ("nextMarker", "NextMarker"),
+            ("delimiter", "Delimiter"),
+            ("encodingType", "EncodingType"),
+        ]
+    };
+    for (field, element) in optional {
+        if let Some(value) = text(field) {
+            out.push_str(&format!("<{element}>{value}</{element}>"));
+        }
+    }
+    if v2 {
+        let count = result["keyCount"]
+            .as_u64()
+            .ok_or("a listBucketResult without its keyCount")?;
+        out.push_str(&format!("<KeyCount>{count}</KeyCount>"));
+    }
+    let max = result["maxKeys"]
+        .as_u64()
+        .ok_or("a listBucketResult without its maxKeys")?;
+    let truncated = result["isTruncated"]
+        .as_bool()
+        .ok_or("a listBucketResult without its isTruncated")?;
+    out.push_str(&format!(
+        "<MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>"
+    ));
+    for object in result["contents"].as_array().into_iter().flatten() {
+        let key = object["key"].as_str().ok_or("an object without its key")?;
+        let size = object["size"]
+            .as_u64()
+            .ok_or("an object without its size")?;
+        out.push_str(&format!("<Contents><Key>{}</Key>", escape(key)));
+        for (field, element) in [
+            ("lastModified", "LastModified"),
+            ("eTag", "ETag"),
+            ("checksumAlgorithm", "ChecksumAlgorithm"),
+        ] {
+            if let Some(value) = object[field].as_str() {
+                out.push_str(&format!("<{element}>{}</{element}>", escape(value)));
+            }
+        }
+        out.push_str(&format!("<Size>{size}</Size>"));
+        if let Some(owner) = object.get("owner").filter(|owner| !owner.is_null()) {
+            let (Some(id), display) = (owner["id"].as_str(), owner["displayName"].as_str()) else {
+                return Err("an owner without its id");
+            };
+            if !v2 && display.is_none() {
+                return Err("an owner without its displayName");
+            }
+            out.push_str(&format!("<Owner><ID>{}</ID>", escape(id)));
+            if let Some(display) = display {
+                out.push_str(&format!("<DisplayName>{}</DisplayName>", escape(display)));
+            }
+            out.push_str("</Owner>");
+        }
+        if let Some(class) = object["storageClass"].as_str() {
+            out.push_str(&format!("<StorageClass>{}</StorageClass>", escape(class)));
+        }
+        out.push_str("</Contents>");
+    }
+    for prefix in result["commonPrefixes"].as_array().into_iter().flatten() {
+        let prefix = prefix["prefix"]
+            .as_str()
+            .ok_or("a common prefix without its prefix")?;
+        out.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            escape(prefix)
+        ));
+    }
+    out.push_str("</ListBucketResult>");
+    Ok(out)
 }
 
 fn session_refused() -> S3Error {
@@ -621,31 +1023,30 @@ fn identity(principal: &crate::server::Principal) -> serde_json::Value {
     }
 }
 
-/// What the mark of a URL presigned for a function is of: a GET, by its
-/// access key, to its host and path, with its query (all of it but the mark
-/// and the signature: its signing time and expiry among it).
-fn marked(access_key: &str, host: &str, path: &str, query: &str) -> String {
+/// What the mark of a URL presigned for a function is of: its method, its
+/// access key, its host and path, and its query (all of it but the mark and
+/// the signature: its signing time and expiry among it).
+fn marked(method: &str, access_key: &str, host: &str, path: &str, query: &str) -> String {
     format!(
-        "GET\n{access_key}\n{host}\n{path}\n{}",
+        "{method}\n{access_key}\n{host}\n{path}\n{}",
         crate::sigv4::canonical_query(query)
     )
 }
 
-/// A GetObject URL for `key` through the access point of alias `alias` at
-/// `host`, with the caller's query (its version, its part), presigned with
-/// `access_key` and its `secret` and marked as made for a function.
+/// A URL for the function's `method` request of `path` at `host`, with
+/// query `passed`, presigned with `access_key` and its `secret` and marked
+/// as made for a function.
 #[allow(clippy::too_many_arguments)]
 fn presign(
+    method: &str,
     host: &str,
     scheme: &str,
-    alias: &str,
-    key: &str,
-    caller_query: &str,
+    path: &str,
+    passed: &str,
     access_key: &str,
     secret: &str,
     region: &str,
 ) -> String {
-    let path = format!("/{alias}/{}", crate::sigv4::encode_key(key));
     let now = crate::time::iso8601(crate::objects::now_ms());
     // `2026-11-26T10:00:00.000Z` as `20261126T100000Z`.
     let amz_date: String = now[..19]
@@ -662,12 +1063,9 @@ fn presign(
     };
     let expires = URL_EXPIRES.to_string();
     let encode = |text: &str| percent_encoding::utf8_percent_encode(text, QUERY).to_string();
-    let mut query: Vec<String> = caller_query
+    let mut query: Vec<String> = passed
         .split('&')
-        .filter(|pair| {
-            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
-            matches!(name, "versionId" | "partNumber")
-        })
+        .filter(|pair| !pair.is_empty())
         .map(str::to_string)
         .collect();
     query.extend([
@@ -683,11 +1081,14 @@ fn presign(
     let unmarked = query.join("&");
     let query = format!(
         "{unmarked}&{MARK}={}",
-        crate::sigv4::sign(&MARK_KEY, &marked(access_key, host, &path, &unmarked))
+        crate::sigv4::sign(
+            &MARK_KEY,
+            &marked(method, access_key, host, path, &unmarked)
+        )
     );
     let canonical = crate::sigv4::canonical_request(
-        "GET",
-        &path,
+        method,
+        path,
         &query,
         &[("host".to_string(), host.to_string())],
         &["host".to_string()],
@@ -740,7 +1141,7 @@ pub(crate) fn called_via<B>(request: &Request<B>, auth: &Authenticated) -> Resul
     };
     if signed.auth_type != "REST-QUERY-STRING"
         || auth.session.is_some()
-        || request.method() != Method::GET
+        || !matches!(*request.method(), Method::GET | Method::HEAD)
     {
         return Err(refused());
     }
@@ -757,6 +1158,7 @@ pub(crate) fn called_via<B>(request: &Request<B>, auth: &Authenticated) -> Resul
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let wanted = marked(
+        request.method().as_str(),
         &principal.access_key,
         host,
         request.uri().path(),

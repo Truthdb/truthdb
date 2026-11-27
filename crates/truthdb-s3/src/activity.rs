@@ -317,6 +317,12 @@ impl Call {
     }
 }
 
+/// The name of the data event `request` makes, if it makes one (the
+/// operation an Object Lambda access point passes on is authorized by it).
+pub(crate) fn data_event_name(request: &hyper::Request<Incoming>) -> Option<&'static str> {
+    data_event(request).map(|(name, _, _)| name)
+}
+
 /// The data event a request makes: its name, bucket and object (S3's
 /// AWS::S3::Object data events, and HeadBucket and listings of a bucket).
 fn data_event(
