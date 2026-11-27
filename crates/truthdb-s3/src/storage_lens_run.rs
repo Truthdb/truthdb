@@ -10,8 +10,8 @@
 //!
 //! Requests are counted from the server's request counters (since it
 //! started), the growth since the last count going to the day of the count,
-//! at most a minute (or a report) apart: those since the last count before
-//! a crash are not counted.
+//! at most a minute (or a report) apart, and once more as the server stops:
+//! those since the last count before a crash are not counted.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -76,6 +76,12 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
     };
     loop {
         if *shutdown.borrow() {
+            // The requests since the last count, counted before stopping.
+            if !state.storage.is_standby()
+                && let Err(err) = count(&state, &mut pass).await
+            {
+                eprintln!("storage lens: {err}");
+            }
             return;
         }
         if state.storage.is_standby() {
@@ -382,7 +388,7 @@ async fn write(
             Some(false) => break,
         }
     }
-    let ends = truthdb_object::lens_batches(&records);
+    let ends = truthdb_object::lens_batches(&due.key, &records);
     let records = Arc::new(records);
     let mut start = 0;
     for end in ends {

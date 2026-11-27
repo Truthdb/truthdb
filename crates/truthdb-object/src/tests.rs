@@ -9267,7 +9267,7 @@ fn storage_lens_records_of_long_prefixes_are_written_and_dropped_within_the_log(
         .transaction(|tx| tx.track_lens(config, 1))
         .unwrap();
     let mut start = 0;
-    for end in lens_batches(&records) {
+    for end in lens_batches(config, &records) {
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| tx.put_lens_records(config, 1, 100, &records[start..end]))
             .unwrap();

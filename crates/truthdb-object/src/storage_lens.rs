@@ -30,13 +30,21 @@ pub const LENS_BATCH: usize = 1000;
 /// prefix's record holds up to a key's 1024 bytes).
 pub const LENS_BATCH_BYTES: usize = 64 * 1024;
 
-/// The ends of `records`' batches: each at most [`LENS_BATCH`] records of
-/// at most [`LENS_BATCH_BYTES`] (one record at least).
-pub fn lens_batches(records: &[LensRecord]) -> Vec<usize> {
+/// The ends of `records`' batches (of configuration `config`'s report):
+/// each at most [`LENS_BATCH`] records of at most [`LENS_BATCH_BYTES`] of
+/// keys (one record at least).
+pub fn lens_batches(config: &str, records: &[LensRecord]) -> Vec<usize> {
     let mut ends = Vec::new();
     let (mut count, mut bytes) = (0, 0);
     for (at, record) in records.iter().enumerate() {
-        let size = 32
+        // As `record_key` makes it: the configuration, a NUL, the
+        // generation, the day, the type, four lengths and the fields.
+        let size = config.len()
+            + 1
+            + 8
+            + 4
+            + 1
+            + 4 * 2
             + record.bucket.len()
             + record.record_value.len()
             + record.storage_class.len()
@@ -611,21 +619,33 @@ mod tests {
         };
         let short = vec![record(1); 2 * LENS_BATCH + 1];
         assert_eq!(
-            lens_batches(&short),
+            lens_batches("a/b", &short),
             [LENS_BATCH, 2 * LENS_BATCH, 2 * LENS_BATCH + 1]
         );
         let long = vec![record(1000); 200];
-        let ends = lens_batches(&long);
+        let ends = lens_batches("a/b", &long);
         let mut start = 0;
         for end in &ends {
             let bytes: usize = long[start..*end]
                 .iter()
-                .map(|r| 32 + 4 + r.record_value.len() + 8 + 12)
+                .map(|r| record_key("a/b", 0, 0, r).len())
                 .sum();
             assert!(bytes <= LENS_BATCH_BYTES && *end > start, "{ends:?}");
             start = *end;
         }
         assert_eq!(start, long.len());
-        assert!(lens_batches(&[]).is_empty());
+        assert!(lens_batches("a/b", &[]).is_empty());
+        // Of the longest configuration key: its keys count too.
+        let config = format!("111111111111/{}", "c".repeat(64));
+        let ends = lens_batches(&config, &short);
+        let mut start = 0;
+        for end in &ends {
+            let bytes: usize = short[start..*end]
+                .iter()
+                .map(|r| record_key(&config, 0, 0, r).len())
+                .sum();
+            assert!(bytes <= LENS_BATCH_BYTES, "{bytes} in {ends:?}");
+            start = *end;
+        }
     }
 }
