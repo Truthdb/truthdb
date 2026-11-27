@@ -22,7 +22,7 @@ use crate::server::S3State;
 
 /// The metrics, by the code the history keeps them under: their names and
 /// units.
-pub const METRICS: [(u8, &str, &str); 19] = [
+pub const METRICS: [(u8, &str, &str); 24] = [
     (ALL_REQUESTS, "AllRequests", "Count"),
     (1, "GetRequests", "Count"),
     (2, "PutRequests", "Count"),
@@ -54,6 +54,11 @@ pub const METRICS: [(u8, &str, &str); 19] = [
         "OperationsFailedReplication",
         "Count",
     ),
+    (PROXIED_REQUESTS, "ProxiedRequests", "Count"),
+    (INVOKED_LAMBDA, "InvokedLambda", "Count"),
+    (LAMBDA_RESPONSE_REQUESTS, "LambdaResponseRequests", "Count"),
+    (LAMBDA_RESPONSE_4XX, "LambdaResponse4xx", "Count"),
+    (LAMBDA_RESPONSE_5XX, "LambdaResponse5xx", "Count"),
 ];
 const ALL_REQUESTS: u8 = 0;
 const BYTES_DOWNLOADED: u8 = 7;
@@ -69,6 +74,48 @@ pub const REPLICATION_LATENCY: u8 = 15;
 pub const BYTES_PENDING_REPLICATION: u8 = 16;
 pub const OPERATIONS_PENDING_REPLICATION: u8 = 17;
 pub const OPERATIONS_FAILED_REPLICATION: u8 = 18;
+
+/// The Object Lambda access point metrics of their own (the request
+/// metrics are kept for them too).
+pub const PROXIED_REQUESTS: u8 = 19;
+pub const INVOKED_LAMBDA: u8 = 20;
+pub const LAMBDA_RESPONSE_REQUESTS: u8 = 21;
+pub const LAMBDA_RESPONSE_4XX: u8 = 22;
+pub const LAMBDA_RESPONSE_5XX: u8 = 23;
+
+/// Whether metric `code` is an Object Lambda access point's alone.
+pub fn is_object_lambda_metric(code: u8) -> bool {
+    (PROXIED_REQUESTS..=LAMBDA_RESPONSE_5XX).contains(&code)
+}
+
+/// What an Object Lambda access point's series are kept under in place of
+/// a bucket's name (no bucket's name has a colon).
+const OBJECT_LAMBDA_SERIES: &str = "objectlambda:";
+
+/// The series key of `account`'s Object Lambda access point `name`.
+pub(crate) fn object_lambda_series(account: &str, name: &str) -> String {
+    format!("{OBJECT_LAMBDA_SERIES}{account}:{name}")
+}
+
+/// The Object Lambda access point a series key names, if it names one: its
+/// account and name.
+pub(crate) fn object_lambda_of(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix(OBJECT_LAMBDA_SERIES)?.split_once(':')
+}
+
+/// When what series key `key` names was made (ms): its bucket, or its
+/// Object Lambda access point; none if it is not there.
+pub(crate) fn made_of(
+    file: &mut truthdb_object::ObjFile<'_>,
+    key: &str,
+) -> Result<Option<u64>, truthdb_core::storage::StorageError> {
+    Ok(match object_lambda_of(key) {
+        Some((account, name)) => file
+            .object_lambda_point(account, name)?
+            .map(|point| point.created_ms),
+        None => file.bucket(key)?.map(|info| info.created_ms),
+    })
+}
 
 /// Whether metric `code` is a replication metric (kept by rule, not by a
 /// metrics configuration).
@@ -149,6 +196,51 @@ pub(crate) fn answered(
     point
 }
 
+/// Counts a request to an Object Lambda access point (`lambda`) in its own
+/// series: the request metrics and whether its function was invoked or it
+/// was passed on; or a function's WriteGetObjectResponse, as such (by its
+/// answer's status). What is counted when its answer's body is sent too
+/// (none for a WriteGetObjectResponse).
+pub(crate) fn object_lambda_answered(
+    recorder: &Arc<MetricRecorder>,
+    lambda: crate::metering::LambdaSeen,
+    kind: RequestKind,
+    uploaded: u64,
+    status: u16,
+    first_byte: Duration,
+    at: u64,
+) -> Option<(Arc<MetricRecorder>, Matched, u64)> {
+    use crate::metering::LambdaRole;
+    let matched = Matched::single(lambda.series, lambda.made_ms);
+    let point = match lambda.role {
+        LambdaRole::Responding => {
+            let mut point = MetricPoint::new();
+            point.insert(LAMBDA_RESPONSE_REQUESTS, Stats::of(1.0));
+            point.insert(
+                LAMBDA_RESPONSE_4XX,
+                Stats::of(f64::from(u8::from((400..500).contains(&status)))),
+            );
+            point.insert(
+                LAMBDA_RESPONSE_5XX,
+                Stats::of(f64::from(u8::from((500..600).contains(&status)))),
+            );
+            recorder.record(&matched, at, &point);
+            return None;
+        }
+        role => {
+            let mut point = answered(kind, uploaded, status, first_byte);
+            let code = match role {
+                LambdaRole::Invoked => INVOKED_LAMBDA,
+                _ => PROXIED_REQUESTS,
+            };
+            point.insert(code, Stats::of(1.0));
+            point
+        }
+    };
+    recorder.record(&matched, at, &point);
+    Some((Arc::clone(recorder), matched, at))
+}
+
 /// What a request counts when its answer's body is sent.
 pub(crate) fn finished(downloaded: u64, total: Duration) -> MetricPoint {
     let mut point = MetricPoint::new();
@@ -204,6 +296,14 @@ pub(crate) struct Matched {
 impl Matched {
     pub(crate) fn is_empty(&self) -> bool {
         self.series.is_empty()
+    }
+
+    /// The one series `series`, of what was made at `made_ms`.
+    pub(crate) fn single(series: MetricSeries, made_ms: u64) -> Matched {
+        Matched {
+            made_ms,
+            series: vec![series],
+        }
     }
 }
 
@@ -416,8 +516,7 @@ impl MetricRecorder {
                         let current = match made.get(&series.bucket) {
                             Some(current) => *current,
                             None => {
-                                let current =
-                                    file.bucket(&series.bucket)?.map(|info| info.created_ms);
+                                let current = made_of(file, &series.bucket)?;
                                 made.insert(series.bucket.clone(), current);
                                 current
                             }

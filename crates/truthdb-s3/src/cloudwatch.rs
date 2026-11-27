@@ -22,7 +22,8 @@ use truthdb_object::{MetricSeries, RESOLUTIONS, SeriesBy, Stats};
 
 use crate::error::S3Error;
 use crate::metric_history::{
-    ALL_STORAGE_TYPES, BUCKET_SIZE_BYTES, METRICS, NUMBER_OF_OBJECTS, is_replication_metric,
+    ALL_STORAGE_TYPES, BUCKET_SIZE_BYTES, METRICS, NUMBER_OF_OBJECTS, TOTAL_REQUEST_LATENCY,
+    is_object_lambda_metric, is_replication_metric,
 };
 use crate::server::{Body, Connection, S3State, full};
 
@@ -164,16 +165,32 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CwE
     let account = principal.account.clone();
     let now = crate::objects::now_ms() / 1000;
     // The caller's buckets, and when each was made: its series' points
-    // from then on (a bucket of the same name before it was another's).
+    // from then on (a bucket of the same name before it was another's);
+    // and its Object Lambda access points, the same way.
     let owned: Owned = state
         .engine
         .run_object(move |file| {
-            Ok(file
+            let mut owned: Owned = file
                 .list_buckets()?
                 .into_iter()
                 .filter(|bucket| bucket.owner == account)
                 .map(|bucket| (bucket.name, bucket.created_ms))
-                .collect())
+                .collect();
+            let mut after: Option<String> = None;
+            loop {
+                let page = file.object_lambda_points(&account, after.as_deref(), 1000)?;
+                let Some(last) = page.last() else {
+                    break;
+                };
+                after = Some(last.name.clone());
+                for point in page {
+                    owned.insert(
+                        crate::metric_history::object_lambda_series(&account, &point.name),
+                        point.created_ms,
+                    );
+                }
+            }
+            Ok(owned)
         })
         .await?;
     match operation.as_str() {
@@ -300,6 +317,30 @@ fn series_of(
         };
         return Some((MetricSeries { bucket, by }, created));
     }
+    // An Object Lambda access point's: by its name and its data source.
+    if let Some(name) = value("AccessPointName") {
+        if dimensions.len() != 2
+            || !(code <= TOTAL_REQUEST_LATENCY || is_object_lambda_metric(code))
+        {
+            return None;
+        }
+        let (bucket, created) = owned.iter().find(|(key, _)| {
+            crate::metric_history::object_lambda_of(key).is_some_and(|(_, named)| named == name)
+        })?;
+        let by = SeriesBy::ObjectLambda {
+            source: value("DataSourceARN")?,
+        };
+        return Some((
+            MetricSeries {
+                bucket: bucket.clone(),
+                by,
+            },
+            *created,
+        ));
+    }
+    if is_object_lambda_metric(code) {
+        return None;
+    }
     let bucket = value("BucketName")?;
     let created = *owned.get(&bucket)?;
     if dimensions.len() != 2 {
@@ -337,9 +378,7 @@ fn still(
     bucket: &str,
     made_ms: u64,
 ) -> Result<bool, truthdb_core::storage::StorageError> {
-    Ok(file
-        .bucket(bucket)?
-        .is_some_and(|info| info.created_ms == made_ms))
+    Ok(crate::metric_history::made_of(file, bucket)? == Some(made_ms))
 }
 
 /// Whether the point of `resolution` seconds at `at` is read: not past its
@@ -763,6 +802,15 @@ async fn list_metrics(
                     ("SourceBucket", series.bucket.clone()),
                     ("DestinationBucket", destination.clone()),
                     ("RuleId", rule.clone()),
+                ],
+                SeriesBy::ObjectLambda { source } => vec![
+                    (
+                        "AccessPointName",
+                        crate::metric_history::object_lambda_of(&series.bucket)
+                            .map_or("", |(_, name)| name)
+                            .to_string(),
+                    ),
+                    ("DataSourceARN", source.clone()),
                 ],
             };
             if !filters.iter().all(|(name, value)| {

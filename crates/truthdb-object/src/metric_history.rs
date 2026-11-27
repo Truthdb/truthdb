@@ -32,6 +32,11 @@ pub enum SeriesBy {
     /// `DestinationBucket` and `RuleId` dimensions; the series' bucket is
     /// the `SourceBucket`).
     Replication { destination: String, rule: String },
+    /// An Object Lambda access point's requests by where they got their
+    /// data (the `DataSourceARN` dimension: its function's ARN, or its
+    /// supporting access point's); the series' bucket names the access
+    /// point (see `object_lambda_series` in the S3 layer).
+    ObjectLambda { source: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -48,6 +53,7 @@ impl MetricSeries {
             SeriesBy::Filter(id) => (0u8, id.clone()),
             SeriesBy::StorageType(storage_type) => (1u8, storage_type.clone()),
             SeriesBy::Replication { destination, rule } => (2u8, format!("{destination}\0{rule}")),
+            SeriesBy::ObjectLambda { source } => (3u8, source.clone()),
         };
         [self.bucket.as_bytes(), &[0, kind], value.as_bytes(), &[0]].concat()
     }
@@ -80,6 +86,7 @@ impl MetricSeries {
                 destination: field()?,
                 rule: field()?,
             },
+            3 => SeriesBy::ObjectLambda { source: field()? },
             _ => return Err(corrupt("metric series")),
         };
         Ok((
@@ -456,5 +463,27 @@ mod tests {
         assert_eq!(decode(&row).unwrap(), point);
         assert!(decode(&[row.clone(), row].concat()).is_err());
         assert!(decode(&encode(&point)[..10]).is_err());
+    }
+
+    #[test]
+    fn every_kind_of_series_reads_back_from_its_key() {
+        for by in [
+            SeriesBy::Filter("docs".into()),
+            SeriesBy::StorageType("StandardStorage".into()),
+            SeriesBy::Replication {
+                destination: "copies".into(),
+                rule: "r1".into(),
+            },
+            SeriesBy::ObjectLambda {
+                source: "arn:aws:lambda:us-east-1:111111111111:function:shape".into(),
+            },
+        ] {
+            let series = MetricSeries {
+                bucket: "objectlambda:111111111111:shaper".into(),
+                by,
+            };
+            let key = series.key();
+            assert_eq!(MetricSeries::from_key(&key).unwrap(), (series, key.len()));
+        }
     }
 }

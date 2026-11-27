@@ -21036,6 +21036,83 @@ refused(lambda: client("s3", nogrant_key, nogrant_secret).write_get_object_respo
 refused(lambda: s3.get_object(Bucket="nothing-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa--ol-s3", Key="doc"), "NoSuchBucket")
 refused(lambda: lambdas.get_object(Bucket=f"arn:aws:s3-object-lambda:us-east-1:{account}:accesspoint/nothing", Key="doc"),
     "NoSuchAccessPoint")
+# Its metrics, when on: in AWS/S3, by AccessPointName and DataSourceARN
+# (its function's ARN when it invoked it, its supporting access point's when
+# it passed the request on).
+import datetime
+def wait_for(check):
+    deadline = time.time() + 30
+    while not check():
+        assert time.time() < deadline, "never"
+        time.sleep(0.5)
+counted = control.create_access_point_for_object_lambda(AccountId=account, Name="counted", Configuration=dict(
+    configuration("shape"), CloudWatchMetricsEnabled=True))["Alias"]["Value"]
+assert s3.get_object(Bucket=counted, Key="doc")["Body"].read() == b"HELLO"
+assert s3.head_object(Bucket=counted, Key="doc")["ContentLength"] == 5
+cw = client("cloudwatch", key, secret)
+function_arn = f"arn:aws:lambda:us-east-1:{account}:function:shape"
+supporting_arn = f"arn:aws:s3:us-east-1:{account}:accesspoint/reader"
+now = datetime.datetime.now(datetime.timezone.utc)
+def total(name, point, source):
+    points = cw.get_metric_statistics(Namespace="AWS/S3", MetricName=name,
+        Dimensions=[{"Name": "AccessPointName", "Value": point}, {"Name": "DataSourceARN", "Value": source}],
+        StartTime=now - datetime.timedelta(minutes=30), EndTime=now + datetime.timedelta(minutes=5),
+        Period=60, Statistics=["Sum"])["Datapoints"]
+    return sum(point["Sum"] for point in points)
+wait_for(lambda: total("LambdaResponseRequests", "counted", function_arn) == 1
+    and total("AllRequests", "counted", supporting_arn) == 1)
+assert [total(name, "counted", function_arn) for name in
+    ["AllRequests", "GetRequests", "InvokedLambda", "ProxiedRequests", "LambdaResponse4xx", "BytesDownloaded"]] \
+    == [1, 1, 1, 0, 0, 5]
+assert [total(name, "counted", supporting_arn) for name in ["HeadRequests", "ProxiedRequests", "InvokedLambda"]] \
+    == [1, 1, 0]
+# And when their answers' bodies were sent: their total latency.
+def samples(name, source):
+    points = cw.get_metric_statistics(Namespace="AWS/S3", MetricName=name,
+        Dimensions=[{"Name": "AccessPointName", "Value": "counted"}, {"Name": "DataSourceARN", "Value": source}],
+        StartTime=now - datetime.timedelta(minutes=30), EndTime=now + datetime.timedelta(minutes=5),
+        Period=60, Statistics=["SampleCount"])["Datapoints"]
+    return sum(point["SampleCount"] for point in points)
+assert (samples("TotalRequestLatency", function_arn), samples("TotalRequestLatency", supporting_arn)) == (1, 1)
+listed = cw.list_metrics(Namespace="AWS/S3", Dimensions=[{"Name": "AccessPointName", "Value": "counted"}])["Metrics"]
+assert {m["MetricName"] for m in listed} >= {"AllRequests", "InvokedLambda", "ProxiedRequests", "LambdaResponseRequests"}, listed
+# None for an access point whose metrics are off.
+assert total("AllRequests", "shaper", function_arn) == 0
+# Its events: Object Lambda's, on the access point, for a request its
+# function answered (a passed-on one is the supporting access point's).
+import gzip
+s3.create_bucket(Bucket="trail-logs")
+ct = client("cloudtrail", key, secret)
+ct.create_trail(Name="lambdas", S3BucketName="trail-logs")
+ct.put_event_selectors(TrailName="lambdas", AdvancedEventSelectors=[{"Name": "data", "FieldSelectors": [
+    {"Field": "eventCategory", "Equals": ["Data"]},
+    {"Field": "resources.type", "Equals": ["AWS::S3ObjectLambda::AccessPoint", "AWS::S3::Object"]}]}])
+ct.start_logging(Name="lambdas")
+assert s3.get_object(Bucket=counted, Key="doc")["Body"].read() == b"HELLO"
+assert s3.head_object(Bucket=counted, Key="doc")["ContentLength"] == 5
+counted_arn = f"arn:aws:s3-object-lambda:us-east-1:{account}:accesspoint/counted"
+def trail_records():
+    out = []
+    for o in s3.list_objects_v2(Bucket="trail-logs").get("Contents", []):
+        out += json.loads(gzip.decompress(s3.get_object(Bucket="trail-logs", Key=o["Key"])["Body"].read()))["Records"]
+    return out
+def through_counted():
+    return [r for r in trail_records() if r["requestParameters"].get("bucketName") == counted]
+def headed_events():
+    return [r for r in trail_records() if r["eventName"] == "HeadObject"]
+wait_for(lambda: through_counted() and headed_events())
+got_event = [r for r in through_counted() if r["eventName"] == "GetObject"][0]
+assert got_event["eventSource"] == "s3-object-lambda.amazonaws.com", got_event
+assert got_event["resources"] == [{"accountId": account, "type": "AWS::S3ObjectLambda::AccessPoint",
+    "ARN": counted_arn}], got_event
+assert got_event["requestParameters"]["key"] == "doc", got_event
+# The passed-on HEAD, and the function's own read: the supporting access
+# point's, on its bucket.
+headed_event = headed_events()[0]
+assert headed_event["eventSource"] == "s3.amazonaws.com", headed_event
+assert {"accountId": account, "type": "AWS::S3::AccessPoint", "ARN": supporting_arn} in headed_event["resources"], headed_event
+assert [r["eventSource"] for r in trail_records() if r["eventName"] == "GetObject"
+    and r["requestParameters"].get("bucketName") == "data"] == ["s3.amazonaws.com"]
 # Its supporting access point deleted: not there to read through.
 control.delete_access_point(AccountId=account, Name="reader")
 refused(lambda: s3.get_object(Bucket=alias, Key="doc"), "NoSuchAccessPoint")
