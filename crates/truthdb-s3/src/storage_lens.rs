@@ -870,6 +870,8 @@ pub async fn handle(
                     file.transaction(|tx| {
                         let deleted = tx.delete_bucket_config("", STORAGE_LENS, &name)?;
                         tx.delete_bucket_config("", STORAGE_LENS_TAGS, &name)?;
+                        // Its reports go with it.
+                        tx.forget_lens(&name)?;
                         Ok(deleted)
                     })
                 })
@@ -915,6 +917,7 @@ async fn put(
     }
     let document = config.render();
     let (of, name) = (account.to_string(), key(account, id));
+    let generation = crate::objects::now_ms();
     let made = crate::scope::object(state, move |file| {
         let existing = file.bucket_config("", STORAGE_LENS, &name)?.is_some();
         if !existing && configurations_of(file, &of)?.len() >= MAX_CONFIGURATIONS {
@@ -922,6 +925,8 @@ async fn put(
         }
         file.transaction(|tx| {
             tx.put_bucket_config("", STORAGE_LENS, &name, document.as_bytes())?;
+            // Its reports' generation (one replaced keeps its own).
+            tx.track_lens(&name, generation)?;
             if tags.is_empty() {
                 tx.delete_bucket_config("", STORAGE_LENS_TAGS, &name)?;
             } else {
@@ -936,6 +941,8 @@ async fn put(
             "An account has at most {MAX_CONFIGURATIONS} Storage Lens configurations."
         )));
     }
+    // Its first report is made at once.
+    crate::storage_lens_run::wake();
     Ok(empty())
 }
 

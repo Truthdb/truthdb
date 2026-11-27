@@ -406,6 +406,7 @@ pub(in crate::engine::relational) fn is_sys_view(name: &str) -> bool {
                 | "sys.dm_s3_imports"
                 | "sys.dm_s3_batch_jobs"
                 | "sys.dm_s3_bucket_usage"
+                | "sys.dm_s3_storage_lens"
                 | "sys.dm_s3_storage"
                 | "sys.dm_s3_api_activity"
                 | "sys.dm_s3_requests"

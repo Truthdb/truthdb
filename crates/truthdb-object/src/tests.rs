@@ -9,7 +9,10 @@ use truthdb_core::storage::{
 use truthdb_core::wal::records::{PageOpUndo, RelRecord};
 
 use crate::body::SEGMENT_BYTES;
-use crate::{BodyLease, BodyWriter, DEFAULT_ACCOUNT, ObjEngine, ObjFile};
+use crate::{
+    BodyLease, BodyWriter, DEFAULT_ACCOUNT, LENS_BATCH, LensRecord, LensRecordType, LensState,
+    ObjEngine, ObjFile, lens_batches,
+};
 
 const RING: u64 = 8 * 1024 * 1024;
 const GRACE: u64 = 1_000;
@@ -9031,6 +9034,274 @@ fn maintenance_records_are_kept_per_table_and_bucket_and_tables_are_listed_acros
         Ok(())
     );
     assert_eq!(read(None, config), None);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn storage_lens_reports_are_read_once_reported_and_dropped_in_batches() {
+    let path = temp_path("storage-lens");
+    let storage = create(&path);
+    let mut lock = storage.lock();
+    let mut file = ObjFile::new(&mut lock);
+    let record = |metric: &str, value: u64| LensRecord {
+        record_type: LensRecordType::Bucket,
+        bucket: "data".into(),
+        record_value: String::new(),
+        storage_class: "STANDARD".into(),
+        metric: metric.into(),
+        value,
+    };
+    let config = "111111111111/lens";
+    assert_eq!(file.lens_state(config).unwrap(), None);
+    file.transaction(|tx| tx.track_lens(config, 1)).unwrap();
+    // Tracked again (a configuration replaced): its generation stays.
+    file.transaction(|tx| tx.track_lens(config, 2)).unwrap();
+    assert_eq!(
+        file.lens_state(config).unwrap(),
+        Some(LensState {
+            generation: 1,
+            reported: None
+        })
+    );
+    // Written but not yet reported: not read.
+    file.transaction(|tx| {
+        tx.put_lens_records(
+            config,
+            1,
+            100,
+            &[record("StorageBytes", 5), record("ObjectCount", 1)],
+        )
+    })
+    .unwrap();
+    assert!(file.lens_report(config, 100).unwrap().is_empty());
+    assert!(file.lens_rows(None, 10).unwrap().0.is_empty());
+    // A report cut short is cleared before it is made again.
+    assert!(
+        !file
+            .transaction(|tx| tx.clear_lens_days(config, 1, 100))
+            .unwrap()
+    );
+    file.transaction(|tx| tx.put_lens_records(config, 1, 100, &[record("StorageBytes", 7)]))
+        .unwrap();
+    // Another generation's day is not reported by it.
+    assert!(
+        !file
+            .transaction(|tx| tx.lens_reported(config, 9, 100))
+            .unwrap()
+    );
+    assert!(
+        file.transaction(|tx| tx.lens_reported(config, 1, 100))
+            .unwrap()
+    );
+    assert_eq!(
+        file.lens_report(config, 100).unwrap(),
+        [record("StorageBytes", 7)]
+    );
+    // A configuration whose key starts like another's is apart from it.
+    let other = "111111111111/lens2";
+    file.transaction(|tx| {
+        tx.track_lens(other, 1)?;
+        tx.put_lens_records(other, 1, 150, &[record("ObjectCount", 9)])?;
+        tx.lens_reported(other, 1, 150).map(|_| ())
+    })
+    .unwrap();
+    assert_eq!(file.lens_report(config, 100).unwrap().len(), 1);
+    // Listed in pages, every configuration's.
+    let (first, next) = file.lens_rows(None, 1).unwrap();
+    assert_eq!((first.len(), first[0].config.as_str()), (1, config));
+    let (rest, end) = file.lens_rows(next.as_deref(), 1).unwrap();
+    assert_eq!((rest.len(), rest[0].config.as_str(), end), (1, other, None));
+    // Past keeping: dropped by maintenance, in batches.
+    let many: Vec<LensRecord> = (0..LENS_BATCH + 5)
+        .map(|n| record(&format!("m{n}"), 1))
+        .collect();
+    file.transaction(|tx| {
+        tx.put_lens_records(config, 1, 101, &many)?;
+        tx.lens_reported(config, 1, 101).map(|_| ())
+    })
+    .unwrap();
+    assert!(file.transaction(|tx| tx.lens_maintain(102)).unwrap());
+    assert!(!file.transaction(|tx| tx.lens_maintain(102)).unwrap());
+    assert!(file.lens_report(config, 101).unwrap().is_empty());
+    assert!(file.lens_report(config, 100).unwrap().is_empty());
+    // A deleted configuration's reports are no longer read, and go; one put
+    // again under its id has a new generation and does not read them.
+    file.transaction(|tx| {
+        tx.put_lens_records(config, 1, 200, &[record("StorageBytes", 3)])?;
+        tx.lens_reported(config, 1, 200).map(|_| ())
+    })
+    .unwrap();
+    file.transaction(|tx| tx.forget_lens(config)).unwrap();
+    file.transaction(|tx| {
+        tx.track_lens(config, 2)?;
+        tx.lens_reported(config, 2, 200).map(|_| ())
+    })
+    .unwrap();
+    assert!(file.lens_report(config, 200).unwrap().is_empty());
+    let (rows, _) = file.lens_rows(None, 100).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.config.as_str())
+            .collect::<Vec<_>>(),
+        [other]
+    );
+    // And they go: under their old generation again, there are none.
+    assert!(!file.transaction(|tx| tx.lens_maintain(0)).unwrap());
+    file.transaction(|tx| {
+        tx.forget_lens(config)?;
+        tx.track_lens(config, 1)?;
+        tx.lens_reported(config, 1, 200).map(|_| ())
+    })
+    .unwrap();
+    assert!(file.lens_report(config, 200).unwrap().is_empty());
+    // Request counts add up by day, for the bucket made at that time; old
+    // days expire in batches.
+    let mut counts = [0u64; 11];
+    counts[0] = 2;
+    counts[7] = 100;
+    for (bucket, day) in [("data", 10), ("data", 10), ("data", 11), ("data2", 10)] {
+        file.transaction(|tx| tx.add_lens_activity(bucket, 5, day, &counts))
+            .unwrap();
+    }
+    let mut twice = [0u64; 11];
+    twice[0] = 4;
+    twice[7] = 200;
+    assert_eq!(file.lens_activity("data", 5, 10).unwrap(), Some(twice));
+    assert_eq!(file.lens_activity("data", 5, 12).unwrap(), None);
+    // A bucket of the name made again does not have the old one's counts.
+    assert_eq!(file.lens_activity("data", 6, 11).unwrap(), None);
+    file.transaction(|tx| tx.add_lens_activity("data", 6, 11, &counts))
+        .unwrap();
+    assert_eq!(file.lens_activity("data", 6, 11).unwrap(), Some(counts));
+    assert!(!file.transaction(|tx| tx.expire_lens_activity(11)).unwrap());
+    assert_eq!(file.lens_activity("data", 5, 10).unwrap(), None);
+    assert_eq!(file.lens_activity("data2", 5, 10).unwrap(), None);
+    assert_eq!(file.lens_activity("data", 6, 11).unwrap(), Some(counts));
+    drop(file);
+    drop(lock);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn storage_lens_reports_of_many_records_are_written_and_dropped_within_the_log() {
+    // Twice the records that, deleted or written in one transaction,
+    // overran these tests' log; each step here is a batch, checkpointed.
+    let path = temp_path("storage-lens-batches");
+    let storage = create(&path);
+    let config = "111111111111/big";
+    let records: Vec<LensRecord> = (0..20 * LENS_BATCH)
+        .map(|n| LensRecord {
+            record_type: LensRecordType::Prefix,
+            bucket: "data".into(),
+            record_value: format!("prefix-{n:06}/"),
+            storage_class: "STANDARD".into(),
+            metric: "StorageBytes".into(),
+            value: n as u64,
+        })
+        .collect();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.track_lens(config, 1))
+        .unwrap();
+    for batch in records.chunks(LENS_BATCH) {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_lens_records(config, 1, 100, batch))
+            .unwrap();
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+    }
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.lens_reported(config, 1, 100))
+        .unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .lens_report(config, 100)
+            .unwrap()
+            .len(),
+        records.len()
+    );
+    // Deleted: a state row; its records go in batches.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.forget_lens(config))
+        .unwrap();
+    let mut steps = 0;
+    while ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.lens_maintain(0))
+        .unwrap()
+    {
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        steps += 1;
+    }
+    assert!(steps >= 19, "{steps}");
+    drop(storage);
+    let storage = open(&path);
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .lens_rows(None, 10)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn storage_lens_records_of_long_prefixes_are_written_and_dropped_within_the_log() {
+    // A thousand records of a prefix of a key's 1024 bytes: a batch of
+    // that many overran these tests' log.
+    let path = temp_path("storage-lens-long");
+    let storage = create(&path);
+    let config = "111111111111/long";
+    let records: Vec<LensRecord> = (0..LENS_BATCH)
+        .map(|n| LensRecord {
+            record_type: LensRecordType::Prefix,
+            bucket: "data".into(),
+            record_value: format!("{n:04}{}/", "p".repeat(1000)),
+            storage_class: "STANDARD".into(),
+            metric: "StorageBytes".into(),
+            value: n as u64,
+        })
+        .collect();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.track_lens(config, 1))
+        .unwrap();
+    let mut start = 0;
+    for end in lens_batches(config, &records) {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_lens_records(config, 1, 100, &records[start..end]))
+            .unwrap();
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        start = end;
+    }
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.lens_reported(config, 1, 100))
+        .unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .lens_report(config, 100)
+            .unwrap()
+            .len(),
+        records.len()
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.forget_lens(config))
+        .unwrap();
+    while ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.lens_maintain(0))
+        .unwrap()
+    {
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+    }
+    drop(storage);
+    let storage = open(&path);
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .lens_rows(None, 10)
+            .unwrap()
+            .0
+            .is_empty()
+    );
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
