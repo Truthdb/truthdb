@@ -436,6 +436,19 @@ fn parse(
     if !valid_id(&id) {
         return Err(bad_id());
     }
+    // "When custom delimiters are used, both the prefix delimiter and
+    // existing delimiter must specify the same special character."
+    if let (Some(prefix_delimiter), Some(delimiter)) = (
+        &prefix_delimiter,
+        prefix_level
+            .as_ref()
+            .and_then(|prefix| prefix.delimiter.as_ref()),
+    ) && prefix_delimiter != delimiter
+    {
+        return Err(invalid(
+            "The prefix delimiter and the delimiter are the same character.",
+        ));
+    }
     if let Some(given) = &given_arn
         && *given != arn(&id)
     {
@@ -1077,6 +1090,7 @@ mod tests {
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>//</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a long delimiter"),
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>&#1;</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a control character delimiter"),
             (format!("<Id>a</Id>{levels}<PrefixDelimiter>&#xFFFE;</PrefixDelimiter><IsEnabled>true</IsEnabled>"), "a delimiter XML has not"),
+            ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><Delimiter>-</Delimiter></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><PrefixDelimiter>/</PrefixDelimiter><IsEnabled>true</IsEnabled>".to_string(), "two delimiters"),
             ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><Delimiter>&#xFFFF;</Delimiter></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a prefix delimiter XML has not"),
             ("<Id>a</Id><AccountLevel><BucketLevel><PrefixLevel><StorageMetrics><SelectionCriteria><Delimiter>&#1;</Delimiter></SelectionCriteria></StorageMetrics></PrefixLevel></BucketLevel></AccountLevel><IsEnabled>true</IsEnabled>".to_string(), "a control character prefix delimiter"),
             (format!("<Id>a</Id>{levels}<Include><Buckets><Arn>arn:aws:s3:::a&#1;b</Arn></Buckets></Include><IsEnabled>true</IsEnabled>"), "a bucket ARN of no bucket name"),
