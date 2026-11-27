@@ -23,9 +23,13 @@
 //! `aws:CalledVia` hold, so a supporting access point's policy may grant to
 //! requests through Object Lambda alone.
 //!
-//! What else Object Lambda serves (HeadObject, ListObjects and
-//! ListObjectsV2 transformed by their function's return value, and
-//! requests no transformation names) is not built yet: 501.
+//! A HeadObject, ListObjects or ListObjectsV2 the access point transforms
+//! is answered by what its function returns. A request no transformation
+//! names is passed on to the supporting access point ("All other requests
+//! are processed as normal"), as one made through Object Lambda.
+//!
+//! Each is authorized as AWS's `s3-object-lambda` action for it (see
+//! [`lambda_action`]) on the Object Lambda access point.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -58,8 +62,9 @@ const URL_EXPIRES: u64 = 300;
 /// The route a function answers on (the host prefix of its
 /// WriteGetObjectResponse).
 const ROUTE: &str = "io-truthdb";
-/// A function's answer to its invocation, at most (it is not read).
-const MAX_INVOCATION_ANSWER: usize = 1024 * 1024;
+/// A function's answer to its invocation, at most (a GetObject's is not
+/// read; a listing's may hold a thousand keys of a kilobyte each).
+const MAX_INVOCATION_ANSWER: usize = 16 * 1024 * 1024;
 
 /// The key the marks of presigned URLs are made with: this process's own
 /// (a URL outlives no restart).
@@ -287,9 +292,11 @@ pub(crate) async fn serve(
     let (Some(action), Some(transformation)) = (action, transformation) else {
         // Passed on: as its operation, on the Object Lambda access point,
         // then through its supporting access point as through Object Lambda.
-        let name = crate::activity::data_event_name(held).ok_or_else(|| {
-            S3Error::not_implemented("This operation through an Object Lambda access point")
-        })?;
+        let name = crate::activity::data_event_name(held)
+            .and_then(|name| lambda_action(name, crate::api::has_param(held, "versionId")))
+            .ok_or_else(|| {
+                S3Error::not_implemented("This operation through an Object Lambda access point")
+            })?;
         authz.check_arn_with(
             &format!("s3-object-lambda:{name}"),
             &point_arn,
@@ -328,7 +335,11 @@ pub(crate) async fn serve(
         }
     }
     authz.check_arn_with(
-        &format!("s3-object-lambda:{action}"),
+        &format!(
+            "s3-object-lambda:{}",
+            lambda_action(action, crate::api::has_param(held, "versionId"))
+                .expect("a transformed operation's action")
+        ),
         &point_arn,
         &point.account,
         &policies,
@@ -549,6 +560,44 @@ pub(crate) async fn serve(
     )))
 }
 
+/// AWS's `s3-object-lambda` action for the operation of data event `name`
+/// (`versioned`: naming an object's version), as `s3:` actions authorize
+/// them: the reads as GetObject, the listings as ListBucket, the writes of
+/// a body (copies and the multipart upload's) as PutObject. An operation it
+/// has none for is not served through an Object Lambda access point.
+fn lambda_action(name: &str, versioned: bool) -> Option<&'static str> {
+    let of = |plain: &'static str, version: &'static str| match versioned {
+        true => version,
+        false => plain,
+    };
+    Some(match name {
+        "GetObject" | "HeadObject" => of("GetObject", "GetObjectVersion"),
+        "ListObjects" | "ListObjectsV2" => "ListBucket",
+        "ListObjectVersions" => "ListBucketVersions",
+        "PutObject"
+        | "CopyObject"
+        | "CreateMultipartUpload"
+        | "UploadPart"
+        | "UploadPartCopy"
+        | "CompleteMultipartUpload" => "PutObject",
+        "AbortMultipartUpload" => "AbortMultipartUpload",
+        "ListParts" => "ListMultipartUploadParts",
+        "DeleteObject" => of("DeleteObject", "DeleteObjectVersion"),
+        "DeleteObjects" => "DeleteObject",
+        "GetObjectTagging" => of("GetObjectTagging", "GetObjectVersionTagging"),
+        "PutObjectTagging" => of("PutObjectTagging", "PutObjectVersionTagging"),
+        "DeleteObjectTagging" => of("DeleteObjectTagging", "DeleteObjectVersionTagging"),
+        "GetObjectAcl" => of("GetObjectAcl", "GetObjectVersionAcl"),
+        "PutObjectAcl" => of("PutObjectAcl", "PutObjectVersionAcl"),
+        "GetObjectLegalHold" => "GetObjectLegalHold",
+        "PutObjectLegalHold" => "PutObjectLegalHold",
+        "GetObjectRetention" => "GetObjectRetention",
+        "PutObjectLockRetention" => "PutObjectRetention",
+        "RestoreObject" => "RestoreObject",
+        _ => return None,
+    })
+}
+
 fn no_supporting_point() -> S3Error {
     S3Error::new(
         404,
@@ -655,6 +704,9 @@ fn returned_response(
                 return Err(invalid(&format!("header {name} of no text")));
             };
             if name == "content-length" {
+                if sized {
+                    return Err(invalid("Content-Length twice"));
+                }
                 value
                     .parse::<u64>()
                     .map_err(|_| invalid("a Content-Length that is no length"))?;

@@ -20555,7 +20555,7 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
         r#"{"ForAnyValue:StringEquals": {"aws:CalledVia": ["s3-object-lambda.amazonaws.com"]}}"#;
     let reader = format!(
         r#"{{"Version": "2012-10-17", "Statement": [
-        {{"Effect": "Allow", "Action": ["s3-object-lambda:GetObject", "s3-object-lambda:HeadObject"], "Resource": "{point}"}},
+        {{"Effect": "Allow", "Action": "s3-object-lambda:GetObject", "Resource": "{point}"}},
         {{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": "{}", "Condition": {called_via}}},
         {{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "{supporting}/object/*", "Condition": {called_via}}}]}}"#,
         lambda_arn("shape")
@@ -20573,12 +20573,24 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
         {{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "{supporting}/object/*"}}]}}"#,
         lambda_arn("shape")
     );
+    // All of Object Lambda but its writes and listings, in AWS's action
+    // names, and the supporting access point as through Object Lambda.
+    let denied = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+        {{"Effect": "Allow", "Action": "s3-object-lambda:*", "Resource": "{points}"}},
+        {{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": "{shape}"}},
+        {{"Effect": "Deny", "Action": ["s3-object-lambda:PutObject", "s3-object-lambda:ListBucket"], "Resource": "{points}"}},
+        {{"Effect": "Allow", "Action": "s3:*", "Resource": ["{supporting}", "{supporting}/object/*"], "Condition": {called_via}}}]}}"#,
+        points = format!("arn:aws:s3-object-lambda:us-east-1:{account}:accesspoint/*"),
+        shape = lambda_arn("shape")
+    );
     let users: Vec<(String, String)> = [
         ("reader", Some(reader.as_str())),
         ("noinvoke", Some(no_invoke.as_str())),
         ("nogrant", None),
         ("function", Some(writer)),
         ("nopoint", Some(no_point.as_str())),
+        ("denied", Some(denied.as_str())),
     ]
     .into_iter()
     .map(|(name, policy)| user_with_key(&server, &account, name, policy))
@@ -20641,7 +20653,8 @@ import json, re, socket, sys, threading, time, urllib.error, urllib.parse, urlli
 import http.server
 import boto3, botocore.config, botocore.exceptions
 (port, account, key, secret, reader_key, reader_secret, noinvoke_key, noinvoke_secret,
-    nogrant_key, nogrant_secret, function_key, function_secret, nopoint_key, nopoint_secret) = sys.argv[1:15]
+    nogrant_key, nogrant_secret, function_key, function_secret, nopoint_key, nopoint_secret,
+    denied_key, denied_secret) = sys.argv[1:17]
 # Every *.s3.test name is the local listener.
 resolve = socket.getaddrinfo
 socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1" if host.endswith("s3.test") else host, *rest, **kw)
@@ -20747,6 +20760,8 @@ def headed(url, key):
         return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}}
     if key == "gone":
         return {"statusCode": 404, "errorCode": "NoSuchKey", "errorMessage": "not here"}
+    if key == "twice":
+        return {"statusCode": 200, "headers": {"Content-Length": "1", "content-length": "2"}}
     with urllib.request.urlopen(urllib.request.Request(url, method="HEAD")) as answer:
         length = answer.headers["Content-Length"]
     return {"statusCode": 200, "headers": {"Content-Length": length, "Content-Type": "text/shaped",
@@ -20945,7 +20960,22 @@ refused(lambda: s3.head_object(Bucket="data", Key="new"), "404")
 assert reader.head_object(Bucket=alias, Key="doc")["ContentLength"] == 5
 refused(lambda: reader.head_object(Bucket=supporting, Key="doc"), "403")
 refused(lambda: reader.list_objects_v2(Bucket=alias), "AccessDenied")
-refused(lambda: client("s3", noinvoke_key, noinvoke_secret).head_object(Bucket=alias, Key="doc"), "403")
+# Passed on as AWS's action for it: a HEAD as GetObject.
+assert client("s3", noinvoke_key, noinvoke_secret).head_object(Bucket=alias, Key="doc")["ContentLength"] == 5
+# A Deny of AWS's actions holds for every operation they name: the writes
+# of a body (a put, a copy, a multipart upload) as PutObject, the listings
+# as ListBucket.
+denied = client("s3", denied_key, denied_secret)
+assert denied.head_object(Bucket=alias, Key="doc")["ContentLength"] == 5
+refused(lambda: denied.put_object(Bucket=alias, Key="new", Body=b"n"), "AccessDenied")
+refused(lambda: denied.copy_object(Bucket=alias, Key="copied", CopySource={"Bucket": "data", "Key": "doc"}),
+    "AccessDenied")
+refused(lambda: denied.create_multipart_upload(Bucket=alias, Key="parts"), "AccessDenied")
+refused(lambda: denied.list_objects_v2(Bucket=alias), "AccessDenied")
+refused(lambda: denied.list_objects(Bucket=alias), "AccessDenied")
+denied.put_object_tagging(Bucket=alias, Key="doc", Tagging={"TagSet": [{"Key": "t", "Value": "v"}]})
+assert s3.get_object_tagging(Bucket="data", Key="doc")["TagSet"] == [{"Key": "t", "Value": "v"}]
+s3.delete_object_tagging(Bucket="data", Key="doc")
 # Not the bucket's own operations (they are no data events).
 refused(lambda: s3.put_bucket_versioning(Bucket=alias, VersioningConfiguration={"Status": "Enabled"}),
     "NotImplemented")
@@ -20962,6 +20992,7 @@ assert "headObjectContext" in events[-1][1] and "outputToken" not in events[-1][
 s3.put_object(Bucket="data", Key="badhead", Body=b"b")
 refused(lambda: s3.head_object(Bucket=viewer, Key="badhead"), "500")
 refused(lambda: s3.head_object(Bucket=viewer, Key="gone"), "404")
+refused(lambda: s3.head_object(Bucket=viewer, Key="twice"), "500")
 listing = s3.list_objects_v2(Bucket=viewer, Prefix="d")
 assert [o["Key"] for o in listing["Contents"]] == ["DOC"] and listing["KeyCount"] == 1, listing
 url = events[-1][1]["listObjectsV2Context"]["inputS3Url"]
@@ -20969,6 +21000,10 @@ assert "list-type=2" in url and "prefix=d" in url, url
 assert [o["Key"] for o in s3.list_objects(Bucket=viewer, Prefix="d")["Contents"]] == ["DOC"]
 assert "listObjectsContext" in events[-1][1], events[-1]
 refused(lambda: s3.list_objects_v2(Bucket=viewer, Prefix="broken"), "LambdaInvalidResponse")
+# A transformed listing too is ListBucket.
+refused(lambda: denied.list_objects_v2(Bucket=viewer, Prefix="d"), "AccessDenied")
+refused(lambda: denied.list_objects(Bucket=viewer, Prefix="d"), "AccessDenied")
+assert denied.head_object(Bucket=viewer, Key="doc")["ContentLength"] == 5
 # Not transformed there: GetObject, passed on.
 assert s3.get_object(Bucket=viewer, Key="doc")["Body"].read() == b"hello"
 # WriteGetObjectResponse: only with a token waiting, and as allowed.
