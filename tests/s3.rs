@@ -22984,6 +22984,21 @@ fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
         assert_eq!(read("ordered.txt").unwrap(), b"first");
         assert!(file.write_all(b"more").is_err());
     }
+    // Closed by another thread of the process than the one that opened it:
+    // in the bucket once the close returns.
+    {
+        use std::io::Write;
+        let path = dir.join("threads.txt");
+        let file = std::thread::spawn(move || {
+            let mut file = std::fs::File::create(path).unwrap();
+            file.write_all(b"threads").unwrap();
+            file
+        })
+        .join()
+        .unwrap();
+        drop(file);
+        assert_eq!(read("threads.txt").unwrap(), b"threads");
+    }
     // Not replaced, nor deleted, unless allowed; not renamed; no chmod.
     assert_eq!(
         errno(std::fs::write(dir.join("old.txt"), b"x").unwrap_err()),
@@ -23037,6 +23052,36 @@ fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
     .expect("mount");
     std::fs::write(dir.join("old.txt"), b"replaced\n").unwrap();
     assert_eq!(read("old.txt").unwrap(), b"replaced\n");
+    // Two opens to replace it at once: one has it, the other is refused.
+    for _ in 0..50 {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let opens: Vec<_> = (0..2)
+            .map(|_| {
+                let (barrier, path) = (barrier.clone(), dir.join("old.txt"));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let opened = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(&path);
+                    // Held until both have tried.
+                    std::thread::sleep(Duration::from_millis(20));
+                    opened.map(drop).map_err(|err| err.raw_os_error())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|open| open.join().unwrap())
+            .collect();
+        let refused = opens
+            .iter()
+            .filter(|open| **open == Err(Some(libc_errno::EPERM)))
+            .count();
+        assert!(
+            refused == 1 && opens.iter().filter(|open| open.is_ok()).count() == 1,
+            "{opens:?}"
+        );
+    }
     std::fs::remove_file(dir.join("new.txt")).unwrap();
     assert!(read("new.txt").is_err());
     assert!(!dir.join("new.txt").exists());

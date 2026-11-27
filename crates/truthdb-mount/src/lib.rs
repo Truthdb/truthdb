@@ -93,9 +93,9 @@ struct Writer {
     done: bool,
     /// What failed, if anything: answered from then on.
     failed: Option<Errno>,
-    /// Who opened it: a close by another (a child of the opener, closing
-    /// what it inherited) does not end it.
-    pid: u32,
+    /// The process that opened it: a close by another (a child of it,
+    /// closing what it inherited) does not end it.
+    opener: u32,
     /// What is uploaded of it: locked by each write, flush, sync and
     /// release of it, for all of it (its uploads too), so that they come
     /// one at a time; locked before the state, never while it is held.
@@ -174,6 +174,20 @@ impl State {
             .contains(path)
             .then_some(Kind::Directory)
     }
+}
+
+/// The process (thread group) of thread `pid` (a request's pid is its
+/// thread's); `pid` itself when that cannot be read.
+fn process_of(pid: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Tgid:"))
+                .and_then(|tgid| tgid.trim().parse().ok())
+        })
+        .unwrap_or(pid)
 }
 
 fn now() -> u64 {
@@ -436,9 +450,15 @@ impl Mount {
         Some(child(&parent, name))
     }
 
-    /// Opens `path` to be written (as a new file, or replacing one).
-    fn writer(&self, path: &str, pid: u32) -> u64 {
+    /// Opens `path` to be written (as a new file, or replacing one), if it
+    /// is neither written nor read: the check and the opening in one hold
+    /// of the state, so that two opens at once do not both have it. `pid`
+    /// is the opening thread's.
+    fn writer(&self, path: &str, pid: u32) -> Result<u64, Errno> {
         let mut state = self.lock();
+        if state.writing(path).is_some() || state.reading(path) {
+            return Err(Errno::EPERM);
+        }
         let fh = state.handle();
         state.writers.insert(
             fh,
@@ -448,11 +468,11 @@ impl Mount {
                 written: 0,
                 done: false,
                 failed: None,
-                pid,
+                opener: process_of(pid),
                 upload: Arc::default(),
             },
         );
-        fh
+        Ok(fh)
     }
 
     /// Writer `fh`'s upload, to be locked.
@@ -775,7 +795,10 @@ impl Filesystem for Mount {
             }
             Err(err) => return reply.error(errno(&err)),
         }
-        let fh = self.writer(&path, req.pid());
+        let fh = match self.writer(&path, req.pid()) {
+            Ok(fh) => fh,
+            Err(err) => return reply.error(err),
+        };
         let kind = Kind::File {
             size: 0,
             mtime: now(),
@@ -872,17 +895,15 @@ impl Filesystem for Mount {
             if self.options.read_only {
                 return reply.error(Errno::EROFS);
             }
-            let state = self.lock();
-            if state.writing(&node.path).is_some() || state.reading(&node.path) {
-                return reply.error(Errno::EPERM);
-            }
-            drop(state);
             // An existing file is replaced only so ("with O_TRUNC", and
             // `allow_overwrite`).
             if !self.options.allow_overwrite || flags.0 & libc::O_TRUNC == 0 {
                 return reply.error(Errno::EPERM);
             }
-            let fh = self.writer(&node.path, req.pid());
+            let fh = match self.writer(&node.path, req.pid()) {
+                Ok(fh) => fh,
+                Err(err) => return reply.error(err),
+            };
             return reply.opened(FileHandle(fh), FopenFlags::empty());
         }
         let mut state = self.lock();
@@ -1015,8 +1036,8 @@ impl Filesystem for Mount {
         // once: "if close is called by a different process than the one
         // that opened it, close returns immediately"; it is uploaded when
         // the last is closed).
-        let opener = self.lock().writers.get(&fh.0).map(|writer| writer.pid);
-        if opener.is_some_and(|pid| pid != req.pid()) {
+        let opener = self.lock().writers.get(&fh.0).map(|writer| writer.opener);
+        if opener.is_some_and(|opener| opener != process_of(req.pid())) {
             return reply.ok();
         }
         let Some(upload) = self.upload_of(fh.0) else {
