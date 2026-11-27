@@ -96,6 +96,10 @@ struct Writer {
     /// The process that opened it: a close by another (a child of it,
     /// closing what it inherited) does not end it.
     opener: u32,
+    /// Closed by its opener with nothing written: ended by its release, or
+    /// by a newer open of the file (which then has it, as Mountpoint's
+    /// "following Release or (a newer) Open").
+    flushed: bool,
     /// What is uploaded of it: locked by each write, flush, sync and
     /// release of it, for all of it (its uploads too), so that they come
     /// one at a time; locked before the state, never while it is held.
@@ -457,6 +461,7 @@ impl Mount {
     /// of the state, so that two opens at once do not both have it. `pid`
     /// is the opening thread's.
     fn writer(&self, path: &str, pid: u32) -> Result<u64, Errno> {
+        self.settle(path);
         let mut state = self.lock();
         if state.writing(path).is_some() || state.reading(path) || state.deleting.contains(path) {
             return Err(Errno::EPERM);
@@ -471,10 +476,30 @@ impl Mount {
                 done: false,
                 failed: None,
                 opener: process_of(pid),
+                flushed: false,
                 upload: Arc::default(),
             },
         );
         Ok(fh)
+    }
+
+    /// Ends the writers of `path` closed with nothing written, as a newer
+    /// open (or a delete) of it comes: their descriptors, if still open
+    /// (duplicated), write no more. Called before the state is held.
+    fn settle(&self, path: &str) {
+        let closed: Vec<(u64, Arc<Mutex<Upload>>)> = self
+            .lock()
+            .writers
+            .iter()
+            .filter(|(_, writer)| writer.path == path && writer.flushed && !writer.done)
+            .map(|(fh, writer)| (*fh, Arc::clone(&writer.upload)))
+            .collect();
+        for (fh, upload) in closed {
+            let mut upload = upload
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = self.upload(fh, &mut upload, true);
+        }
     }
 
     /// Writer `fh`'s upload, to be locked.
@@ -717,6 +742,7 @@ impl Filesystem for Mount {
         // permit `unlink` operations." Checked, and the file marked as being
         // deleted, in one hold of the state: one opened to be written
         // meanwhile is refused until the delete is done.
+        self.settle(&path);
         {
             let mut state = self.lock();
             if state.writing(&path).is_some() || !state.deleting.insert(path.clone()) {
@@ -786,6 +812,7 @@ impl Filesystem for Mount {
         let Some(path) = self.entry_path(parent, name) else {
             return reply.error(Errno::EINVAL);
         };
+        self.settle(&path);
         {
             let state = self.lock();
             if state.writing(&path).is_some() || state.reading(&path) {
@@ -916,6 +943,7 @@ impl Filesystem for Mount {
             };
             return reply.opened(FileHandle(fh), FopenFlags::empty());
         }
+        self.settle(&node.path);
         let mut state = self.lock();
         // "a file cannot have a reader and a writer open at the same time".
         if state.writing(&node.path).is_some() {
@@ -1025,6 +1053,7 @@ impl Filesystem for Mount {
                 return reply.error(Errno::EINVAL);
             }
             writer.written += data.len() as u64;
+            writer.flushed = false;
         }
         upload.pending.extend_from_slice(data);
         match self.upload(fh.0, &mut upload, false) {
@@ -1045,13 +1074,16 @@ impl Filesystem for Mount {
         // flush when some bytes have been written", as Mountpoint does: a
         // shell's `>` and `dd` duplicate the descriptor and close the first
         // before writing; `touch` closes, then sets the times by path).
-        if self
-            .lock()
-            .writers
-            .get(&fh.0)
-            .is_some_and(|writer| writer.written == 0)
         {
-            return reply.ok();
+            let mut state = self.lock();
+            if let Some(writer) = state.writers.get_mut(&fh.0)
+                && writer.written == 0
+            {
+                if writer.opener == process_of(req.pid()) {
+                    writer.flushed = true;
+                }
+                return reply.ok();
+            }
         }
         // A file written is uploaded whole as it is closed: by its opener
         // (another's close, as a child's of what it inherited, returns at

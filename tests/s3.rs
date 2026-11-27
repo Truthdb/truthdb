@@ -23074,6 +23074,29 @@ fn files_written_to_a_mounted_bucket_are_uploaded_as_mountpoint_writes_them() {
     .expect("mount");
     std::fs::write(dir.join("old.txt"), b"replaced\n").unwrap();
     assert_eq!(read("old.txt").unwrap(), b"replaced\n");
+    // An empty file just closed (its upload ended by its release, later):
+    // opened again at once, read, replaced or deleted.
+    let shell = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "for n in 1 2 3 4 5 6 7 8 9 10; do \
+               touch t$n && cat t$n && : > e$n && cat e$n && \
+               touch w$n && echo hi > w$n && touch r$n && rm r$n || exit 1; \
+             done",
+        )
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    for n in 1..=10 {
+        assert_eq!(read(&format!("t{n}")).unwrap(), b"");
+        assert_eq!(read(&format!("w{n}")).unwrap(), b"hi\n");
+        assert!(read(&format!("r{n}")).is_err());
+    }
     // Replaced and deleted at once: one or the other, never both.
     for round in 0..50 {
         let name = format!("raced-{round}");
