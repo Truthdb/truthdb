@@ -46,7 +46,8 @@ pub struct AdminConfig {
     #[serde(default = "default_admin_port")]
     pub port: u16,
 
-    /// A bearer token `/metrics` needs (`Authorization: Bearer <token>`).
+    /// A bearer token `/metrics` and `/storage-lens` need (`Authorization:
+    /// Bearer <token>`).
     #[serde(default)]
     pub token: Option<String>,
 }

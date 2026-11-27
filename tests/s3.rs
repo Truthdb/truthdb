@@ -22122,15 +22122,18 @@ control.put_storage_lens_configuration(AccountId=account, ConfigId="main", Stora
 assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="main")["Tags"] == []
 # CloudTrail records each call by its name and configuration.
 trail = client("cloudtrail", key, secret)
+# The deletes of "main" (one done, one refused) and the refused ones of
+# other ids may be of one second, in no order: the one done is found.
 for _ in range(60):
-    events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
-        "AttributeValue": "DeleteStorageLensConfiguration"}])["Events"]
-    if events:
+    events = [json.loads(event["CloudTrailEvent"]) for event in trail.lookup_events(LookupAttributes=[
+        {"AttributeKey": "EventName", "AttributeValue": "DeleteStorageLensConfiguration"}])["Events"]]
+    done = [event for event in events
+        if event["requestParameters"].get("configId") == "main" and "errorCode" not in event]
+    if done:
         break
     time.sleep(0.5)
-assert events, events
-deleted = json.loads(events[0]["CloudTrailEvent"])
-assert deleted["requestParameters"]["configId"] == "main", deleted
+assert done, events
+deleted = done[0]
 assert deleted["requestParameters"]["x-amz-account-id"] == account and deleted["readOnly"] is False, deleted
 print("ok")
 "#;
@@ -22544,5 +22547,117 @@ elif phase == "after":
     found = versions("")
     keys = [k for k, _ in found]
     assert len(keys) == len(set(keys)) == 4, found
+print("ok")
+"#;
+
+#[test]
+fn the_admin_listener_shows_storage_lens_dashboards() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let admin = server.admin_port.expect("an admin listener");
+    let (account, key, secret) = account_with_key(&server, "lens-dashboard");
+    let script = server.dir.join("storage_lens_dashboard.py");
+    std::fs::write(&script, STORAGE_LENS_DASHBOARD_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg("-I")
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &account, &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bearer = format!("Authorization: Bearer {ADMIN_TOKEN}\r\n");
+    // The token is needed.
+    assert_eq!(admin_call(admin, "GET", "/storage-lens", "").0, 401);
+    let page = format!("/storage-lens/{account}/dash");
+    assert_eq!(
+        admin_call(admin, "GET", &page, "Authorization: Bearer wrong\r\n").0,
+        401
+    );
+    // Its report: made within a minute of the configuration.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let body = loop {
+        let (status, head, body) = admin_call(admin, "GET", &page, &bearer);
+        assert_eq!(status, 200, "{body}");
+        if body.contains("Report of") {
+            let head = head.to_ascii_lowercase();
+            assert!(head.contains("content-type: text/html"), "{head}");
+            assert!(
+                head.contains("content-security-policy: default-src 'none'"),
+                "{head}"
+            );
+            break body;
+        }
+        assert!(Instant::now() < deadline, "no report: {body}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // The account's storage, its buckets by storage (the most first), the
+    // trend; no script.
+    assert!(
+        body.contains("1,234 bytes in 3 objects, in 2 buckets."),
+        "{body}"
+    );
+    let (big, small) = (body.find("<td>zebra</td>"), body.find("<td>apple</td>"));
+    assert!(big.is_some() && small.is_some() && big < small, "{body}");
+    // One day's report: a dot.
+    assert!(body.contains("<circle"), "{body}");
+    assert!(!body.to_ascii_lowercase().contains("<script"), "{body}");
+    // The list links to it.
+    let (status, _, list) = admin_call(admin, "GET", "/storage-lens", &bearer);
+    assert_eq!(status, 200);
+    // It links by a query (an id of `.` or `..` stays in one).
+    let link = format!("/storage-lens?dashboard={account}%2Fdash");
+    assert!(list.contains(&format!("href=\"{link}\"")), "{list}");
+    let (status, _, linked) = admin_call(admin, "GET", &link, &bearer);
+    assert_eq!(status, 200);
+    assert!(linked.contains("1,234 bytes in 3 objects"), "{linked}");
+    let bad = format!("/storage-lens?dashboard={account}%2Fdash%00");
+    assert_eq!(admin_call(admin, "GET", &bad, &bearer).0, 404);
+    // What is not a configuration's is not found, and not looked up.
+    for missing in [
+        format!("/storage-lens/{account}/none"),
+        format!("/storage-lens/{account}/dash%00"),
+        format!("/storage-lens/{account}/a*b"),
+        "/storage-lens/12/dash".to_string(),
+        format!("/storage-lens/{account}"),
+    ] {
+        assert_eq!(
+            admin_call(admin, "GET", &missing, &bearer).0,
+            404,
+            "{missing}"
+        );
+    }
+}
+
+const STORAGE_LENS_DASHBOARD_SCRIPT: &str = r#"
+import socket, sys
+import boto3, botocore.config
+port, account, key, secret = sys.argv[1:5]
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service):
+    return boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": "path"}))
+s3, control = client("s3"), client("s3control")
+s3.create_bucket(Bucket="zebra")
+s3.create_bucket(Bucket="apple")
+s3.put_object(Bucket="zebra", Key="a", Body=b"x" * 1000)
+s3.put_object(Bucket="zebra", Key="b", Body=b"x" * 200)
+s3.put_object(Bucket="apple", Key="c", Body=b"x" * 34)
+# A configuration stored in more than one chunk (of 1500 bytes): an id
+# ending in NUL would reach its later chunks.
+names = ["zebra", "apple"] + [f"named-but-not-made-{n:03}" for n in range(60)]
+control.put_storage_lens_configuration(AccountId=account, ConfigId="dash", StorageLensConfiguration={
+    "Id": "dash", "IsEnabled": True, "AccountLevel": {"BucketLevel": {}},
+    "Include": {"Buckets": [f"arn:aws:s3:::{name}" for name in names]}})
 print("ok")
 "#;

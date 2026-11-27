@@ -1,8 +1,9 @@
 //! The admin listener (`[admin]`): `/metrics` in Prometheus' text format
 //! (the S3 API's requests and storage usage per bucket, the log, the object
 //! store's queues, the journal consumers' lag), `/healthz` (the process
-//! answers) and `/readyz` (the database is usable). With a token set,
-//! `/metrics` needs it as a bearer token.
+//! answers), `/readyz` (the database is usable) and `/storage-lens` (the
+//! Storage Lens dashboards, see `storage_lens_dashboard`). With a token
+//! set, `/metrics` and `/storage-lens` need it as a bearer token.
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
@@ -31,7 +32,7 @@ const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub struct AdminState {
     pub storage: Arc<Storage>,
     pub request_metrics: Arc<RequestMetrics>,
-    /// The bearer token `/metrics` needs, if any.
+    /// The bearer token `/metrics` and `/storage-lens` need, if any.
     pub token: Option<String>,
 }
 
@@ -141,7 +142,74 @@ async fn handle(state: &Arc<AdminState>, request: Request<Incoming>) -> Response
                 Err(err) => text(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}\n")),
             }
         }
+        path if path == "/storage-lens" || path.starts_with("/storage-lens/") => {
+            if !authorized(state, &request) {
+                return unauthorized();
+            }
+            storage_lens(state, path, request.uri().query().unwrap_or("")).await
+        }
         _ => text(StatusCode::NOT_FOUND, "not found\n"),
+    }
+}
+
+fn unauthorized() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("www-authenticate", "Bearer")
+        .body(full(Bytes::from_static(b"unauthorized\n")))
+        .expect("a valid response")
+}
+
+/// A Storage Lens dashboard page: the list, or one configuration's
+/// (`/storage-lens/<account>/<id>`, or `/storage-lens?dashboard=<account>/
+/// <id>`, which the list links to: a browser keeps an id of `.` or `..`
+/// in a query, not in a path; each a valid one: not looked up otherwise).
+async fn storage_lens(state: &Arc<AdminState>, path: &str, query: &str) -> Response<Body> {
+    let rest = path.strip_prefix("/storage-lens").unwrap_or("");
+    let asked = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("dashboard="));
+    let named = match (rest.trim_end_matches('/'), asked) {
+        ("", None) => None,
+        ("", Some(asked)) => Some(asked),
+        (named, _) => Some(&named[1..]),
+    };
+    let key = match named {
+        None => None,
+        Some(named) => {
+            let decoded = percent_encoding::percent_decode_str(named).decode_utf8();
+            let valid = decoded.as_ref().ok().and_then(|named| {
+                let (account, id) = named.split_once('/')?;
+                (truthdb_object::valid_account_id(account) && crate::storage_lens::valid_id(id))
+                    .then(|| named.to_string())
+            });
+            match valid {
+                Some(key) => Some(key),
+                None => return text(StatusCode::NOT_FOUND, "not found\n"),
+            }
+        }
+    };
+    let storage = Arc::clone(&state.storage);
+    let made = tokio::task::spawn_blocking(move || match &key {
+        None => crate::storage_lens_dashboard::list(&storage).map(Some),
+        Some(key) => crate::storage_lens_dashboard::dashboard(&storage, key),
+    })
+    .await;
+    match made {
+        Ok(Ok(Some(html))) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/html; charset=utf-8")
+            .header(
+                "content-security-policy",
+                crate::storage_lens_dashboard::POLICY,
+            )
+            .header("x-content-type-options", "nosniff")
+            .header("cache-control", "no-store")
+            .body(full(html))
+            .expect("a valid response"),
+        Ok(Ok(None)) => text(StatusCode::NOT_FOUND, "not found\n"),
+        Ok(Err(err)) => text(StatusCode::SERVICE_UNAVAILABLE, format!("{err}\n")),
+        Err(err) => text(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}\n")),
     }
 }
 

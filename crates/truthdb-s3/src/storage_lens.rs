@@ -45,7 +45,7 @@ fn no_such_configuration() -> S3Error {
 
 /// Whether `id` is a configuration's id: 1 to 64 letters, digits, hyphens,
 /// underscores and periods.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     (1..=64).contains(&id.len())
         && id
             .bytes()
