@@ -5,21 +5,23 @@
 //! configuration just made, at once): the storage metrics as they are at
 //! that pass, the activity metrics of the day's requests. A day missed (the
 //! server down past it) is not made later: its storage is no longer there to
-//! count. A report is written with the day it is of in one transaction.
+//! count. A report is written in batches, then its day recorded as reported:
+//! it is read whole or not at all (see `truthdb-object`'s `storage_lens`).
 //!
 //! Requests are counted from the server's request counters (since it
-//! started), the growth since the last pass going to the day of the pass:
-//! those of a last minute before a crash are not counted.
+//! started), the growth since the last count going to the day of the count,
+//! at most a minute (or a report) apart: those since the last count before
+//! a crash are not counted.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
 use truthdb_engine::metrics::RequestCounts;
 use truthdb_object::{
-    ActivityCounts, BUCKET_ACCELERATE, LensRecord, LensRecordType, ListAfter, ObjFile,
-    ReplicationStatus, STORAGE_LENS, Versioning,
+    ActivityCounts, BUCKET_ACCELERATE, LENS_BATCH, LENS_KEEP_DAYS, LensRecord, LensRecordType,
+    ListAfter, ObjFile, ReplicationStatus, STORAGE_LENS, Versioning,
 };
 
 use crate::batch_run::object;
@@ -31,6 +33,8 @@ const DAY_MS: u64 = 86_400_000;
 const IDLE: Duration = Duration::from_secs(60);
 /// The versions listed in one lock hold.
 const PAGE: usize = 1000;
+/// The uploads listed in one lock hold (each with all its parts).
+const UPLOAD_PAGE: usize = 10;
 /// The prefixes a bucket's prefix metrics are kept of while it is listed:
 /// past them, a new prefix is not counted.
 const MAX_PREFIXES: usize = 100_000;
@@ -46,30 +50,39 @@ pub(crate) fn wake() {
     WAKE.notify_one();
 }
 
+fn today() -> u32 {
+    (now_ms() / DAY_MS) as u32
+}
+
+/// What the pass keeps between its runs.
+#[derive(Default)]
+struct Pass {
+    /// The request counters as last counted (none: a standby, or just
+    /// promoted; empty when the server starts, so that its first count
+    /// takes what they hold).
+    counted: Option<HashMap<String, RequestCounts>>,
+    /// The day old counts and reports were last dropped.
+    maintained: Option<u32>,
+    /// The configurations whose report of a day failed: not tried again
+    /// that day, so that one does not keep the others from theirs.
+    failed: HashSet<(String, u32)>,
+}
+
 /// Counts requests and makes reports until `shutdown` turns true.
 pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
-    let mut counted: HashMap<String, RequestCounts> = HashMap::new();
+    let mut pass = Pass {
+        counted: Some(HashMap::new()),
+        ..Pass::default()
+    };
     loop {
         if *shutdown.borrow() {
             return;
         }
         if state.storage.is_standby() {
             // What a standby answers is not counted, now or once promoted.
-            counted = snapshot(&state);
-        } else {
-            if let Err(err) = count(&state, &mut counted).await {
-                eprintln!("storage lens: {err}");
-            }
-            loop {
-                match step(&state, &shutdown).await {
-                    Ok(true) if !*shutdown.borrow() => continue,
-                    Ok(_) => break,
-                    Err(err) => {
-                        eprintln!("storage lens: {err}");
-                        break;
-                    }
-                }
-            }
+            pass.counted = None;
+        } else if let Err(err) = run_once(&state, &mut pass, &shutdown).await {
+            eprintln!("storage lens: {err}");
         }
         tokio::select! {
             _ = tokio::time::sleep(IDLE) => {}
@@ -77,6 +90,50 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
             _ = shutdown.changed() => {}
         }
     }
+}
+
+async fn run_once(
+    state: &S3State,
+    pass: &mut Pass,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), String> {
+    let day = today();
+    if pass.maintained != Some(day) {
+        maintain(state, day).await?;
+        pass.maintained = Some(day);
+        pass.failed.retain(|(_, failed)| *failed + 1 >= day);
+    }
+    loop {
+        count(state, pass).await?;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        match step(state, &pass.failed, shutdown).await {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => {}
+            Err((key, day, err)) => {
+                eprintln!("storage lens: the report of {key}: {err}");
+                pass.failed.insert((key, day));
+            }
+        }
+    }
+}
+
+/// Drops, in batches, request counts and reports past keeping, and the
+/// reports of deleted configurations.
+async fn maintain(state: &S3State, day: u32) -> Result<(), String> {
+    let keep_from = day.saturating_sub(LENS_KEEP_DAYS - 1);
+    while object(state, move |file| {
+        file.transaction(|tx| tx.expire_lens_activity(keep_from))
+    })
+    .await?
+    {}
+    while object(state, move |file| {
+        file.transaction(|tx| tx.lens_maintain(keep_from))
+    })
+    .await?
+    {}
+    Ok(())
 }
 
 fn snapshot(state: &S3State) -> HashMap<String, RequestCounts> {
@@ -130,31 +187,41 @@ pub(crate) fn growth(
     out
 }
 
-/// Adds the requests counted since the last pass to today's counts of
-/// their buckets (those that exist), and drops counts past keeping.
-async fn count(
-    state: &S3State,
-    counted: &mut HashMap<String, RequestCounts>,
-) -> Result<(), String> {
+/// Adds the requests counted since the last count to today's counts of
+/// their buckets (those that exist). The first count after starting
+/// counts what the counters hold (the requests since the server started);
+/// the first after a standby is promoted counts nothing.
+async fn count(state: &S3State, pass: &mut Pass) -> Result<(), String> {
     let now = snapshot(state);
-    let grown = growth(&now, counted);
-    let day = (now_ms() / DAY_MS) as u32;
-    object(state, move |file| {
-        let mut existing = Vec::new();
-        for (bucket, add) in grown {
-            if file.bucket(&bucket)?.is_some() {
-                existing.push((bucket, add));
+    let Some(before) = &pass.counted else {
+        // Just promoted: from now on.
+        pass.counted = Some(now);
+        return Ok(());
+    };
+    let grown = growth(&now, before);
+    if !grown.is_empty() {
+        let day = today();
+        object(state, move |file| {
+            let mut existing = Vec::new();
+            for (bucket, add) in grown {
+                if let Some(info) = file.bucket(&bucket)? {
+                    existing.push((bucket, info.created_ms, add));
+                }
             }
-        }
-        file.transaction(|tx| {
-            for (bucket, add) in &existing {
-                tx.add_lens_activity(bucket, day, add)?;
+            // One bucket's counts a row: a transaction of at most a batch.
+            for chunk in existing.chunks(LENS_BATCH) {
+                file.transaction(|tx| {
+                    for (bucket, created_ms, add) in chunk {
+                        tx.add_lens_activity(bucket, *created_ms, day, add)?;
+                    }
+                    Ok(())
+                })?;
             }
-            tx.expire_lens_activity(day.saturating_sub(truthdb_object::LENS_KEEP_DAYS - 1))
+            Ok(())
         })
-    })
-    .await?;
-    *counted = now;
+        .await?;
+    }
+    pass.counted = Some(now);
     Ok(())
 }
 
@@ -163,16 +230,34 @@ struct Due {
     key: String,
     account: String,
     document: Vec<u8>,
+    generation: u64,
+    /// The day of its last report.
+    reported: Option<u32>,
     config: LensConfig,
 }
 
-/// Makes the first due report; whether there was one.
-async fn step(state: &S3State, shutdown: &watch::Receiver<bool>) -> Result<bool, String> {
-    let day = (now_ms() / DAY_MS) as u32 - 1;
+/// Makes the first due report not in `failed`; the configuration whose
+/// report it was, if there was one.
+async fn step(
+    state: &S3State,
+    failed: &HashSet<(String, u32)>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<Option<String>, (String, u32, String)> {
+    let day = today() - 1;
     let region = state.region.clone();
+    let skip: HashSet<String> = failed
+        .iter()
+        .filter(|(_, failed)| *failed == day)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let now = now_ms();
     let due = object(state, move |file| {
         for key in file.bucket_config_ids_with("", STORAGE_LENS, "")? {
-            if file.lens_reported(&key)?.is_some_and(|last| last >= day) {
+            if skip.contains(&key) {
+                continue;
+            }
+            let lens = file.lens_state(&key)?;
+            if lens.is_some_and(|lens| lens.reported.is_some_and(|last| last >= day)) {
                 continue;
             }
             let Some(document) = file.bucket_config("", STORAGE_LENS, &key)? else {
@@ -188,33 +273,102 @@ async fn step(state: &S3State, shutdown: &watch::Receiver<bool>) -> Result<bool,
             if !config.enabled {
                 continue;
             }
+            // A configuration put before its state was kept is given one.
+            let lens = match lens {
+                Some(lens) => lens,
+                None => {
+                    file.transaction(|tx| tx.track_lens(&key, now))?;
+                    file.lens_state(&key)?.expect("just tracked")
+                }
+            };
             return Ok(Some(Due {
                 account: account.to_string(),
                 key,
                 document,
+                generation: lens.generation,
+                reported: lens.reported,
                 config,
             }));
         }
         Ok(None)
     })
-    .await?;
+    .await
+    .map_err(|err| (String::new(), day, err))?;
     let Some(due) = due else {
-        return Ok(false);
+        return Ok(None);
     };
-    let Some(records) = report(state, &due, day, shutdown).await? else {
-        return Ok(false);
+    let key = due.key.clone();
+    let failure = |err: String| (key.clone(), day, err);
+    let Some(records) = report(state, &due, day, shutdown).await.map_err(failure)? else {
+        return Ok(None);
     };
-    let Due { key, document, .. } = due;
-    object(state, move |file| {
-        // A configuration changed or deleted meanwhile: made again (or not
-        // at all) from what it is now.
-        if file.bucket_config("", STORAGE_LENS, &key)?.as_deref() != Some(&document[..]) {
+    write(state, &due, day, records).await.map_err(failure)?;
+    Ok(Some(due.key))
+}
+
+/// Writes `due`'s report of `day`: what an earlier one cut short left is
+/// cleared, the records written, then the day recorded as reported, each a
+/// transaction of at most a batch. Each first finds the configuration as
+/// it was when the report began (else nothing more is written: it is made
+/// again, or not at all, from what it is now).
+async fn write(
+    state: &S3State,
+    due: &Due,
+    day: u32,
+    records: Vec<LensRecord>,
+) -> Result<(), String> {
+    let (key, generation) = (due.key.clone(), due.generation);
+    let document = Arc::new(due.document.clone());
+    let unchanged = move |file: &mut ObjFile<'_>, key: &str, document: &[u8]| {
+        Ok::<_, truthdb_core::storage::StorageError>(
+            file.bucket_config("", STORAGE_LENS, key)?.as_deref() == Some(document)
+                && file
+                    .lens_state(key)?
+                    .is_some_and(|lens| lens.generation == generation),
+        )
+    };
+    let from = due.reported.map_or(0, |last| last + 1);
+    loop {
+        let (key, document) = (key.clone(), Arc::clone(&document));
+        let more = object(state, move |file| {
+            if !unchanged(file, &key, &document)? {
+                return Ok(None);
+            }
+            file.transaction(|tx| tx.clear_lens_days(&key, generation, from))
+                .map(Some)
+        })
+        .await?;
+        match more {
+            None => return Ok(()),
+            Some(true) => continue,
+            Some(false) => break,
+        }
+    }
+    let records = Arc::new(records);
+    for start in (0..records.len()).step_by(LENS_BATCH) {
+        let (key, document, records) = (key.clone(), Arc::clone(&document), Arc::clone(&records));
+        let written = object(state, move |file| {
+            if !unchanged(file, &key, &document)? {
+                return Ok(false);
+            }
+            let end = (start + LENS_BATCH).min(records.len());
+            file.transaction(|tx| {
+                tx.put_lens_records(&key, generation, day, &records[start..end])
+            })?;
+            Ok(true)
+        })
+        .await?;
+        if !written {
             return Ok(());
         }
-        file.transaction(|tx| tx.put_lens_report(&key, day, &records))
+    }
+    object(state, move |file| {
+        if unchanged(file, &key, &document)? {
+            file.transaction(|tx| tx.lens_reported(&key, generation, day))?;
+        }
+        Ok(())
     })
-    .await?;
-    Ok(true)
+    .await
 }
 
 /// One storage class's counts, of a bucket or of a prefix.
@@ -570,14 +724,19 @@ async fn report(
     Ok(Some(records(&due.config, &tallies)))
 }
 
-/// The settings and rule counts of a bucket, and its requests of `day`.
+/// The settings and rule counts of a bucket (made at `created_ms`), and
+/// its requests of `day`.
 fn bucket_facts(
     file: &mut ObjFile<'_>,
     name: &str,
+    created_ms: u64,
     day: u32,
     region: &str,
 ) -> Result<Option<BucketTally>, truthdb_core::storage::StorageError> {
-    let Some(info) = file.bucket(name)? else {
+    let Some(info) = file
+        .bucket(name)?
+        .filter(|info| info.created_ms == created_ms)
+    else {
         return Ok(None);
     };
     let accelerated = file.bucket_config(name, BUCKET_ACCELERATE, "")?.as_deref() == Some(&[1][..]);
@@ -680,7 +839,9 @@ fn bucket_facts(
         settings,
         lifecycle_rules,
         replication_rules,
-        activity: file.lens_activity(name, day)?.unwrap_or_default(),
+        activity: file
+            .lens_activity(name, created_ms, day)?
+            .unwrap_or_default(),
         ..BucketTally::default()
     }))
 }
@@ -696,8 +857,10 @@ async fn tally(
     shutdown: &watch::Receiver<bool>,
 ) -> Result<Option<BucketTally>, String> {
     let (bucket, region) = (name.to_string(), state.region.clone());
-    let Some(mut tally) =
-        object(state, move |file| bucket_facts(file, &bucket, day, &region)).await?
+    let Some(mut tally) = object(state, move |file| {
+        bucket_facts(file, &bucket, created_ms, day, &region)
+    })
+    .await?
     else {
         return Ok(None);
     };
@@ -789,11 +952,20 @@ async fn tally(
     let now = now_ms();
     let mut after: Option<(String, u64)> = None;
     loop {
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
         let (bucket, resume, page_rule) = (name.to_string(), after.clone(), rule.clone());
         let mut part = BucketTally::default();
         let page = object(state, move |file| {
+            if file
+                .bucket(&bucket)?
+                .is_none_or(|info| info.created_ms != created_ms)
+            {
+                return Ok(None);
+            }
             let resume = resume.as_ref().map(|(key, upload)| (key.as_str(), *upload));
-            let (uploads, more) = file.list_uploads(&bucket, "", resume, PAGE)?;
+            let (uploads, more) = file.list_uploads(&bucket, "", resume, UPLOAD_PAGE)?;
             for upload in &uploads {
                 let mut bytes = 0;
                 let mut from = 0;
@@ -823,10 +995,12 @@ async fn tally(
             let next = uploads
                 .last()
                 .map(|upload| (upload.key.clone(), upload.upload));
-            Ok((part, next, more))
+            Ok(Some((part, next, more)))
         })
         .await?;
-        let (part, next, more) = page;
+        let Some((part, next, more)) = page else {
+            return Ok(None);
+        };
         tally.merge(part);
         if !more || next.is_none() {
             break;

@@ -22270,7 +22270,7 @@ fn storage_lens_reports_count_each_bucket_and_prefix_once_a_day_across_a_crash()
     // The account: its buckets' sum; an excluded bucket is not counted.
     assert_eq!(
         value("ACCOUNT", "", "", "STANDARD", "StorageBytes"),
-        Some(213)
+        Some(813)
     );
     assert_eq!(
         setting("ACCOUNT", "", "VersioningEnabledBucketCount"),
@@ -22295,6 +22295,16 @@ fn storage_lens_reports_count_each_bucket_and_prefix_once_a_day_across_a_crash()
         (other("p/"), other("p/q/"), other("p/q/r/")),
         (Some(40), Some(40), None)
     );
+    // A report of more records than a transaction writes: written whole.
+    let many = rows
+        .iter()
+        .filter(|row| row[1] == "PREFIX" && row[2] == "many")
+        .count();
+    assert_eq!(many, 60 * 20, "{rows:?}");
+    assert_eq!(
+        value("PREFIX", "many", "p59/", "STANDARD", "StorageBytes"),
+        Some(10)
+    );
     // Made once a day: a crash does not lose it, nor make it again (an
     // object put since would be in one made again); a configuration put
     // just before one has its report after it.
@@ -22303,9 +22313,23 @@ fn storage_lens_reports_count_each_bucket_and_prefix_once_a_day_across_a_crash()
     let second = wait(server.native_port, "second");
     assert!(second.iter().all(|row| row[0] == yesterday), "{second:?}");
     assert_eq!(report(server.native_port, "daily"), rows);
-    // A disabled configuration has none; a deleted one's go with it.
+    // A disabled configuration has none; a deleted one's go with it, and
+    // are not those of one put again under its id.
     run("after", server.s3_port);
     assert!(report(server.native_port, "daily").is_empty());
+    run("again", server.s3_port);
+    let again = wait(server.native_port, "daily");
+    let late = again
+        .iter()
+        .find(|row| {
+            row[1] == "BUCKET"
+                && row[2] == "data"
+                && row[4] == "STANDARD"
+                && row[5] == "StorageBytes"
+        })
+        .map(|row| row[6].clone());
+    assert_eq!(late.as_deref(), Some("1166"), "{again:?}");
+    assert_eq!(again.len(), rows.len(), "{again:?}");
     assert!(report(server.native_port, "quiet").is_empty());
     assert!(!report(server.native_port, "second").is_empty());
 }
@@ -22328,7 +22352,7 @@ def lens(id, enabled=True, **extra):
             "IsEnabled": True, "SelectionCriteria": {"MaxDepth": 2, "MinStorageBytesPercentage": 1}}}))},
         **extra)
 if phase == "setup":
-    for name in ["data", "other", "skipped"]:
+    for name in ["data", "other", "skipped", "many"]:
         s3.create_bucket(Bucket=name)
     s3.put_bucket_versioning(Bucket="data", VersioningConfiguration={"Status": "Enabled"})
     s3.put_object(Bucket="data", Key="logs/a", Body=b"x" * 10)
@@ -22348,6 +22372,8 @@ if phase == "setup":
     theirs.put_object(Bucket="theirs", Key="z", Body=b"x" * 3)
     s3.put_bucket_accelerate_configuration(Bucket="other", AccelerateConfiguration={"Status": "Enabled"})
     s3.put_object(Bucket="skipped", Key="y", Body=b"x" * 9)
+    for n in range(60):
+        s3.put_object(Bucket="many", Key=f"p{n:02}/x", Body=b"x" * 10)
     control.put_storage_lens_configuration(AccountId=account, ConfigId="daily",
         StorageLensConfiguration=lens("daily", Exclude={"Buckets": ["arn:aws:s3:::skipped"]}))
     control.put_storage_lens_configuration(AccountId=account, ConfigId="quiet",
@@ -22360,5 +22386,8 @@ elif phase == "arm":
         StorageLensConfiguration=lens("second"))
 elif phase == "after":
     control.delete_storage_lens_configuration(AccountId=account, ConfigId="daily")
+elif phase == "again":
+    control.put_storage_lens_configuration(AccountId=account, ConfigId="daily",
+        StorageLensConfiguration=lens("daily", Exclude={"Buckets": ["arn:aws:s3:::skipped"]}))
 print("ok")
 "#;

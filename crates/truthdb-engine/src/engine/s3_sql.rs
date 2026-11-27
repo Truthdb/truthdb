@@ -924,17 +924,20 @@ struct StorageLensStream {
 
 impl ExternalStream for StorageLensStream {
     fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
-        if self.done {
-            return Ok(None);
+        // A slice may hold no record read (those of a report not finished,
+        // or of a deleted configuration): the next is read.
+        let mut records = Vec::new();
+        while records.is_empty() && !self.done {
+            let (slice, next) = {
+                let mut guard = self.core.lock();
+                let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+                file.lens_rows(self.after.as_deref(), LENS_SLICE)
+                    .map_err(storage_error)?
+            };
+            records = slice;
+            self.done = next.is_none();
+            self.after = next;
         }
-        let (records, next) = {
-            let mut guard = self.core.lock();
-            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
-            file.lens_rows(self.after.as_deref(), LENS_SLICE)
-                .map_err(storage_error)?
-        };
-        self.done = next.is_none();
-        self.after = next;
         let rows: Vec<Vec<Datum>> = records
             .iter()
             .map(|row| {

@@ -105,7 +105,9 @@ pub use replication::{
     ReplicationDestination, ReplicationFilter, ReplicationRule, ReplicationStatus, ReplicationWork,
 };
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
-pub use storage_lens::{ActivityCounts, LENS_KEEP_DAYS, LensRecord, LensRecordType, LensRow};
+pub use storage_lens::{
+    ActivityCounts, LENS_BATCH, LENS_KEEP_DAYS, LensRecord, LensRecordType, LensRow, LensState,
+};
 pub use stored::{Backlogs, BodyUse, StoredBody};
 pub use tables::{
     MaintenanceRecord, NamespaceInfo, TableBucketInfo, TableError, TableInfo, warehouse_bucket,
@@ -259,16 +261,18 @@ const TABLE_MAINTENANCE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 56;
 /// `object_lambda`).
 const ACCESS_POINTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 57;
 
-/// Storage Lens: (bucket, 0, day u32 BE) -> that day's request counts, 11
-/// u64 LE (see `storage_lens`).
+/// Storage Lens: (day u32 BE, bucket) -> the bucket's creation time and
+/// that day's request counts, 12 u64 LE (see `storage_lens`).
 const LENS_ACTIVITY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 58;
 
-/// Storage Lens: (configuration key, 0, day u32 BE, record type, then the
+/// Storage Lens: (configuration key, 0, generation u64 BE, day u32 BE,
+/// record type, then the
 /// bucket, the record value, the storage class and the metric, each a u16
 /// BE length and its bytes) -> the metric's value, u64 BE.
 const LENS_REPORTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 59;
 
-/// Storage Lens: configuration key -> the day of its last report, u32 BE.
+/// Storage Lens: configuration key -> its generation, u64 BE, and the day
+/// of its last report, u32 BE (u32::MAX: none).
 const LENS_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 60;
 
 /// The object id stamped into every body page's header. Not a tree.
