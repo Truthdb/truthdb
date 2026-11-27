@@ -75,8 +75,7 @@ static MARK_KEY: LazyLock<hmac::Key> = LazyLock::new(|| {
 
 /// The GetObjects waiting for their function's WriteGetObjectResponse, by
 /// their output token.
-static WAITING: LazyLock<Mutex<HashMap<String, oneshot::Sender<Answer>>>> =
-    LazyLock::new(Default::default);
+static WAITING: LazyLock<Mutex<HashMap<String, Waiter>>> = LazyLock::new(Default::default);
 
 /// The client functions are invoked with.
 static POSTER: OnceLock<Option<truthdb_s3client::Poster>> = OnceLock::new();
@@ -260,12 +259,6 @@ pub(crate) async fn serve(
     auth: &Authenticated,
     via: ViaLambda,
 ) -> Result<Option<Response<Body>>, S3Error> {
-    if auth.session.is_some() {
-        return Err(session_refused());
-    }
-    let Some(principal) = auth.principal.clone() else {
-        return Err(S3Error::access_denied("Access Denied"));
-    };
     let held = &*request;
     let action = action_of(held)?;
     let transformation = action.and_then(|action| {
@@ -276,6 +269,25 @@ pub(crate) async fn serve(
     });
     let point = &via.point;
     let point_arn = lambda_arn(&state.region, &point.account, &point.name);
+    // Counted in its own metrics, if they are on: by where it gets its data
+    // (its function, or its supporting access point); as served only once
+    // it is (see `counted_as`).
+    let source = via
+        .configuration
+        .metrics
+        .then(|| match (action, transformation) {
+            (Some(_), Some(transformation)) => {
+                canonical_function(&state.region, &point.account, &transformation.function_arn)
+            }
+            _ => via.configuration.supporting.clone(),
+        });
+    counted_as(held, point, &source, crate::metering::LambdaRole::Unserved);
+    if auth.session.is_some() {
+        return Err(session_refused());
+    }
+    let Some(principal) = auth.principal.clone() else {
+        return Err(S3Error::access_denied("Access Denied"));
+    };
     let query = held.uri().query().unwrap_or("").to_string();
     let authz = Authz::load(
         state,
@@ -317,6 +329,12 @@ pub(crate) async fn serve(
             "NoSuchAccessPoint" => no_supporting_point(),
             _ => err,
         })?;
+        counted_as(
+            request,
+            point,
+            &source,
+            crate::metering::LambdaRole::Proxied,
+        );
         // Every check the operation makes is made here too (see
         // `Authz::through_lambda`).
         request.extensions_mut().insert(crate::authz::LambdaGate {
@@ -327,6 +345,10 @@ pub(crate) async fn serve(
         return Ok(None);
     };
     let configuration = &via.configuration;
+    // Its events are the Object Lambda access point's.
+    if let Some(seen) = crate::metering::seen_of(held) {
+        seen.mark_answered_by(&point_arn, &point.account);
+    }
     // Ranges and parts only as its features allow (the function serves them).
     let allows = |feature: &str| configuration.features.iter().any(|known| known == feature);
     if matches!(action, "GetObject" | "HeadObject") {
@@ -512,6 +534,7 @@ pub(crate) async fn serve(
     });
     event[context_key] = context;
     let event = event.to_string();
+    counted_as(held, point, &source, crate::metering::LambdaRole::Invoked);
     let delivery = format!("object-lambda/{request_id}");
     if action != "GetObject" {
         // Answered by what the function returns.
@@ -537,7 +560,14 @@ pub(crate) async fn serve(
         return returned_response(action, &body, &request_id, held.uri().path()).map(Some);
     }
     let (answered, answer) = oneshot::channel();
-    lock_waiting().insert(token.clone(), answered);
+    let counted = via.configuration.metrics.then(|| {
+        lambda_seen(
+            point,
+            function_arn.clone(),
+            crate::metering::LambdaRole::Responding,
+        )
+    });
+    lock_waiting().insert(token.clone(), (answered, counted));
     let _waiting = Waiting(token.clone());
     // Its return is not read: the function answers with
     // WriteGetObjectResponse.
@@ -633,6 +663,52 @@ fn lambda_action(name: &str, versioned: bool) -> Option<&'static str> {
         "RestoreObject" => "RestoreObject",
         _ => return None,
     })
+}
+
+/// The ARN of the function `arn` names, as an access point of `account`
+/// invokes it (in this Region, of that account); `arn` itself if it names
+/// none.
+fn canonical_function(region: &str, account: &str, arn: &str) -> String {
+    match crate::batch::function_name(arn) {
+        Some((function, qualifier, _)) => {
+            let mut canonical = format!("arn:aws:lambda:{region}:{account}:function:{function}");
+            if let Some(qualifier) = &qualifier {
+                canonical.push(':');
+                canonical.push_str(qualifier);
+            }
+            canonical
+        }
+        None => arn.to_string(),
+    }
+}
+
+/// Marks `request` (to Object Lambda access point `point`) as its metrics
+/// count it, from `source`, if they are on.
+fn counted_as<B>(
+    request: &Request<B>,
+    point: &ObjectLambdaPoint,
+    source: &Option<String>,
+    role: crate::metering::LambdaRole,
+) {
+    if let (Some(source), Some(seen)) = (source, crate::metering::seen_of(request)) {
+        seen.mark_lambda(lambda_seen(point, source.clone(), role));
+    }
+}
+
+/// A request to Object Lambda access point `point` as its metrics count it.
+fn lambda_seen(
+    point: &ObjectLambdaPoint,
+    source: String,
+    role: crate::metering::LambdaRole,
+) -> crate::metering::LambdaSeen {
+    crate::metering::LambdaSeen {
+        series: truthdb_object::MetricSeries {
+            bucket: crate::metric_history::object_lambda_series(&point.account, &point.name),
+            by: truthdb_object::SeriesBy::ObjectLambda { source },
+        },
+        made_ms: point.created_ms,
+        role,
+    }
 }
 
 fn no_supporting_point() -> S3Error {
@@ -941,7 +1017,11 @@ pub(crate) fn called_via_keys() -> [(&'static str, String); 3] {
     ]
 }
 
-fn lock_waiting() -> std::sync::MutexGuard<'static, HashMap<String, oneshot::Sender<Answer>>> {
+/// A GetObject waiting for its answer: where it goes, and how the
+/// function's answer is counted (if its access point's metrics are on).
+type Waiter = (oneshot::Sender<Answer>, Option<crate::metering::LambdaSeen>);
+
+fn lock_waiting() -> std::sync::MutexGuard<'static, HashMap<String, Waiter>> {
     WAITING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1229,6 +1309,16 @@ async fn write_get_object_response(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
     };
+    let token = header("x-amz-request-token").unwrap_or_default();
+    // Counted as its access point's function's answer, whatever it answers.
+    let counted = lock_waiting()
+        .get(&token)
+        .and_then(|(_, counted)| counted.clone());
+    if let Some(counted) = counted
+        && let Some(seen) = crate::metering::seen_of(&request)
+    {
+        seen.mark_lambda(counted);
+    }
     let status = match header("x-amz-fwd-status") {
         None => 200,
         Some(status) => status
@@ -1266,8 +1356,7 @@ async fn write_get_object_response(
         };
         headers.push(("content-length".to_string(), length));
     }
-    let token = header("x-amz-request-token").unwrap_or_default();
-    let Some(waiting) = lock_waiting().remove(&token) else {
+    let Some((waiting, _)) = lock_waiting().remove(&token) else {
         return Err(S3Error::invalid_request(
             "The request token names no GetObject waiting for its answer",
         ));

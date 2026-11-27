@@ -106,6 +106,9 @@ pub(crate) struct Call {
     control: Option<ControlCall>,
     /// The access point the request was made through.
     through: Option<Through>,
+    /// The Object Lambda access point whose function answered the request:
+    /// its ARN and account.
+    answered_by: Option<(String, String)>,
     host: Option<String>,
     user_agent: Option<String>,
     source_ip: Option<String>,
@@ -122,6 +125,12 @@ struct Through {
 }
 
 impl Call {
+    /// This event for a request the function of Object Lambda access point
+    /// `arn` (of `account`) answered: Object Lambda's event, on it.
+    pub(crate) fn answered_by(&mut self, arn: &str, account: &str) {
+        self.answered_by = Some((arn.to_string(), account.to_string()));
+    }
+
     /// This event for a request made through the access point of ARN `arn`,
     /// on its bucket `bucket` (the name the request gave was the access
     /// point's).
@@ -309,6 +318,7 @@ impl Call {
             express,
             control: None,
             through: None,
+            answered_by: None,
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
@@ -551,6 +561,17 @@ fn record(
         Some(through) if hidden => (through.given.as_ref(), None, None),
         through => (call.bucket.as_ref(), through, owner),
     };
+    // Answered by an Object Lambda access point's function: the access
+    // point (and its account) only in its own account's event, the caller
+    // having given its alias, which names no account.
+    let answered_by = call
+        .answered_by
+        .as_ref()
+        .filter(|(_, point_account)| recipient == point_account);
+    let owner = match (&call.answered_by, answered_by) {
+        (Some(_), None) => None,
+        _ => owner,
+    };
     let (principal, signed) = who;
     let account = &principal.account;
     let identity = match &principal.user {
@@ -598,7 +619,9 @@ fn record(
         "eventVersion": "1.11",
         "userIdentity": identity,
         "eventTime": format!("{}Z", &iso[..19]),
-        "eventSource": if call.express {
+        "eventSource": if call.answered_by.is_some() {
+            "s3-object-lambda.amazonaws.com"
+        } else if call.express {
             "s3express.amazonaws.com"
         } else {
             "s3.amazonaws.com"
@@ -624,7 +647,17 @@ fn record(
         "recipientAccountId": recipient,
         "eventCategory": if call.data { "Data" } else { "Management" },
     });
-    if let Some(bucket) = bucket_named {
+    if let Some((arn, point_account)) = answered_by {
+        // Object Lambda's: on its access point (no bucket was acted on).
+        record["resources"] = json!([{
+            "accountId": point_account,
+            "type": "AWS::S3ObjectLambda::AccessPoint",
+            "ARN": arn,
+        }]);
+        if let (Some(key), Fit::Whole) = (&call.key, fit) {
+            record["requestParameters"]["key"] = json!(truncated(key, MAX_KEY));
+        }
+    } else if let Some(bucket) = bucket_named {
         // A name no bucket can have (a refused call's) made printable and
         // cut short.
         let bucket = truncated(&printable(bucket), 255).to_string();

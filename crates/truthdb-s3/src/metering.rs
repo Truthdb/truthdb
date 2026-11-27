@@ -40,6 +40,35 @@ struct Seen {
     copy_source: Mutex<Option<(String, String)>>,
     /// The access point the request was made through: its bucket and ARN.
     through: Mutex<Option<(String, String)>>,
+    /// The Object Lambda access point the request was made to, if its
+    /// metrics are on.
+    lambda: Mutex<Option<LambdaSeen>>,
+    /// The Object Lambda access point whose function answered the request:
+    /// its ARN and account.
+    answered_by: Mutex<Option<(String, String)>>,
+}
+
+/// A request to an Object Lambda access point whose metrics are on (or a
+/// function's answer to one): its series, when the access point was made
+/// (ms), and what the request was.
+#[derive(Clone)]
+pub(crate) struct LambdaSeen {
+    pub(crate) series: truthdb_object::MetricSeries,
+    pub(crate) made_ms: u64,
+    pub(crate) role: LambdaRole,
+}
+
+/// What a request to an Object Lambda access point was.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LambdaRole {
+    /// Neither answered by its function nor passed on (refused first).
+    Unserved,
+    /// Answered by its function.
+    Invoked,
+    /// Passed on to its supporting access point.
+    Proxied,
+    /// A function's WriteGetObjectResponse.
+    Responding,
 }
 
 impl BucketSeen {
@@ -110,6 +139,41 @@ impl BucketSeen {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|(bucket, _)| bucket.clone())
+    }
+
+    pub(crate) fn mark_answered_by(&self, arn: &str, account: &str) {
+        *self
+            .0
+            .answered_by
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((arn.to_string(), account.to_string()));
+    }
+
+    /// The Object Lambda access point whose function answered the request:
+    /// its ARN and account.
+    pub(crate) fn answered_by(&self) -> Option<(String, String)> {
+        self.0
+            .answered_by
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn mark_lambda(&self, seen: LambdaSeen) {
+        *self
+            .0
+            .lambda
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(seen);
+    }
+
+    pub(crate) fn lambda(&self) -> Option<LambdaSeen> {
+        self.0
+            .lambda
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn mark_through(&self, bucket: &str, arn: &str) {
@@ -227,11 +291,13 @@ pub(crate) fn uploaded(request: &Request<Incoming>) -> u64 {
 /// (or is dropped, its client gone), the request's total latency.
 pub(crate) struct MeteredBody {
     inner: Body,
-    counters: Arc<BucketRequests>,
+    /// Its bucket's request counters (none: it is no bucket's request, but
+    /// an Object Lambda access point's).
+    counters: Option<Arc<BucketRequests>>,
     started: Instant,
     /// The metric history's series the request counts in, and when it
     /// came (seconds).
-    history: Option<(Arc<MetricRecorder>, Matched, u64)>,
+    history: Vec<(Arc<MetricRecorder>, Matched, u64)>,
     /// The request's access log line, if its bucket's logging is on.
     log: Option<(
         Arc<crate::access_log::AccessLogger>,
@@ -244,9 +310,9 @@ pub(crate) struct MeteredBody {
 impl MeteredBody {
     pub(crate) fn new(
         inner: Body,
-        counters: Arc<BucketRequests>,
+        counters: Option<Arc<BucketRequests>>,
         started: Instant,
-        history: Option<(Arc<MetricRecorder>, Matched, u64)>,
+        history: Vec<(Arc<MetricRecorder>, Matched, u64)>,
         log: Option<(
             Arc<crate::access_log::AccessLogger>,
             crate::access_log::Entry,
@@ -267,8 +333,10 @@ impl MeteredBody {
         if !self.done {
             self.done = true;
             let total = self.started.elapsed();
-            self.counters.finished(self.sent, total);
-            if let Some((recorder, series, at)) = &self.history {
+            if let Some(counters) = &self.counters {
+                counters.finished(self.sent, total);
+            }
+            for (recorder, series, at) in &self.history {
                 recorder.record(
                     series,
                     *at,

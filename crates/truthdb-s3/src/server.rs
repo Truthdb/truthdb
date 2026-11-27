@@ -355,12 +355,23 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
             *named = bucket.clone();
         }
     }
+    // Answered by an Object Lambda access point's function: its events are
+    // that access point's, told to its account.
+    let answered_by = seen.answered_by();
+    if let Some((arn, account)) = &answered_by {
+        for event in [&mut call, &mut data].into_iter().flatten() {
+            event.answered_by(arn, account);
+        }
+    }
+    let event_owner = answered_by
+        .map(|(_, account)| account)
+        .or_else(|| seen.owner());
     if let Some(call) = &call {
         state.activity.record(
             state,
             call,
             &who,
-            seen.owner().as_deref(),
+            event_owner.as_deref(),
             &ids.request_id,
             error_code.zip(error_message.as_deref()),
         );
@@ -372,16 +383,29 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 state,
                 data,
                 &who,
-                seen.owner().as_deref(),
+                event_owner.as_deref(),
                 seen.copy_source_owner(),
                 &ids.request_id,
                 error_code.zip(error_message.as_deref()),
             )
             .await;
     }
-    if let Some(metered) = metered.filter(|_| seen.seen()) {
-        // The latency to the first byte, before the lookups below.
-        let first_byte = started.elapsed();
+    // The latency to the first byte, before the lookups below.
+    let first_byte = started.elapsed();
+    // An Object Lambda access point's own series, if its metrics are on.
+    let mut lambda_history = match (seen.lambda(), &metered) {
+        (Some(lambda), Some(metered)) => crate::metric_history::object_lambda_answered(
+            &state.metric_recorder,
+            lambda,
+            metered.kind,
+            uploaded,
+            response.status().as_u16(),
+            first_byte,
+            arrived,
+        ),
+        _ => None,
+    };
+    if let Some(metered) = metered.as_ref().filter(|_| seen.seen()) {
         let counters = state.request_metrics.bucket(&metered.bucket);
         counters.answered(
             metered.kind,
@@ -448,7 +472,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_string)
                     }),
-                    object_size: object_size(&response, &metered, uploaded),
+                    object_size: object_size(&response, metered, uploaded),
                     turnaround_ms: first_byte.as_millis() as u64,
                     signed,
                     auth_type,
@@ -457,8 +481,13 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 },
             ));
         }
+        let histories = history.into_iter().chain(lambda_history.take()).collect();
         response = response.map(|body| {
-            crate::metering::MeteredBody::new(body, counters, started, history, log).boxed()
+            crate::metering::MeteredBody::new(body, Some(counters), started, histories, log).boxed()
+        });
+    } else if let Some(history) = lambda_history.take() {
+        response = response.map(|body| {
+            crate::metering::MeteredBody::new(body, None, started, vec![history], None).boxed()
         });
     }
     if let Some((bucket, origin, method)) = cross_origin {
