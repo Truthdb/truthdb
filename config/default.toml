@@ -92,11 +92,12 @@ reserved_ratio = 0.17
 #
 # [admin]
 # Prometheus /metrics (S3 requests and storage, the log, queues, consumer
-# lag), /healthz and /readyz.
+# lag), /healthz, /readyz, and the Storage Lens dashboards at /storage-lens
+# (every account's dashboards and bucket names: set a token).
 # enabled = true
 # addr = "127.0.0.1"
 # port = 9625
-# token = "a-long-random-secret"   # /metrics then needs Authorization: Bearer <token>
+# token = "a-long-random-secret"   # /metrics and /storage-lens then need Authorization: Bearer <token>
 #
 # [kafka]
 # Kafka-compatible listener for consumers of stream topics (TLS only). Clients

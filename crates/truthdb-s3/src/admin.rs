@@ -32,7 +32,7 @@ const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub struct AdminState {
     pub storage: Arc<Storage>,
     pub request_metrics: Arc<RequestMetrics>,
-    /// The bearer token `/metrics` needs, if any.
+    /// The bearer token `/metrics` and `/storage-lens` need, if any.
     pub token: Option<String>,
 }
 
@@ -146,7 +146,7 @@ async fn handle(state: &Arc<AdminState>, request: Request<Incoming>) -> Response
             if !authorized(state, &request) {
                 return unauthorized();
             }
-            storage_lens(state, path).await
+            storage_lens(state, path, request.uri().query().unwrap_or("")).await
         }
         _ => text(StatusCode::NOT_FOUND, "not found\n"),
     }
@@ -161,14 +161,22 @@ fn unauthorized() -> Response<Body> {
 }
 
 /// A Storage Lens dashboard page: the list, or one configuration's
-/// (`/storage-lens/<account>/<id>`, each a valid one: not looked up
-/// otherwise).
-async fn storage_lens(state: &Arc<AdminState>, path: &str) -> Response<Body> {
+/// (`/storage-lens/<account>/<id>`, or `/storage-lens?dashboard=<account>/
+/// <id>`, which the list links to: a browser keeps an id of `.` or `..`
+/// in a query, not in a path; each a valid one: not looked up otherwise).
+async fn storage_lens(state: &Arc<AdminState>, path: &str, query: &str) -> Response<Body> {
     let rest = path.strip_prefix("/storage-lens").unwrap_or("");
-    let key = match rest.trim_end_matches('/') {
-        "" => None,
-        named => {
-            let named = &named[1..];
+    let asked = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("dashboard="));
+    let named = match (rest.trim_end_matches('/'), asked) {
+        ("", None) => None,
+        ("", Some(asked)) => Some(asked),
+        (named, _) => Some(&named[1..]),
+    };
+    let key = match named {
+        None => None,
+        Some(named) => {
             let decoded = percent_encoding::percent_decode_str(named).decode_utf8();
             let valid = decoded.as_ref().ok().and_then(|named| {
                 let (account, id) = named.split_once('/')?;

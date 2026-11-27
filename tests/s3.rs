@@ -22122,15 +22122,18 @@ control.put_storage_lens_configuration(AccountId=account, ConfigId="main", Stora
 assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="main")["Tags"] == []
 # CloudTrail records each call by its name and configuration.
 trail = client("cloudtrail", key, secret)
+# The deletes of "main" (one done, one refused) and the refused ones of
+# other ids may be of one second, in no order: the one done is found.
 for _ in range(60):
-    events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
-        "AttributeValue": "DeleteStorageLensConfiguration"}])["Events"]
-    if events:
+    events = [json.loads(event["CloudTrailEvent"]) for event in trail.lookup_events(LookupAttributes=[
+        {"AttributeKey": "EventName", "AttributeValue": "DeleteStorageLensConfiguration"}])["Events"]]
+    done = [event for event in events
+        if event["requestParameters"].get("configId") == "main" and "errorCode" not in event]
+    if done:
         break
     time.sleep(0.5)
-assert events, events
-deleted = json.loads(events[0]["CloudTrailEvent"])
-assert deleted["requestParameters"]["configId"] == "main", deleted
+assert done, events
+deleted = done[0]
 assert deleted["requestParameters"]["x-amz-account-id"] == account and deleted["readOnly"] is False, deleted
 print("ok")
 "#;
@@ -22604,15 +22607,20 @@ fn the_admin_listener_shows_storage_lens_dashboards() {
     );
     let (big, small) = (body.find("<td>zebra</td>"), body.find("<td>apple</td>"));
     assert!(big.is_some() && small.is_some() && big < small, "{body}");
-    assert!(body.contains("<polyline"), "{body}");
+    // One day's report: a dot.
+    assert!(body.contains("<circle"), "{body}");
     assert!(!body.to_ascii_lowercase().contains("<script"), "{body}");
     // The list links to it.
     let (status, _, list) = admin_call(admin, "GET", "/storage-lens", &bearer);
     assert_eq!(status, 200);
-    assert!(
-        list.contains(&format!("href=\"/storage-lens/{account}/dash\"")),
-        "{list}"
-    );
+    // It links by a query (an id of `.` or `..` stays in one).
+    let link = format!("/storage-lens?dashboard={account}%2Fdash");
+    assert!(list.contains(&format!("href=\"{link}\"")), "{list}");
+    let (status, _, linked) = admin_call(admin, "GET", &link, &bearer);
+    assert_eq!(status, 200);
+    assert!(linked.contains("1,234 bytes in 3 objects"), "{linked}");
+    let bad = format!("/storage-lens?dashboard={account}%2Fdash%00");
+    assert_eq!(admin_call(admin, "GET", &bad, &bearer).0, 404);
     // What is not a configuration's is not found, and not looked up.
     for missing in [
         format!("/storage-lens/{account}/none"),

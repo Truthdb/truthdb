@@ -412,7 +412,7 @@ async fn main() -> ExitCode {
                     config.admin.addr,
                     config.admin.port,
                     if config.admin.token.is_some() {
-                        " (metrics need the token)"
+                        " (metrics and Storage Lens need the token)"
                     } else {
                         ""
                     }

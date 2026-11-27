@@ -20,7 +20,7 @@ const TOP_BUCKETS: usize = 25;
 /// The account metrics a day's trend point is read from: an account's
 /// records come first in a day's, and are this many at most (a metric of
 /// each storage class, and those of none).
-const ACCOUNT_RECORDS: usize = 600;
+const ACCOUNT_RECORDS: usize = 256;
 
 /// The Content-Security-Policy of the dashboard's pages: nothing loaded,
 /// no script; their own inline style only.
@@ -83,7 +83,7 @@ pub fn list(storage: &Storage) -> Result<String, StorageError> {
                 .map_or("none yet".to_string(), date);
             let _ = write!(
                 body,
-                "<tr><td>{}</td><td><a href=\"/storage-lens/{}/{}\">{}</a></td><td>{}</td></tr>",
+                "<tr><td>{}</td><td><a href=\"/storage-lens?dashboard={}%2F{}\">{}</a></td><td>{}</td></tr>",
                 escape(account),
                 escape(account),
                 escape(id),
@@ -131,13 +131,23 @@ fn trend(title: &str, points: &[(u32, u64)]) -> String {
             format!("{x:.1},{y:.1}")
         })
         .collect();
+    // One day: a dot (a line of one point draws nothing).
+    let mark = match line.as_slice() {
+        [point] => {
+            let (x, y) = point.split_once(',').expect("x,y");
+            format!("<circle cx=\"{x}\" cy=\"{y}\" r=\"4\" fill=\"#2a6\"/>")
+        }
+        _ => format!(
+            "<polyline fill=\"none\" stroke=\"#2a6\" stroke-width=\"2\" points=\"{}\"/>",
+            line.join(" ")
+        ),
+    };
     format!(
         "<h3>{}</h3><svg width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"{}\">\
-         <polyline fill=\"none\" stroke=\"#2a6\" stroke-width=\"2\" points=\"{}\"/></svg>\
+         {mark}</svg>\
          <p>{} to {}: from {} to {} (highest {}).</p>",
         escape(title),
         escape(title),
-        line.join(" "),
         date(first),
         date(last),
         grouped(points[0].1),
@@ -185,7 +195,9 @@ pub fn dashboard(storage: &Storage, key: &str) -> Result<Option<String>, Storage
             file.lens_report_page(key, generation, last, resume.as_deref(), PAGE)
         })?
         else {
-            break;
+            // Deleted, or put again, while the page was read.
+            body.push_str("<p>The configuration changed while this page was read: reload it.</p>");
+            return Ok(Some(page(&title, &body)));
         };
         for record in records {
             match record.record_type {
@@ -303,6 +315,8 @@ mod tests {
         assert_eq!(grouped(1_234_567), "1,234,567");
         let svg = trend("Storage bytes", &[(10, 5), (12, 10)]);
         assert!(svg.contains("points=\"0.0,60.0 600.0,0.0\""), "{svg}");
+        let one = trend("Storage bytes", &[(10, 5)]);
+        assert!(one.contains("<circle cx=\"0.0\" cy=\"0.0\""), "{one}");
         assert!(trend("x", &[]).is_empty());
     }
 }
