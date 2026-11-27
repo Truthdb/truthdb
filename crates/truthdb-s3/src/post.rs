@@ -586,16 +586,11 @@ pub async fn post_object(
             }),
         );
     }
-    // A Requester Pays bucket's: its requester says it pays (in a field,
-    // or the header), or it is refused.
+    // A Requester Pays bucket's: its requester says it pays in a field
+    // (which its policy covers: a form's headers are anyone's to add), or
+    // it is refused.
     let charged = crate::request_payment::check_saying(
-        crate::request_payment::says_requester_pays(field(&fields, "x-amz-request-payer").or_else(
-            || {
-                headers
-                    .get("x-amz-request-payer")
-                    .and_then(|value| value.to_str().ok())
-            },
-        )),
+        crate::request_payment::says_requester_pays(field(&fields, "x-amz-request-payer")),
         &authz,
     )?;
     if !charged.is_empty()

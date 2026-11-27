@@ -483,9 +483,9 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         }
         let histories = history.into_iter().chain(lambda_history.take()).collect();
         // What a Requester Pays bucket's requester is charged for (the
-        // request succeeding).
+        // request succeeding: a form upload's redirect too).
         let charged: Vec<_> = match seen.charged() {
-            Some((buckets, account)) if response.status().is_success() => buckets
+            Some((buckets, account)) if response.status().as_u16() < 400 => buckets
                 .iter()
                 .map(|bucket| {
                     let charged = state.request_metrics.charged(bucket, &account);

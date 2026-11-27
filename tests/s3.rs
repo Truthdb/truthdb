@@ -21191,8 +21191,8 @@ fn requester_pays_buckets_ask_other_accounts_to_say_they_pay() {
         String::from_utf8_lossy(&output.stderr)
     );
     // What the requester was charged for: its successful requests to the
-    // Requester Pays bucket (the source of its copy and its form upload
-    // among them), and their bytes (the answers' bodies: two reads of the
+    // Requester Pays bucket (the source of its copy and its two form
+    // uploads among them), and their bytes (the answers' bodies: two reads of the
     // object, the listing's and the copy's XML; the put's and the form's
     // uploads); nothing for the owner's account.
     let rows = sql_rows(
@@ -21203,7 +21203,7 @@ fn requester_pays_buckets_ask_other_accounts_to_say_they_pay() {
     let row = &rows[0];
     assert_eq!(
         (row[0].as_str(), row[1].as_str(), row[2].as_str()),
-        ("paid", other.as_str(), "7"),
+        ("paid", other.as_str(), "8"),
         "{rows:?}"
     );
     assert!(row[3].parse::<u64>().unwrap() > 8, "{rows:?}");
@@ -21308,6 +21308,22 @@ said = forms.generate_presigned_post("paid", "form/t", Fields={"x-amz-request-pa
 status, headers = post_form(said["url"], said["fields"])
 assert status == 204 and headers.get("x-amz-request-charged") == "requester", (status, headers)
 assert s3.get_object(Bucket="paid", Key="form/t")["Body"].read() == b"form"
+# One answered with a redirect: charged too.
+redirected = forms.generate_presigned_post("paid", "form/r", Fields={"x-amz-request-payer": "requester",
+    "success_action_redirect": "http://example.test/done"}, Conditions=[{"x-amz-request-payer": "requester"},
+    {"success_action_redirect": "http://example.test/done"}])
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+try:
+    urllib.request.build_opener(NoRedirect).open(urllib.request.Request(redirected["url"],
+        data=("".join(f'--b\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'
+            for n, v in redirected["fields"].items()) +
+            '--b\r\nContent-Disposition: form-data; name="file"; filename="f"\r\n\r\nform\r\n--b--\r\n').encode(),
+        headers={"Content-Type": "multipart/form-data; boundary=b"}))
+    raise SystemExit("not redirected")
+except urllib.error.HTTPError as error:
+    assert error.code == 303 and error.headers["x-amz-request-charged"] == "requester", (error.code, dict(error.headers))
 # Not anonymously, whatever its policy allows, even saying it pays.
 assert anonymous("/paid/o") == 403
 try:
