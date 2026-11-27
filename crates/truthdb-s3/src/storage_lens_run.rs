@@ -129,8 +129,9 @@ async fn run_once(
             Err(Failure::Pass(err)) => return Err(err),
         }
     }
-    // The reports made, their exports.
+    // The reports made, their exports (requests counted between them too).
     loop {
+        count(state, pass).await?;
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -154,10 +155,17 @@ async fn export_step(
 ) -> Result<bool, Failure> {
     let region = state.region.clone();
     let failed = failed.clone();
+    let yesterday = today() - 1;
     let due = object(state, move |file| {
         for key in file.bucket_config_ids_with("", STORAGE_LENS, "")? {
-            let Some(lens) = file.lens_state(&key)? else {
+            if failed.contains(&(key.clone(), yesterday)) {
                 continue;
+            }
+            // A configuration whose state cannot be read is failed alone.
+            let lens = match file.lens_state(&key) {
+                Ok(Some(lens)) => lens,
+                Ok(None) => continue,
+                Err(err) => return Ok(Err((key, yesterday, err.to_string()))),
             };
             let Some(day) = lens.reported else {
                 continue;
@@ -179,7 +187,7 @@ async fn export_step(
             let Some(export) = config.export.filter(|_| config.enabled) else {
                 continue;
             };
-            return Ok(Some(crate::storage_lens_export::ExportDue {
+            return Ok(Ok(Some(crate::storage_lens_export::ExportDue {
                 account: account.to_string(),
                 id: id.to_string(),
                 key: key.clone(),
@@ -187,12 +195,13 @@ async fn export_step(
                 generation: lens.generation,
                 day,
                 export,
-            }));
+            })));
         }
-        Ok(None)
+        Ok(Ok(None))
     })
     .await
-    .map_err(Failure::Pass)?;
+    .map_err(Failure::Pass)?
+    .map_err(|(key, day, err)| Failure::Of(key, day, err))?;
     let Some(due) = due else {
         return Ok(false);
     };

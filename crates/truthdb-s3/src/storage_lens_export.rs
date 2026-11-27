@@ -4,10 +4,15 @@
 //!
 //! The files are under `<prefix>/StorageLens/<account>/<id>/V_1/reports/
 //! dt=<day>/`, the manifest at `.../V_1/manifests/dt=<day>/manifest.json`.
-//! Their bodies are written first; they, and the day recorded as exported,
-//! are then put in one transaction: a crash leaves them all or none, and an
-//! export is made once. A destination that is not there (or not the
-//! account's) has none; the day is recorded as exported all the same.
+//! Their bodies are written first, then put in parts of at most
+//! [`DELIVERY_FILES`] (each its own engine call, so that the log is
+//! checkpointed between), the last with the manifest and the day recorded
+//! as exported. An export of one part (up to 99 data files) is put whole or
+//! not at all, and made once; one of more, cut short by a crash or by its
+//! configuration changing, has its earlier parts put again (under the same
+//! keys) when it is made again, or left where they are if its destination
+//! changed. A destination that is not there (or not the account's) has
+//! none; the day is recorded as exported all the same.
 
 use std::sync::Arc;
 
@@ -533,7 +538,8 @@ struct Delivery<'a> {
 enum Delivered {
     /// Put (the last: with the day recorded as exported).
     Part,
-    /// The configuration is no longer as the export began: nothing put.
+    /// The configuration is no longer as the export began: this part is
+    /// not put (earlier ones are where they were put).
     Abandoned,
     /// Its destination refused (or its files could not be written): the
     /// day is recorded as exported without them.
