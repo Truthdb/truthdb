@@ -296,7 +296,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         }
         request
             .extensions_mut()
-            .insert(crate::accelerate::AccelerateHost);
+            .insert(crate::accelerate::AccelerateHost(named));
     } else if let Some(bucket) = host.and_then(|host| crate::api::host_bucket(host, &state.domains))
     {
         request
@@ -601,6 +601,9 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
             "the request target's host is not the Host header",
         ));
     }
+    // An accelerate endpoint: only as its bucket's acceleration allows,
+    // whatever serves the request.
+    crate::accelerate::check(state, &request).await?;
     // A website endpoint answers for itself, anonymously.
     if let Some(crate::website::WebsiteHost(bucket)) = request.extensions().get().cloned() {
         return Ok(crate::website::serve(state, request, bucket).await);

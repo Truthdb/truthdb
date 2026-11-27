@@ -12,10 +12,10 @@ use truthdb_object::BUCKET_ACCELERATE;
 use crate::error::S3Error;
 use crate::server::{Authenticated, Body, S3State, full, read_body};
 
-/// A request to an accelerate endpoint, in its extensions (its bucket, if
-/// its host names one, is its virtual host's).
+/// A request to an accelerate endpoint, in its extensions: the bucket its
+/// host names (none: the endpoint itself).
 #[derive(Clone)]
-pub(crate) struct AccelerateHost;
+pub(crate) struct AccelerateHost(pub(crate) Option<String>);
 
 /// What `host` names as an accelerate endpoint, if it is one: its bucket
 /// (none: the endpoint itself). A bucket name with periods is none, as
@@ -48,43 +48,40 @@ fn invalid(message: &str) -> S3Error {
 }
 
 /// Refuses a request to an accelerate endpoint its bucket's acceleration
-/// does not allow: one on no bucket (ListBuckets), creating or deleting a
-/// bucket, or on a bucket whose acceleration is not Enabled.
-pub(crate) async fn check(
-    state: &S3State,
-    request: &Request<Incoming>,
-    target: &crate::api::Target,
-    principal: Option<&crate::server::Principal>,
-) -> Result<(), S3Error> {
-    if request.extensions().get::<AccelerateHost>().is_none() {
+/// does not allow, before anything else serves it: one not virtual-hosted
+/// (on the endpoint itself: ListBuckets, or path-style), another service's
+/// or S3 Control's, creating or deleting a bucket, or on a bucket (its
+/// host's) whose acceleration is not Enabled.
+pub(crate) async fn check(state: &S3State, request: &Request<Incoming>) -> Result<(), S3Error> {
+    let Some(AccelerateHost(named)) = request.extensions().get::<AccelerateHost>() else {
         return Ok(());
+    };
+    let Some(bucket) = named.clone() else {
+        return Err(invalid(
+            "The accelerate endpoint takes virtual-hosted requests of a bucket only",
+        ));
+    };
+    if crate::server::request_service(request).is_some_and(|service| service != "s3")
+        || crate::api::control_route(request).is_some()
+    {
+        return Err(invalid(
+            "The accelerate endpoint takes Amazon S3 requests only",
+        ));
     }
-    let bucket = match target {
-        crate::api::Target::Bucket(_)
-            if crate::api::subresource_count(request) == 0
-                && matches!(*request.method(), Method::PUT | Method::DELETE) =>
-        {
-            return Err(invalid(
-                "CreateBucket and DeleteBucket are not supported by the accelerate endpoint",
-            ));
-        }
-        crate::api::Target::Bucket(bucket) | crate::api::Target::Object(bucket, _) => {
-            bucket.clone()
-        }
-        crate::api::Target::Service => {
-            return Err(invalid(
-                "ListBuckets is not supported by the accelerate endpoint",
-            ));
-        }
-    };
-    // Read in the request's own scope: its key still valid.
-    let scope = crate::scope::Scope {
-        key: principal.map(|principal| (principal.access_key.clone(), principal.account.clone())),
-        buckets: Vec::new(),
-        origin: None,
-    };
+    if request.uri().path() == "/"
+        && crate::api::subresource_count(request) == 0
+        && matches!(*request.method(), Method::PUT | Method::DELETE)
+    {
+        return Err(invalid(
+            "CreateBucket and DeleteBucket are not supported by the accelerate endpoint",
+        ));
+    }
     let enabled = crate::scope::within(
-        scope,
+        crate::scope::Scope {
+            key: None,
+            buckets: Vec::new(),
+            origin: None,
+        },
         crate::scope::object(state, move |file| {
             Ok(file
                 .bucket_config(&bucket, BUCKET_ACCELERATE, "")?

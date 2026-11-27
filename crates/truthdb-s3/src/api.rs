@@ -404,8 +404,6 @@ pub async fn dispatch(
     // mark checked, it is one made through Object Lambda.
     let called_via = proxied || crate::object_lambda_run::called_via(&request, &auth)?;
     let target = target(&request)?;
-    // An accelerate endpoint's: only as its bucket's acceleration allows.
-    crate::accelerate::check(state, &request, &target, auth.principal.as_ref()).await?;
     let via = request
         .extensions()
         .get::<crate::access_points::Via>()

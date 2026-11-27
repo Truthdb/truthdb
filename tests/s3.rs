@@ -21362,13 +21362,13 @@ fn accelerate_endpoints_serve_a_bucket_while_its_acceleration_is_enabled() {
         return;
     };
     let server = start_server();
-    let (_, key, secret) = account_with_key(&server, "accelerating");
+    let (account, key, secret) = account_with_key(&server, "accelerating");
     let script = server.dir.join("accelerate.py");
     std::fs::write(&script, ACCELERATE_SCRIPT).expect("script");
     let output = Command::new(python)
         .arg("-I")
         .arg(&script)
-        .args([&server.s3_port.to_string(), &key, &secret])
+        .args([&server.s3_port.to_string(), &key, &secret, &account])
         .output()
         .expect("run python");
     assert!(
@@ -21382,7 +21382,7 @@ fn accelerate_endpoints_serve_a_bucket_while_its_acceleration_is_enabled() {
 const ACCELERATE_SCRIPT: &str = r#"
 import socket, sys
 import boto3, botocore.config, botocore.exceptions
-port, key, secret = sys.argv[1:4]
+port, key, secret, account = sys.argv[1:5]
 # Every *.s3.test name is the local listener.
 resolve = socket.getaddrinfo
 socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
@@ -21416,6 +21416,13 @@ assert [o["Key"] for o in fast.list_objects_v2(Bucket="fast")["Contents"]] == ["
 # Not what the accelerate endpoint takes: ListBuckets, CreateBucket,
 # DeleteBucket.
 refused(lambda: fast.list_buckets(), "InvalidRequest")
+# Only virtual-hosted: not path-style through the endpoint itself.
+error = refused(lambda: client("s3-accelerate.s3.test", "path").get_object(Bucket="fast", Key="o"), "InvalidRequest")
+assert "virtual-hosted" in error["Error"]["Message"], error
+# Nor S3 Control's requests.
+error = refused(lambda: boto3.client("s3control", endpoint_url=f"http://s3-accelerate.s3.test:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret).list_access_points(AccountId=account), "InvalidRequest")
+assert "Amazon S3 requests only" in error["Error"]["Message"], error
 refused(lambda: fast.create_bucket(Bucket="other"), "InvalidRequest")
 refused(lambda: fast.delete_bucket(Bucket="fast"), "InvalidRequest")
 # Suspended: no longer served there.
@@ -21423,6 +21430,21 @@ s3.put_bucket_accelerate_configuration(Bucket="fast", AccelerateConfiguration={"
 assert s3.get_bucket_accelerate_configuration(Bucket="fast")["Status"] == "Suspended"
 refused(lambda: fast.get_object(Bucket="fast", Key="o"), "InvalidRequest")
 refused(lambda: dual.get_object(Bucket="fast", Key="o"), "InvalidRequest")
+# Whatever would serve the request: a form upload, a CORS preflight.
+import urllib.error, urllib.request
+def sent(method, headers, data=None):
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/", method=method, data=data,
+        headers=dict(headers, Host=f"fast.s3-accelerate.s3.test:{port}"))
+    try:
+        with urllib.request.urlopen(request) as answer:
+            return answer.status, answer.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+status, body = sent("POST", {"Content-Type": "multipart/form-data; boundary=b"},
+    b'--b\r\nContent-Disposition: form-data; name="key"\r\n\r\nf\r\n--b--\r\n')
+assert status == 400 and b"<Code>InvalidRequest</Code>" in body, (status, body)
+status, body = sent("OPTIONS", {"Origin": "https://site.test", "Access-Control-Request-Method": "GET"})
+assert status == 400 and b"<Code>InvalidRequest</Code>" in body, (status, body)
 assert s3.get_object(Bucket="fast", Key="o")["Body"].read() == b"data"
 # Refused: a bucket name with periods, a status not known, a bucket missing,
 # and bucket names the accelerate endpoint's host has.
