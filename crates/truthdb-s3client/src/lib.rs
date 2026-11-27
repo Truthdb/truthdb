@@ -778,6 +778,8 @@ impl Client {
     }
 
     /// Bytes `start` to `end` (inclusive) of the object (fewer at its end).
+    /// A service that answers the whole object (ignoring the range) has it
+    /// cut to the range.
     pub async fn get_object_range(
         &self,
         bucket: &str,
@@ -794,6 +796,7 @@ impl Client {
                 Bytes::new(),
             )
             .await?;
+        let whole = response.status().as_u16() == 200;
         let mut download = Download {
             head: head_of(response.headers())?,
             body: response.into_body(),
@@ -802,7 +805,13 @@ impl Client {
         while let Some(chunk) = download.next_chunk().await? {
             out.extend_from_slice(&chunk);
         }
-        Ok(Bytes::from(out))
+        let out = Bytes::from(out);
+        if whole {
+            let from = (start as usize).min(out.len());
+            let to = (end as usize).saturating_add(1).min(out.len());
+            return Ok(out.slice(from..to));
+        }
+        Ok(out)
     }
 
     /// Stores `body` as the object, with `headers` (content type, metadata,

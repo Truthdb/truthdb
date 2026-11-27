@@ -430,6 +430,11 @@ impl Filesystem for Mount {
             let Some(reader) = state.readers.get(&fh.0) else {
                 return reply.error(Errno::EBADF);
             };
+            // Read past its size as opened (the object may have grown since):
+            // its end.
+            if offset >= reader.size {
+                return reply.data(&[]);
+            }
             let end = offset.saturating_add(u64::from(size)).min(reader.size);
             let held = (offset >= reader.start && end <= reader.start + reader.data.len() as u64)
                 .then(|| {
@@ -441,9 +446,6 @@ impl Filesystem for Mount {
         };
         if let Some(data) = held {
             return reply.data(&data);
-        }
-        if offset >= file_size {
-            return reply.data(&[]);
         }
         let last = offset
             .saturating_add(u64::from(size).max(READ_AHEAD))
@@ -496,13 +498,24 @@ fn config(options: &Options) -> Config {
     if options.allow_other {
         config.acl = SessionACL::All;
     }
+    // Requests are served by threads of their own: one waiting on the
+    // service does not hold up the others.
+    config.n_threads = Some(THREADS);
     config
 }
 
-/// Mounts the bucket at `directory` until it is unmounted.
-pub fn mount(client: Client, options: Options, directory: &Path) -> std::io::Result<()> {
+/// The threads requests are served by.
+const THREADS: usize = 4;
+
+/// The bucket mounted at `directory`: [`fuser::Session::run`] serves it
+/// until it is unmounted (its `unmount_callable` unmounts it).
+pub fn session(
+    client: Client,
+    options: Options,
+    directory: &Path,
+) -> std::io::Result<fuser::Session<Mount>> {
     let config = config(&options);
-    fuser::mount(Mount::new(client, options)?, directory, &config)
+    fuser::Session::new(Mount::new(client, options)?, directory, &config)
 }
 
 /// Mounts the bucket at `directory` in the background: unmounted when the

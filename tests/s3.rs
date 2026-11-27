@@ -22670,7 +22670,10 @@ fn a_bucket_mounts_as_a_read_only_file_system_with_mountpoints_semantics() {
         .read(true)
         .write(true)
         .open("/dev/fuse");
-    if fuse.is_err() || !std::path::Path::new("/usr/bin/fusermount3").exists() {
+    let fusermount = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join("fusermount3").exists())
+    });
+    if fuse.is_err() || !fusermount {
         eprintln!("skipped: no /dev/fuse or fusermount3");
         return;
     }
@@ -22800,6 +22803,29 @@ fn a_bucket_mounts_as_a_read_only_file_system_with_mountpoints_semantics() {
             file.read_exact(&mut chunk).unwrap();
             assert!(chunk == big[at as usize..at as usize + 1000], "at {at}");
         }
+    }
+    // A file that grows while open: read to its size as opened, and no
+    // further (its end), not past it.
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(dir.join("top.txt")).unwrap();
+        let mut all = String::new();
+        file.read_to_string(&mut all).unwrap();
+        runtime.block_on(async {
+            new_client()
+                .put_object("files", "top.txt", &[], vec![b'g'; 20_000].into())
+                .await
+                .expect("grow");
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            std::fs::metadata(dir.join("top.txt")).unwrap().len(),
+            20_000
+        );
+        file.seek(SeekFrom::Start(12_288)).unwrap();
+        let mut more = Vec::new();
+        file.read_to_end(&mut more).unwrap();
+        assert!(more.is_empty(), "{} bytes", more.len());
     }
     // Not there, and read-only.
     assert_eq!(

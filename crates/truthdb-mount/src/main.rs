@@ -1,7 +1,7 @@
 //! `truthdb-mount <bucket> <directory>`: mounts the bucket (or a prefix of
 //! it) at the directory, read-only, until it is unmounted (`fusermount3 -u
-//! <directory>`) or this is stopped (Ctrl-C, SIGTERM). It runs in the
-//! foreground. The endpoint and keys are found as `truthdb-cli s3` finds
+//! <directory>`: this then ends) or this is stopped (Ctrl-C, SIGTERM: it
+//! unmounts). It runs in the foreground. The endpoint and keys are found as `truthdb-cli s3` finds
 //! them.
 
 use std::path::PathBuf;
@@ -124,20 +124,34 @@ fn main() -> Result<()> {
         dir_mode: mode(&args.dir_mode)?,
         allow_other: args.allow_other,
     };
-    let session = truthdb_mount::spawn(client, options, &args.directory)
+    let mut session = truthdb_mount::session(client, options, &args.directory)
         .with_context(|| format!("mounting {} at {}", args.bucket, args.directory.display()))?;
-    // Unmounted when stopped (the session dropped), or when it ends.
+    let mut unmounter = session.unmount_callable();
+    // Served until unmounted: from outside (`fusermount3 -u`), or here when
+    // stopped.
+    let (ended, end) = tokio::sync::oneshot::channel();
+    let served = std::thread::spawn(move || {
+        let result = session.run();
+        let _ = ended.send(());
+        result
+    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
+    let stopped = runtime.block_on(async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-        Ok::<_, std::io::Error>(())
+        Ok::<_, std::io::Error>(tokio::select! {
+            _ = tokio::signal::ctrl_c() => true,
+            _ = term.recv() => true,
+            _ = end => false,
+        })
     })?;
-    drop(session);
+    if stopped {
+        unmounter.unmount().context("unmounting")?;
+    }
+    served
+        .join()
+        .map_err(|_| anyhow!("the file system's thread panicked"))?
+        .context("serving the file system")?;
     Ok(())
 }
