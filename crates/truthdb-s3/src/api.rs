@@ -140,7 +140,6 @@ pub(crate) fn control_route<B>(request: &Request<B>) -> Option<ControlRoute> {
 /// would list objects, an object GET would return its body).
 const UNIMPLEMENTED: &[&str] = &[
     "abac",
-    "accelerate",
     "analytics",
     "annotation",
     "intelligent-tiering",
@@ -156,6 +155,7 @@ const UNIMPLEMENTED: &[&str] = &[
 /// The sub-resources the routes below implement, each for some methods and
 /// targets.
 const SUBRESOURCES: &[&str] = &[
+    "accelerate",
     "acl",
     "attributes",
     "cors",
@@ -404,6 +404,8 @@ pub async fn dispatch(
     // mark checked, it is one made through Object Lambda.
     let called_via = proxied || crate::object_lambda_run::called_via(&request, &auth)?;
     let target = target(&request)?;
+    // An accelerate endpoint's: only as its bucket's acceleration allows.
+    crate::accelerate::check(state, &request, &target, auth.principal.as_ref()).await?;
     let via = request
         .extensions()
         .get::<crate::access_points::Via>()
@@ -777,6 +779,18 @@ async fn route(
             authz.check(action, Bucket(&bucket))?;
             crate::sse::handle(state, request, auth, bucket, method).await
         }
+        (Target::Bucket(bucket), method) if has_param(&request, "accelerate") => {
+            let action = match method {
+                Method::GET => "s3:GetAccelerateConfiguration",
+                Method::PUT => "s3:PutAccelerateConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?accelerate"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::accelerate::handle(state, request, auth, bucket, method).await
+        }
+        (Target::Object(..), _) if has_param(&request, "accelerate") => Err(
+            S3Error::not_implemented("an object has no ?accelerate configuration"),
+        ),
         (Target::Bucket(bucket), method) if has_param(&request, "requestPayment") => {
             let action = match method {
                 Method::GET => "s3:GetBucketRequestPayment",

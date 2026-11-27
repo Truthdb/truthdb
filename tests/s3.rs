@@ -21355,6 +21355,89 @@ print("ok")
 "#;
 
 #[test]
+fn accelerate_endpoints_serve_a_bucket_while_its_acceleration_is_enabled() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (_, key, secret) = account_with_key(&server, "accelerating");
+    let script = server.dir.join("accelerate.py");
+    std::fs::write(&script, ACCELERATE_SCRIPT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const ACCELERATE_SCRIPT: &str = r#"
+import socket, sys
+import boto3, botocore.config, botocore.exceptions
+port, key, secret = sys.argv[1:4]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(endpoint, style):
+    return boto3.client("s3", endpoint_url=f"http://{endpoint}:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(retries={"max_attempts": 1}, s3={"addressing_style": style}))
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+        return error.response
+s3 = client("s3.test", "path")
+fast = client("s3-accelerate.s3.test", "virtual")
+dual = client("s3-accelerate.dualstack.s3.test", "virtual")
+s3.create_bucket(Bucket="fast")
+s3.put_object(Bucket="fast", Key="o", Body=b"data")
+# Never set: no status.
+assert "Status" not in s3.get_bucket_accelerate_configuration(Bucket="fast")
+refused(lambda: fast.get_object(Bucket="fast", Key="o"), "InvalidRequest")
+# Enabled: served through either accelerate endpoint, as through the plain one.
+s3.put_bucket_accelerate_configuration(Bucket="fast", AccelerateConfiguration={"Status": "Enabled"})
+assert s3.get_bucket_accelerate_configuration(Bucket="fast")["Status"] == "Enabled"
+assert fast.get_object(Bucket="fast", Key="o")["Body"].read() == b"data"
+assert dual.get_object(Bucket="fast", Key="o")["Body"].read() == b"data"
+fast.put_object(Bucket="fast", Key="n", Body=b"new")
+assert s3.get_object(Bucket="fast", Key="n")["Body"].read() == b"new"
+assert [o["Key"] for o in fast.list_objects_v2(Bucket="fast")["Contents"]] == ["n", "o"]
+# Not what the accelerate endpoint takes: ListBuckets, CreateBucket,
+# DeleteBucket.
+refused(lambda: fast.list_buckets(), "InvalidRequest")
+refused(lambda: fast.create_bucket(Bucket="other"), "InvalidRequest")
+refused(lambda: fast.delete_bucket(Bucket="fast"), "InvalidRequest")
+# Suspended: no longer served there.
+s3.put_bucket_accelerate_configuration(Bucket="fast", AccelerateConfiguration={"Status": "Suspended"})
+assert s3.get_bucket_accelerate_configuration(Bucket="fast")["Status"] == "Suspended"
+refused(lambda: fast.get_object(Bucket="fast", Key="o"), "InvalidRequest")
+refused(lambda: dual.get_object(Bucket="fast", Key="o"), "InvalidRequest")
+assert s3.get_object(Bucket="fast", Key="o")["Body"].read() == b"data"
+# Refused: a bucket name with periods, a status not known, a bucket missing,
+# and bucket names the accelerate endpoint's host has.
+s3.create_bucket(Bucket="with.dots")
+refused(lambda: s3.put_bucket_accelerate_configuration(Bucket="with.dots",
+    AccelerateConfiguration={"Status": "Enabled"}), "InvalidRequest")
+refused(lambda: s3.put_bucket_accelerate_configuration(Bucket="fast",
+    AccelerateConfiguration={"Status": "Fast"}), "MalformedXML")
+refused(lambda: s3.get_bucket_accelerate_configuration(Bucket="nothing-here"), "NoSuchBucket")
+for name in ["s3-accelerate", "a.s3-accelerate"]:
+    refused(lambda: s3.create_bucket(Bucket=name), "InvalidBucketName")
+print("ok")
+"#;
+
+#[test]
 fn requests_through_an_access_point_act_on_its_bucket_as_both_allow() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

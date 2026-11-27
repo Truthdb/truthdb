@@ -286,6 +286,17 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         request
             .extensions_mut()
             .insert(crate::website::WebsiteHost(bucket));
+    } else if let Some(named) = host.and_then(|host| crate::accelerate::host(host, &state.domains))
+    {
+        // An accelerate endpoint: virtual-hosted, as its bucket's.
+        if let Some(bucket) = &named {
+            request
+                .extensions_mut()
+                .insert(crate::api::VirtualHost(bucket.clone()));
+        }
+        request
+            .extensions_mut()
+            .insert(crate::accelerate::AccelerateHost);
     } else if let Some(bucket) = host.and_then(|host| crate::api::host_bucket(host, &state.domains))
     {
         request
