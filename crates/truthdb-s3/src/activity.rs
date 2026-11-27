@@ -238,6 +238,48 @@ impl Call {
                     .collect(),
             });
             return Some(call);
+        } else if crate::api::control_route(request) == Some(crate::api::ControlRoute::StorageLens)
+        {
+            let rest = request
+                .uri()
+                .path()
+                .strip_prefix(crate::storage_lens::PREFIX)
+                .unwrap_or("");
+            let segments: Vec<&str> = rest.split('/').skip(1).collect();
+            let name = match (method, segments.as_slice()) {
+                (&Method::GET, []) => "ListStorageLensConfigurations",
+                (&Method::PUT, [_]) => "PutStorageLensConfiguration",
+                (&Method::GET, [_]) => "GetStorageLensConfiguration",
+                (&Method::DELETE, [_]) => "DeleteStorageLensConfiguration",
+                (&Method::PUT, [_, "tagging"]) => "PutStorageLensConfigurationTagging",
+                (&Method::GET, [_, "tagging"]) => "GetStorageLensConfigurationTagging",
+                (&Method::DELETE, [_, "tagging"]) => "DeleteStorageLensConfigurationTagging",
+                _ => return None,
+            };
+            let mut call = Call::build(request, name, None, None, false);
+            call.control = Some(ControlCall {
+                account: request
+                    .headers()
+                    .get("x-amz-account-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string(),
+                access_point: None,
+                object_lambda: false,
+                parameters: segments
+                    .first()
+                    .map(|id| {
+                        (
+                            "configId",
+                            percent_encoding::percent_decode_str(id)
+                                .decode_utf8_lossy()
+                                .into_owned(),
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+            });
+            return Some(call);
         } else if crate::api::control_route(request).is_some() {
             return None;
         } else {

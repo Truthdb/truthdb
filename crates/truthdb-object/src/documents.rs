@@ -55,6 +55,11 @@ pub const BUCKET_REQUEST_PAYMENT: u8 = 14;
 /// Bucket configuration: its transfer acceleration (one byte: 1 Enabled, 0
 /// Suspended; none: never set).
 pub const BUCKET_ACCELERATE: u8 = 15;
+/// An account's S3 Storage Lens configurations, kept under the empty bucket
+/// name, by `<account>/<id>` (see `truthdb-s3`'s `storage_lens`).
+pub const STORAGE_LENS: u8 = 16;
+/// A Storage Lens configuration's tags, by the configuration's key.
+pub const STORAGE_LENS_TAGS: u8 = 17;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()

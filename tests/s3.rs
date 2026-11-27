@@ -20373,7 +20373,7 @@ refused(lambda: control.delete_access_point(AccountId=account, Name="open"), "No
 control.create_access_point(AccountId=account, Name="open", Bucket="others")
 refused(lambda: control.get_access_point_policy(AccountId=account, Name="open"), "NoSuchAccessPointPolicy")
 # Another S3 Control path: refused, not taken for a bucket's.
-refused(lambda: control.list_storage_lens_configurations(AccountId=account), "NotImplemented")
+refused(lambda: control.list_storage_lens_groups(AccountId=account), "NotImplemented")
 print("ok")
 "#;
 
@@ -21943,5 +21943,191 @@ theirs.create_bucket(Bucket="data")
 theirs.put_object(Bucket="data", Key="k", Body=b"another's")
 refused(lambda: s3.get_object(Bucket=alias, Key="k"), "NoSuchBucket")
 refused(lambda: through.get_object(Bucket=arn, Key="k"), "NoSuchBucket")
+print("ok")
+"#;
+
+#[test]
+fn storage_lens_configurations_are_kept_listed_and_tagged_through_s3_control() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "lensing");
+    let (other, ..) = account_with_key(&server, "elsewhere");
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetStorageLensConfiguration","Resource":"arn:aws:s3:us-east-1:{account}:storage-lens/main"}}]}}"#
+    );
+    let (reader_key, reader_secret) =
+        user_with_key(&server, &account, "lens-reader", Some(&policy));
+    let script = server.dir.join("storage_lens.py");
+    std::fs::write(&script, STORAGE_LENS_SCRIPT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other,
+            &reader_key,
+            &reader_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const STORAGE_LENS_SCRIPT: &str = r#"
+import json, socket, sys, time
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other, reader_key, reader_secret = sys.argv[1:8]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+def client(service, access, secret_key):
+    return boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+control = client("s3control", key, secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+levels = {"ActivityMetrics": {"IsEnabled": True},
+    "AdvancedCostOptimizationMetrics": {"IsEnabled": False},
+    "AdvancedDataProtectionMetrics": {"IsEnabled": True}}
+config = {"Id": "main", "IsEnabled": True,
+    "AccountLevel": dict(levels, BucketLevel=dict(levels, PrefixLevel={"StorageMetrics": {
+        "IsEnabled": True, "SelectionCriteria": {"Delimiter": "/", "MaxDepth": 4,
+        "MinStorageBytesPercentage": 1.5}}})),
+    "Include": {"Buckets": ["arn:aws:s3:::data", "arn:aws:s3:::logs"], "Regions": ["us-east-1"]}}
+destination = {"Format": "Parquet", "OutputSchemaVersion": "V_1", "AccountId": account,
+    "Arn": "arn:aws:s3:::reports", "Prefix": "lens", "Encryption": {"SSES3": {}}}
+assert control.list_storage_lens_configurations(AccountId=account).get("StorageLensConfigurationList", []) == []
+refused(lambda: control.get_storage_lens_configuration(AccountId=account, ConfigId="main"), "NoSuchConfiguration")
+control.put_storage_lens_configuration(AccountId=account, ConfigId="main", StorageLensConfiguration=config,
+    Tags=[{"Key": "team", "Value": "storage"}])
+got = control.get_storage_lens_configuration(AccountId=account, ConfigId="main")["StorageLensConfiguration"]
+lens_arn = f"arn:aws:s3:us-east-1:{account}:storage-lens/main"
+assert got == dict(config, StorageLensArn=lens_arn), got
+assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="main")["Tags"] == [
+    {"Key": "team", "Value": "storage"}]
+# Replaced whole, tags with it; a second one, disabled; listed with the Region.
+control.put_storage_lens_configuration(AccountId=account, ConfigId="main", StorageLensConfiguration=config)
+assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="main")["Tags"] == []
+control.put_storage_lens_configuration(AccountId=account, ConfigId="quiet", StorageLensConfiguration={
+    "Id": "quiet", "IsEnabled": False, "AccountLevel": {"BucketLevel": {}},
+    "Exclude": {"Regions": ["us-west-2"]}})
+# A scope of Regions only reads back as Put, with no Buckets.
+assert control.get_storage_lens_configuration(AccountId=account, ConfigId="quiet")["StorageLensConfiguration"][
+    "Exclude"] == {"Regions": ["us-west-2"]}
+listed = control.list_storage_lens_configurations(AccountId=account)["StorageLensConfigurationList"]
+assert listed == [
+    {"Id": "main", "StorageLensArn": lens_arn, "HomeRegion": "us-east-1", "IsEnabled": True},
+    {"Id": "quiet", "StorageLensArn": f"arn:aws:s3:us-east-1:{account}:storage-lens/quiet",
+        "HomeRegion": "us-east-1", "IsEnabled": False}], listed
+# Tags: put, read, deleted; on a configuration that is.
+control.put_storage_lens_configuration_tagging(AccountId=account, ConfigId="quiet",
+    Tags=[{"Key": "a", "Value": "1"}, {"Key": "b", "Value": ""}])
+assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="quiet")["Tags"] == [
+    {"Key": "a", "Value": "1"}, {"Key": "b", "Value": ""}]
+refused(lambda: control.put_storage_lens_configuration_tagging(AccountId=account, ConfigId="quiet",
+    Tags=[{"Key": "a", "Value": "1"}, {"Key": "a", "Value": "2"}]), "InvalidRequest")
+refused(lambda: control.put_storage_lens_configuration_tagging(AccountId=account, ConfigId="quiet",
+    Tags=[{"Key": f"k{n}", "Value": ""} for n in range(51)]), "InvalidRequest")
+control.delete_storage_lens_configuration_tagging(AccountId=account, ConfigId="quiet")
+assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="quiet")["Tags"] == []
+refused(lambda: control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="none"),
+    "NoSuchConfiguration")
+# Refused: what is not built (501), what is wrong (400).
+def with_(**changes):
+    return dict(config, **changes)
+for bad in [
+    with_(AccountLevel=dict(config["AccountLevel"], DetailedStatusCodesMetrics={"IsEnabled": True})),
+    with_(AccountLevel=dict(config["AccountLevel"], StorageLensGroupLevel={})),
+    with_(AwsOrg={"Arn": "arn:aws:organizations::111111111111:organization/o-abc"}),
+    with_(DataExport={"S3BucketDestination": dict(destination,
+        Encryption={"SSEKMS": {"KeyId": "arn:aws:kms:us-east-1:111111111111:key/1"}})}),
+    # Not built yet: exports and CloudWatch publishing.
+    with_(DataExport={"S3BucketDestination": destination}),
+    with_(DataExport={"CloudWatchMetrics": {"IsEnabled": True}}),
+]:
+    refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
+        StorageLensConfiguration=bad), "NotImplemented")
+for bad in [
+    with_(Exclude={"Regions": ["us-west-2"]}),
+    with_(Include={"Buckets": ["data"]}),
+    with_(Id="other"),
+    with_(StorageLensArn=f"arn:aws:s3:us-east-1:{account}:storage-lens/other"),
+    with_(AccountLevel={"ActivityMetrics": {"IsEnabled": True}, "BucketLevel": {}}),
+    with_(DataExport={"S3BucketDestination": dict(destination, AccountId="12")}),
+]:
+    refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
+        StorageLensConfiguration=bad), "InvalidRequest")
+refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="main",
+    StorageLensConfiguration=config, Tags=[{"Key": "a", "Value": "1"}, {"Key": "a", "Value": "2"}]),
+    "InvalidRequest")
+refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="a*b",
+    StorageLensConfiguration=with_(Id="a*b")), "InvalidRequest")
+# At most 50 an account; a replaced one is not another.
+for n in range(48):
+    control.put_storage_lens_configuration(AccountId=account, ConfigId=f"n{n}",
+        StorageLensConfiguration={"Id": f"n{n}", "IsEnabled": True, "AccountLevel": {"BucketLevel": {}}})
+refused(lambda: control.put_storage_lens_configuration(AccountId=account, ConfigId="one-more",
+    StorageLensConfiguration={"Id": "one-more", "IsEnabled": True, "AccountLevel": {"BucketLevel": {}}}),
+    "InvalidRequest")
+control.put_storage_lens_configuration(AccountId=account, ConfigId="n0",
+    StorageLensConfiguration={"Id": "n0", "IsEnabled": False, "AccountLevel": {"BucketLevel": {}}})
+# A path's id that is no id is refused before it is looked up: a NUL would
+# reach the stored chunks of a configuration longer than one chunk.
+control.delete_storage_lens_configuration(AccountId=account, ConfigId="n1")
+control.put_storage_lens_configuration(AccountId=account, ConfigId="big", StorageLensConfiguration={
+    "Id": "big", "IsEnabled": True, "AccountLevel": {"BucketLevel": {}},
+    "Include": {"Buckets": [f"arn:aws:s3:::bucket-{n:03}" for n in range(60)]}})
+for call in [control.get_storage_lens_configuration, control.delete_storage_lens_configuration,
+        control.get_storage_lens_configuration_tagging, control.delete_storage_lens_configuration_tagging]:
+    refused(lambda: call(AccountId=account, ConfigId="big\x00"), "InvalidRequest")
+refused(lambda: control.put_storage_lens_configuration_tagging(AccountId=account, ConfigId="big\x00",
+    Tags=[{"Key": "a", "Value": "1"}]), "InvalidRequest")
+refused(lambda: control.get_storage_lens_configuration(AccountId=account, ConfigId="a*b"), "InvalidRequest")
+assert len(control.get_storage_lens_configuration(AccountId=account, ConfigId="big")[
+    "StorageLensConfiguration"]["Include"]["Buckets"]) == 60
+assert len(control.list_storage_lens_configurations(AccountId=account)["StorageLensConfigurationList"]) == 50
+# Its account's own; a user's permissions name the configuration's ARN.
+refused(lambda: control.get_storage_lens_configuration(AccountId=other, ConfigId="main"), "AccessDenied")
+reader = client("s3control", reader_key, reader_secret)
+assert reader.get_storage_lens_configuration(AccountId=account, ConfigId="main")["StorageLensConfiguration"]["Id"] == "main"
+refused(lambda: reader.get_storage_lens_configuration(AccountId=account, ConfigId="quiet"), "AccessDenied")
+refused(lambda: reader.list_storage_lens_configurations(AccountId=account), "AccessDenied")
+refused(lambda: reader.delete_storage_lens_configuration(AccountId=account, ConfigId="main"), "AccessDenied")
+# Deleted with its tags; then it does not exist.
+control.put_storage_lens_configuration_tagging(AccountId=account, ConfigId="main", Tags=[{"Key": "x", "Value": "y"}])
+control.delete_storage_lens_configuration(AccountId=account, ConfigId="main")
+refused(lambda: control.get_storage_lens_configuration(AccountId=account, ConfigId="main"), "NoSuchConfiguration")
+refused(lambda: control.delete_storage_lens_configuration(AccountId=account, ConfigId="main"), "NoSuchConfiguration")
+control.put_storage_lens_configuration(AccountId=account, ConfigId="main", StorageLensConfiguration=config)
+assert control.get_storage_lens_configuration_tagging(AccountId=account, ConfigId="main")["Tags"] == []
+# CloudTrail records each call by its name and configuration.
+trail = client("cloudtrail", key, secret)
+for _ in range(60):
+    events = trail.lookup_events(LookupAttributes=[{"AttributeKey": "EventName",
+        "AttributeValue": "DeleteStorageLensConfiguration"}])["Events"]
+    if events:
+        break
+    time.sleep(0.5)
+assert events, events
+deleted = json.loads(events[0]["CloudTrailEvent"])
+assert deleted["requestParameters"]["configId"] == "main", deleted
+assert deleted["requestParameters"]["x-amz-account-id"] == account and deleted["readOnly"] is False, deleted
 print("ok")
 "#;
