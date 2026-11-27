@@ -67,6 +67,8 @@ pub struct Authz {
     session: Option<crate::session::Scope>,
     /// The access point the request is made through.
     via: Option<crate::access_points::Via>,
+    /// The Object Lambda access point a request was passed on from.
+    lambda: Option<LambdaGate>,
 }
 
 /// The changes of a bucket (not its objects') a ReadOnly session may not
@@ -103,6 +105,15 @@ struct Loaded {
     policies: Vec<Policy>,
     buckets: HashMap<String, BucketGrant>,
     existing_tags: HashMap<(String, String), Vec<(String, String)>>,
+}
+
+/// The Object Lambda access point a request was passed on from: its ARN,
+/// its account and its policy.
+#[derive(Debug, Clone)]
+pub(crate) struct LambdaGate {
+    pub(crate) arn: String,
+    pub(crate) account: String,
+    pub(crate) policy: Option<Policy>,
 }
 
 /// An object a request names (its target, or a copy's source), and which
@@ -389,6 +400,7 @@ impl Authz {
             region: Some(state.region.clone()),
             session: None,
             via: None,
+            lambda: None,
         })
     }
 
@@ -412,6 +424,7 @@ impl Authz {
             region: None,
             session: None,
             via: None,
+            lambda: None,
         })
     }
 
@@ -717,6 +730,13 @@ impl Authz {
         )
     }
 
+    /// This authorization for a request passed on from the Object Lambda
+    /// access point `gate` names.
+    pub(crate) fn through_lambda(mut self, gate: LambdaGate) -> Authz {
+        self.lambda = Some(gate);
+        self
+    }
+
     /// This authorization for a request made through access point `via`;
     /// `objects` are those it names (as [`Self::load`]'s), whose tags are
     /// read when the access point's policy reads them.
@@ -773,6 +793,23 @@ impl Authz {
                 "NoSuchBucket",
                 "The specified bucket does not exist",
             ));
+        }
+        // Passed on from an Object Lambda access point: each action as its
+        // `s3-object-lambda` one there too, where AWS has one (so a Deny
+        // there holds for whatever the operation checks: a version's
+        // delete, the tags or the lock a write stores).
+        if let Some(gate) = &self.lambda
+            && let Some(name) = action.strip_prefix("s3:")
+            && crate::object_lambda_run::LAMBDA_ACTIONS.contains(&name)
+        {
+            let policies: Vec<&Policy> = gate.policy.iter().collect();
+            self.decide_all(
+                &format!("s3-object-lambda:{name}"),
+                &gate.arn,
+                Some(&gate.account),
+                &policies,
+                context,
+            )?;
         }
         let point_arn = via.arn(region);
         let (through_arn, bucket_arn) = match resource {

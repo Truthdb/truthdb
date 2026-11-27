@@ -20584,6 +20584,14 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
         points = format!("arn:aws:s3-object-lambda:us-east-1:{account}:accesspoint/*"),
         shape = lambda_arn("shape")
     );
+    // All of Object Lambda but storing tags and deleting versions: whatever
+    // operation checks them.
+    let tagless = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+        {{"Effect": "Allow", "Action": "s3-object-lambda:*", "Resource": "{point}"}},
+        {{"Effect": "Deny", "Action": ["s3-object-lambda:PutObjectTagging", "s3-object-lambda:DeleteObjectVersion"], "Resource": "{point}"}},
+        {{"Effect": "Allow", "Action": "s3:*", "Resource": ["{supporting}", "{supporting}/object/*"], "Condition": {called_via}}}]}}"#
+    );
     let users: Vec<(String, String)> = [
         ("reader", Some(reader.as_str())),
         ("noinvoke", Some(no_invoke.as_str())),
@@ -20591,6 +20599,7 @@ fn gets_through_an_object_lambda_access_point_are_answered_by_its_function() {
         ("function", Some(writer)),
         ("nopoint", Some(no_point.as_str())),
         ("denied", Some(denied.as_str())),
+        ("tagless", Some(tagless.as_str())),
     ]
     .into_iter()
     .map(|(name, policy)| user_with_key(&server, &account, name, policy))
@@ -20654,7 +20663,7 @@ import http.server
 import boto3, botocore.config, botocore.exceptions
 (port, account, key, secret, reader_key, reader_secret, noinvoke_key, noinvoke_secret,
     nogrant_key, nogrant_secret, function_key, function_secret, nopoint_key, nopoint_secret,
-    denied_key, denied_secret) = sys.argv[1:17]
+    denied_key, denied_secret, tagless_key, tagless_secret) = sys.argv[1:19]
 # Every *.s3.test name is the local listener.
 resolve = socket.getaddrinfo
 socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1" if host.endswith("s3.test") else host, *rest, **kw)
@@ -20976,6 +20985,17 @@ refused(lambda: denied.list_objects(Bucket=alias), "AccessDenied")
 denied.put_object_tagging(Bucket=alias, Key="doc", Tagging={"TagSet": [{"Key": "t", "Value": "v"}]})
 assert s3.get_object_tagging(Bucket="data", Key="doc")["TagSet"] == [{"Key": "t", "Value": "v"}]
 s3.delete_object_tagging(Bucket="data", Key="doc")
+# A Deny holds for the checks an operation makes beyond its own action:
+# the tags a put stores, the version a multiple delete names.
+tagless = client("s3", tagless_key, tagless_secret)
+refused(lambda: tagless.put_object(Bucket=alias, Key="tagged", Body=b"t", Tagging="t=v"), "AccessDenied")
+refused(lambda: s3.head_object(Bucket="data", Key="tagged"), "404")
+tagless.put_object(Bucket=alias, Key="plain", Body=b"p")
+result = tagless.delete_objects(Bucket=alias, Delete={"Objects": [{"Key": "plain", "VersionId": "null"}]})
+assert [e["Code"] for e in result.get("Errors", [])] == ["AccessDenied"], result
+refused(lambda: tagless.delete_object(Bucket=alias, Key="plain", VersionId="null"), "AccessDenied")
+tagless.delete_object(Bucket=alias, Key="plain")
+refused(lambda: s3.head_object(Bucket="data", Key="plain"), "404")
 # Not the bucket's own operations (they are no data events).
 refused(lambda: s3.put_bucket_versioning(Bucket=alias, VersioningConfiguration={"Status": "Enabled"}),
     "NotImplemented")

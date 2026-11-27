@@ -482,6 +482,10 @@ pub async fn dispatch(
         true => authz.with_keys(&crate::object_lambda_run::called_via_keys()),
         false => authz,
     };
+    let authz = match request.extensions().get::<crate::authz::LambdaGate>() {
+        Some(gate) => authz.through_lambda(gate.clone()),
+        None => authz,
+    };
     let authz = match via {
         Some(via) => authz.through(state, via, objects).await?,
         None => authz,

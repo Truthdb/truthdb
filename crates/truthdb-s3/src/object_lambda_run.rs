@@ -317,6 +317,13 @@ pub(crate) async fn serve(
             "NoSuchAccessPoint" => no_supporting_point(),
             _ => err,
         })?;
+        // Every check the operation makes is made here too (see
+        // `Authz::through_lambda`).
+        request.extensions_mut().insert(crate::authz::LambdaGate {
+            arn: point_arn,
+            account: point.account.clone(),
+            policy: via.policy.clone(),
+        });
         return Ok(None);
     };
     let configuration = &via.configuration;
@@ -559,6 +566,36 @@ pub(crate) async fn serve(
         held.uri().path(),
     )))
 }
+
+/// AWS's `s3-object-lambda` actions (the service authorization reference's).
+pub(crate) const LAMBDA_ACTIONS: [&str; 26] = [
+    "AbortMultipartUpload",
+    "DeleteObject",
+    "DeleteObjectTagging",
+    "DeleteObjectVersion",
+    "DeleteObjectVersionTagging",
+    "GetObject",
+    "GetObjectAcl",
+    "GetObjectLegalHold",
+    "GetObjectRetention",
+    "GetObjectTagging",
+    "GetObjectVersion",
+    "GetObjectVersionAcl",
+    "GetObjectVersionTagging",
+    "ListBucket",
+    "ListBucketMultipartUploads",
+    "ListBucketVersions",
+    "ListMultipartUploadParts",
+    "PutObject",
+    "PutObjectAcl",
+    "PutObjectLegalHold",
+    "PutObjectRetention",
+    "PutObjectTagging",
+    "PutObjectVersionAcl",
+    "PutObjectVersionTagging",
+    "RestoreObject",
+    "WriteGetObjectResponse",
+];
 
 /// AWS's `s3-object-lambda` action for the operation of data event `name`
 /// (`versioned`: naming an object's version), as `s3:` actions authorize
